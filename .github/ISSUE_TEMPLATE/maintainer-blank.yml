@@ -1,0 +1,9 @@
+name: Blank issue
+description: General issue for maintainers.
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+    validations:
+      required: true

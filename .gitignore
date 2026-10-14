@@ -1,0 +1,38 @@
+# Unreal Engine generated files (including example projects and plugins)
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# IDE caches and generated project files
+.vs/
+.idea/
+.vscode/
+*.sln
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.xcworkspace/
+*.xcodeproj/
+*.code-workspace
+
+# Build artifacts
+*.o
+*.obj
+*.pdb
+*.dSYM/
+*.log
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
