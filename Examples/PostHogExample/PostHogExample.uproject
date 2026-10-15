@@ -1,19 +1,22 @@
 {
-  "FileVersion": 3,
-  "EngineAssociation": "5.8",
-  "Category": "Analytics",
-  "Description": "PostHog native integration example",
-  "Modules": [
-    {
-      "Name": "PostHogExample",
-      "Type": "Runtime",
-      "LoadingPhase": "Default"
-    }
-  ],
-  "Plugins": [
-    {
-      "Name": "PostHog",
-      "Enabled": true
-    }
-  ]
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "Analytics",
+	"Description": "Playable three-lane runner demonstrating PostHog analytics and feature flags",
+	"Modules": [
+		{
+			"Name": "PostHogExample",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "PostHog",
+			"Enabled": true,
+			"SupportedTargetPlatforms": [
+				"Mac"
+			]
+		}
+	]
 }
