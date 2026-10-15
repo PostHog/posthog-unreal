@@ -2,15 +2,9 @@
 #include "RunnerCharacter.h"
 #include "RunnerGameInstance.h"
 #include "RunnerHUD.h"
+#include "RunnerEnvironment.h"
 #include "RunnerRules.h"
 #include "RunnerTrackSegment.h"
-#include "Engine/DirectionalLight.h"
-#include "Engine/ExponentialHeightFog.h"
-#include "Engine/SkyLight.h"
-#include "Components/SkyAtmosphereComponent.h"
-#include "Components/DirectionalLightComponent.h"
-#include "Components/ExponentialHeightFogComponent.h"
-#include "Components/SkyLightComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -31,14 +25,7 @@ void ARunnerGameMode::InitGame(const FString& MapName, const FString& Options, F
     Super::InitGame(MapName, Options, ErrorMessage);
     // Build an entire playable scene in the engine's empty Entry map before the player spawns.
     RunnerStart = GetWorld()->SpawnActor<APlayerStart>(FVector(600, 0, 100), FRotator::ZeroRotator);
-    ADirectionalLight* Sun = GetWorld()->SpawnActor<ADirectionalLight>(FVector(0, 0, 1500), FRotator(-35, -25, 0));
-    Sun->GetLightComponent()->SetIntensity(5.f);
-    ASkyLight* Sky = GetWorld()->SpawnActor<ASkyLight>();
-    Sky->GetLightComponent()->SetIntensity(1.5f);
-    Sky->GetLightComponent()->SetRealTimeCaptureEnabled(true);
-    GetWorld()->SpawnActor<ASkyAtmosphere>();
-    AExponentialHeightFog* Fog = GetWorld()->SpawnActor<AExponentialHeightFog>();
-    Fog->GetComponent()->SetFogDensity(0.008f);
+    RunnerEnvironment::Spawn(GetWorld());
     ExtendTrack(600.f);
 }
 
