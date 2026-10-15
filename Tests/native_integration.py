@@ -244,7 +244,7 @@ class NativeTests(unittest.TestCase):
         with (evidence / "stdout.log").open("w") as output:
             process = subprocess.Popen([
                 ARGS.editor, str(root / "Examples/PostHogExample/PostHogExample.uproject"),
-                "-unattended", "-nullrhi", "-nosound", "-nosplash", "-nop4",
+                "-unattended", "-nullrhi", "-nosound", "-nosplash", "-nop4", "-NoAssetRegistryCache",
                 "-ExecCmds=Automation RunTests PostHog.;SoftQuit",
                 f"-ReportExportPath={report}",
                 f"-abslog={evidence / 'editor.log'}", "-stdout", "-FullStdOutLogOutput",
@@ -275,7 +275,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, str(evidence / "stdout.log"))
         result = json.loads((report / "index.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["failed"], 0, result)
-        self.assertEqual(result["succeeded"], 7, result)
+        self.assertEqual(result["succeeded"], 8, result)
         wire = self.http("/__captured/events")
         events = {event["event"]: event for event in wire}
         self.assertEqual(events["unreal_native_integration"]["properties"]["$lib"], "posthog-unreal")
@@ -316,6 +316,55 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(len({event["distinct_id"] for event in parallel_a}), 1)
         self.assertEqual(len({event["distinct_id"] for event in parallel_b}), 1)
         self.assertNotEqual(parallel_a[0]["distinct_id"], parallel_b[0]["distinct_id"])
+        analytics = events["analytics_before"]
+        props = analytics["properties"]
+        self.assertEqual(props["precedence"], "caller")
+        self.assertEqual(props["registered_wins"], "registered")
+        self.assertEqual(props["context_wins"], "context")
+        self.assertEqual(props["default_only"], 123)
+        self.assertEqual(props["string"], "00123")
+        self.assertEqual(props["number"], 42)
+        self.assertIs(props["boolean"], False)
+        self.assertEqual(props["object"], {"nested": True})
+        self.assertEqual(props["array"], [None, 1, False])
+        for key in ("invalid", "secret", "$session_id"):
+            self.assertNotIn(key, props)
+        native_props = events["analytics_native"]["properties"]
+        self.assertNotIn("default_only", native_props)
+        self.assertEqual(native_props["registered_wins"], "registered")
+        self.assertEqual(native_props["context_wins"], "context")
+        self.assertEqual(events["analytics_native"]["distinct_id"], analytics["distinct_id"])
+        self.assertIn("$session_id", events["analytics_during"]["properties"])
+        self.assertNotIn("$session_id", events["analytics_after"]["properties"])
+        self.assertEqual(events["analytics_custom_session"]["properties"]["$session_id"],
+                         "01912345-6789-7abc-8def-0123456789ab")
+        replaced = events["analytics_replaced_defaults"]["properties"]
+        self.assertIs(replaced["replacement"], True)
+        self.assertIs(replaced["registered_only"], True)
+        self.assertEqual(replaced["registered_wins"], "registered")
+        self.assertNotIn("default_only", replaced)
+        auto_before = events["analytics_auto_before"]
+        auto_after = events["analytics_auto_after"]
+        self.assertNotEqual(auto_before["properties"]["$session_id"], auto_after["properties"]["$session_id"])
+        self.assertNotEqual(auto_before["distinct_id"], analytics["distinct_id"])
+        starts = [event for event in wire if event["event"] == "SessionStart" and event["properties"].get("test_suite") == "analytics"]
+        ends = [event for event in wire if event["event"] == "SessionEnd" and event["properties"].get("test_suite") == "analytics"]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(ends), 3)
+        explicit_start = next(event for event in starts if event["distinct_id"] == analytics["distinct_id"])
+        self.assertEqual(explicit_start["properties"]["chapter"], "intro")
+        self.assertEqual(explicit_start["properties"]["$session_id"], events["analytics_during"]["properties"]["$session_id"])
+        self.assertTrue(any(event["properties"]["$session_id"] == explicit_start["properties"]["$session_id"] for event in ends))
+        self.assertEqual(events["analytics_stock_blueprint"]["properties"]["string"], "00123")
+        for name in ("analytics_stock_blueprint", "analytics_multicast", "analytics_immediate",
+                     "analytics_retained_first", "analytics_retained_multicast", "analytics_restart"):
+            self.assertEqual(events[name]["distinct_id"], "analytics-user")
+        self.assertEqual(events["analytics_bound_second"]["distinct_id"], auto_before["distinct_id"])
+        self.assertEqual(events["Game Error"]["properties"]["Error"], "ordinary-error")
+        analytics_identify = next(event for event in wire if event["event"] == "$identify" and event["distinct_id"] == "analytics-user")
+        self.assertEqual(analytics_identify["properties"]["$anon_distinct_id"], analytics["distinct_id"])
+        for name in ("analytics_opted_out", "analytics_closed"):
+            self.assertNotIn(name, events)
         blueprint = events["blueprint_anonymous"]
         self.assertEqual(blueprint["properties"]["string"], "00123 玩家 🚀")
         self.assertEqual(blueprint["properties"]["number"], 42)

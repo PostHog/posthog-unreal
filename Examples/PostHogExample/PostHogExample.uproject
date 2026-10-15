@@ -11,6 +11,8 @@
 		}
 	],
 	"Plugins": [
+		{ "Name": "AnalyticsBlueprintLibrary", "Enabled": true },
+		{ "Name": "AnalyticsMulticast", "Enabled": true },
 		{
 			"Name": "PostHog",
 			"Enabled": true,

@@ -63,6 +63,7 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
     FPostHogProperties LastSetOnce;
     bool bHasPersonProperties = false;
     FString SessionId;
+    FString AnalyticsSessionId;
     FDateTime SessionStarted;
     FDateTime LastActivity;
     bool bForeground = true;
@@ -240,13 +241,14 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
     bool CanCaptureLocked() const { return !bClosed && Handle != 0 && !bOptedOut; }
     bool CanProcessPeopleLocked() const { return CanCaptureLocked() && Config.PersonProfiles != EPostHogPersonProfiles::Never; }
 
-    FPostHogEvent SnapshotLocked(const FString& Name, const FPostHogProperties& Properties)
+    FPostHogEvent SnapshotLocked(const FString& Name, const FPostHogProperties& Properties, const FPostHogProperties* Defaults = nullptr)
     {
         FPostHogEvent Event;
         Event.Event = Name; Event.DistinctId = DistinctId; Event.Timestamp = Config.Now();
         Event.ConsentGeneration = ConsentGeneration;
         Event.Uuid = PostHogJson::NewUuidV7(Event.Timestamp);
-        auto Merged = Registered.ToNative();
+        auto Merged = Defaults ? Defaults->ToNative() : Registered.ToNative();
+        if (Defaults) { PostHogJson::Merge(*Merged, *Registered.ToNative()); }
         PostHogJson::Merge(*Merged, *Config.Context.ToNative());
         Merged->SetStringField(TEXT("$lib"), TEXT("posthog-unreal"));
         Merged->SetStringField(TEXT("$lib_version"), TEXT("0.0.1"));
@@ -489,6 +491,9 @@ FString FPostHogClient::GetAnonymousId() const { FScopeLock Lock(&Impl->Mutex); 
 bool FPostHogClient::IsOptedOut() const { FScopeLock Lock(&Impl->Mutex); return Impl->bOptedOut; }
 
 EPostHogCaptureResult FPostHogClient::Capture(const FString& Name, const FPostHogProperties& Properties)
+{ return CaptureWithDefaults(Name, Properties, nullptr); }
+
+EPostHogCaptureResult FPostHogClient::CaptureWithDefaults(const FString& Name, const FPostHogProperties& Properties, const FPostHogProperties* Defaults)
 {
     if (!NonBlank(Name) || !Properties.IsValid()) { return EPostHogCaptureResult::Invalid; }
     FPostHogEvent Event;
@@ -496,7 +501,7 @@ EPostHogCaptureResult FPostHogClient::Capture(const FString& Name, const FPostHo
         FScopeLock Lock(&Impl->Mutex);
         if (Impl->bClosed) { return EPostHogCaptureResult::Closed; }
         if (!Impl->CanCaptureLocked()) { return EPostHogCaptureResult::Disabled; }
-        Event = Impl->SnapshotLocked(Name, Properties);
+        Event = Impl->SnapshotLocked(Name, Properties, Defaults);
     }
     return Impl->Emit(MoveTemp(Event));
 }
@@ -787,7 +792,50 @@ bool FPostHogClient::StartSession()
 }
 void FPostHogClient::EndSession()
 {
-    { FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return; } Impl->SessionId.Empty(); }
+    { FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return; } Impl->SessionId.Empty(); Impl->AnalyticsSessionId.Empty(); }
+    FlushAsync();
+}
+
+bool FPostHogClient::StartAnalyticsSession(const FPostHogProperties& Properties, const FPostHogProperties& Defaults)
+{
+    FPostHogEvent Event;
+    FString StartedId;
+    {
+        FScopeLock Lock(&Impl->Mutex);
+        if (!Impl->CanCaptureLocked()) { return false; }
+        const FDateTime Now = Impl->Config.Now();
+        Impl->SessionLocked(Now, false);
+        if (Impl->SessionId.IsEmpty()) { Impl->StartSessionLocked(Now); }
+        if (Impl->AnalyticsSessionId == Impl->SessionId) { return true; }
+        Event = Impl->SnapshotLocked(TEXT("SessionStart"), Properties, &Defaults);
+        StartedId = Impl->SessionId;
+        Impl->AnalyticsSessionId = StartedId;
+    }
+    const bool bAccepted = Impl->Emit(MoveTemp(Event)) == EPostHogCaptureResult::Accepted;
+    if (!bAccepted)
+    {
+        FScopeLock Lock(&Impl->Mutex);
+        if (Impl->AnalyticsSessionId == StartedId) { Impl->AnalyticsSessionId.Empty(); }
+    }
+    return bAccepted;
+}
+
+void FPostHogClient::EndAnalyticsSession(const FPostHogProperties& Defaults)
+{
+    TOptional<FPostHogEvent> Event;
+    {
+        FScopeLock Lock(&Impl->Mutex);
+        if (Impl->bClosed) { return; }
+        if (Impl->CanCaptureLocked() && !Impl->SessionId.IsEmpty())
+        {
+            const FString EndingId = Impl->SessionId;
+            Event = Impl->SnapshotLocked(TEXT("SessionEnd"), {}, &Defaults);
+            // An expired automatic session must not change the ID of the session being ended.
+            Event->Properties.SetString(TEXT("$session_id"), EndingId);
+        }
+        Impl->SessionId.Empty(); Impl->AnalyticsSessionId.Empty();
+    }
+    if (Event) { Impl->Emit(MoveTemp(Event.GetValue())); }
     FlushAsync();
 }
 bool FPostHogClient::SetSessionId(const FString& Id)

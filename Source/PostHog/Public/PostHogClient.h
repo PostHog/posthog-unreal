@@ -122,6 +122,10 @@ public:
 private:
     friend class FPostHogModule;
     friend class UPostHogSubsystem;
+    friend class FPostHogAnalyticsProvider;
+    EPostHogCaptureResult CaptureWithDefaults(const FString& Event, const FPostHogProperties& Properties, const FPostHogProperties* Defaults);
+    bool StartAnalyticsSession(const FPostHogProperties& Properties, const FPostHogProperties& Defaults);
+    void EndAnalyticsSession(const FPostHogProperties& Defaults);
     /** Recheck a completion before publishing it on the game thread. */
     FPostHogFlagReloadResult ValidateFlagReloadResult(FPostHogFlagReloadResult Result) const;
     /** Runtime module teardown: closes clients and joins all native work. */

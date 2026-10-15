@@ -1,4 +1,5 @@
 #include "PostHogSubsystem.h"
+#include "PostHogAnalyticsProvider.h"
 #include "PostHogJson.h"
 #include "PostHogTasks.h"
 #include "Engine/Engine.h"
@@ -155,9 +156,29 @@ bool UPostHogSubsystem::ReloadFeatureFlags()
     return true;
 }
 
+TSharedPtr<IAnalyticsProvider> UPostHogSubsystem::GetAnalyticsProvider()
+{
+    auto Current = GetClient();
+    if (!Current) { return nullptr; }
+    if (!AnalyticsProvider) { AnalyticsProvider = MakeShareable(new FPostHogAnalyticsProvider(Current)); }
+    return AnalyticsProvider;
+}
+
+bool UPostHogSubsystem::BindAnalyticsProvider()
+{
+    if (!GetAnalyticsProvider()) { return false; }
+    return FPostHogAnalyticsProvider::Bind(AnalyticsProvider);
+}
+
+void UPostHogSubsystem::UnbindAnalyticsProvider()
+{
+    if (IsInGameThread() && AnalyticsProvider) { AnalyticsProvider->Unbind(); }
+}
+
 void UPostHogSubsystem::Shutdown()
 {
     if (!IsInGameThread() || State == EPostHogSubsystemState::ShuttingDown || State == EPostHogSubsystemState::Deinitialized) { return; }
+    UnbindAnalyticsProvider(); AnalyticsProvider.Reset();
     StopObserving();
     FlagReload = {};
     if (Initialization)
