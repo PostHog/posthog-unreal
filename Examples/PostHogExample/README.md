@@ -46,6 +46,8 @@ The analytics and reload items are greyed out when no SDK client is configured.
 
 Forward movement is automatic. The track is dressed at runtime as a sunlit path cut through dense jungle, with temple ruins along it: sandstone flagstones over a dirt path, a colonnade with arches and guardian statues, torches, tree trunks and canopy closing in on both sides, and a misty chasm at the path edges. Jump fallen pillars, slide under collapsed lintels, dodge stone block walls, and collect gold relics along the open lane of every obstacle row. Speed increases with distance, and old track sections are retired as new ones appear.
 
+The course turns. After the opening straight, a 90-degree corner follows every four to seven sections, never bending the same way three times in a row. Turning is automatic: the runner and camera follow the bend, and the lane you are in stays the same through it, so there is no turn input. Corners have no obstacles. The layout comes from a fixed seed, so every run follows the same course.
+
 After building, you can open `PostHogExample.uproject` directly or use the launch script. Project defaults select the engine's empty Entry map, `RunnerGameMode`, and `RunnerGameInstance`. The track and runner appear when you press **Play**, not in the editing viewport. Keep machine-specific overrides in ignored `Config/UserEngine.ini`. Restart the editor after changing project defaults or rebuilding C++; the SDK does not support Live Coding/module reloading.
 
 ## Analytics
@@ -95,7 +97,7 @@ The built-in articulated runner makes the example runnable without a skeletal me
 
 ## Validation
 
-After building, run the three rule tests in Unreal's console:
+After building, run the four rule tests in Unreal's console:
 
 ```
 Automation RunTests PostHogExample.Runner
@@ -109,4 +111,4 @@ python3 Tests/runner_integration.py \
   --mock-server /path/to/sdk-mock-server/server.py
 ```
 
-The driver launches the same public run script, enables Python only for the test process, and checks the unconfigured game, normal/hard flags, a late flag response, a flag-request timeout, the title screen holding the countdown, real obstacle traversal, track cleanup, game over, and restart. The late-response scenario shortens the first countdown to ensure the run starts before the response arrives. It inspects ingested events, including run correlation and identity/session continuity. Logs, results, and captured mock events are written to ignored `artifacts/runner/`.
+The driver launches the same public run script, enables Python only for the test process, and checks the unconfigured game, normal/hard flags, a late flag response, a flag-request timeout, the title screen holding the countdown, real obstacle traversal, a corner pass, track cleanup, game over, and restart. The late-response scenario shortens the first countdown to ensure the run starts before the response arrives. It inspects ingested events, including run correlation and identity/session continuity. Logs, results, and captured mock events are written to ignored `artifacts/runner/`.

@@ -43,4 +43,41 @@ bool FRunnerTrackWindowTest::RunTest(const FString&)
 		2.f * RunnerRules::LaneWidth / 1500.f + 0.4f);
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRunnerCourseTest, "PostHogExample.Runner.Course",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FRunnerCourseTest::RunTest(const FString&)
+{
+	for (int32 Seed : {RunnerRules::CourseSeed, 1, 77, 4096})
+	{
+		RunnerRules::FCourse Course(Seed), Replay(Seed);
+		int32 Straights = 0, LastTurn = 0, SameTurns = 0, Corners = 0;
+		bool bDeterministic = true, bSpaced = true, bNoTriple = true, bOpeningStraight = true;
+		for (int32 Piece = 0; Piece < 2000; ++Piece)
+		{
+			const int32 Turn = Course.Next();
+			bDeterministic &= Turn == Replay.Next();
+			if (Piece < RunnerRules::OpeningStraights) bOpeningStraight &= Turn == 0;
+			if (Turn == 0)
+			{
+				++Straights;
+				bSpaced &= Straights <= RunnerRules::MaxStraights;
+				continue;
+			}
+			++Corners;
+			bSpaced &= Straights >= RunnerRules::MinStraights;
+			SameTurns = Turn == LastTurn ? SameTurns + 1 : 1;
+			bNoTriple &= SameTurns < 3;
+			LastTurn = Turn;
+			Straights = 0;
+		}
+		TestTrue(TEXT("Same seed replays the same course"), bDeterministic);
+		TestTrue(TEXT("First pieces are straight"), bOpeningStraight);
+		TestTrue(TEXT("Corners are spaced by straights"), bSpaced);
+		TestTrue(TEXT("Never three turns the same way in a row"), bNoTriple);
+		TestTrue(TEXT("Course has corners"), Corners > 200);
+	}
+	return true;
+}
 #endif

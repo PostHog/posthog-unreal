@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/GameModeBase.h"
 #include "PostHogProperties.h"
+#include "RunnerTrack.h"
 #include "RunnerGameMode.generated.h"
 
 class ARunnerTrackSegment;
@@ -54,6 +55,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
 	void QuitGame();
 
+	/** World location of a lane at a distance along the track's centre line; plans the course that far if needed. */
+	UFUNCTION(BlueprintCallable, Category="Runner|Track")
+	FVector TrackLocation(float DistanceCm, int32 Lane, float Z);
+	/** Distance along the centre line at the point closest to a location. */
+	UFUNCTION(BlueprintCallable, Category="Runner|Track")
+	float TrackDistanceAt(FVector WorldLocation) const;
+	UFUNCTION(BlueprintCallable, Category="Runner|Track")
+	int32 TrackLaneAt(FVector WorldLocation) const;
+	FRunnerTrackFrame TrackFrameAt(const FVector& WorldLocation) const;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Runner")
 	float Countdown = 3.f;
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Runner")
@@ -72,15 +83,17 @@ private:
 	TArray<TObjectPtr<ARunnerTrackSegment>> Segments;
 	UPROPERTY()
 	TObjectPtr<APlayerStart> RunnerStart;
+	UPROPERTY()
+	TObjectPtr<ARunnerTrack> Track;
 
-	float StartX = 0.f;
-	int32 NextSegment = 0;
+	float StartDistance = 0.f;
+	int32 NextPiece = 0;
 	bool bRunStarted = false;
 	bool bEndCaptured = false;
 	bool bLeavingLevel = false;
 	float RunSeconds = 0.f;
 	FString RunId;
-	void ExtendTrack(float PlayerX);
+	void ExtendTrack(float PlayerDistance);
 	void CaptureRunEnd(const FString& Reason);
 	FPostHogProperties RunProperties() const;
 	void OpenMenu(ERunnerMenu NewMenu);

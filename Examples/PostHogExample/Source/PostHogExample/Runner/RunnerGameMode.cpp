@@ -35,6 +35,7 @@ void ARunnerGameMode::InitGame(const FString& MapName, const FString& Options, F
     // Build an entire playable scene in the engine's empty Entry map before the player spawns.
     RunnerStart = GetWorld()->SpawnActor<APlayerStart>(FVector(600, 0, 100), FRotator::ZeroRotator);
     RunnerEnvironment::Spawn(GetWorld());
+    Track = GetWorld()->SpawnActor<ARunnerTrack>(FVector::ZeroVector, FRotator::ZeroRotator);
     ExtendTrack(600.f);
 }
 
@@ -48,7 +49,7 @@ void ARunnerGameMode::BeginPlay()
 {
     Super::BeginPlay();
     RunId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
-    if (APawn* Pawn = UGameplayStatics::GetPlayerPawn(this, 0)) StartX = Pawn->GetActorLocation().X;
+    if (APawn* Pawn = UGameplayStatics::GetPlayerPawn(this, 0)) StartDistance = TrackDistanceAt(Pawn->GetActorLocation());
     OpenMenu(Menu);
 }
 
@@ -85,33 +86,66 @@ void ARunnerGameMode::Tick(float DeltaSeconds)
     }
     if (APawn* Pawn = UGameplayStatics::GetPlayerPawn(this, 0))
     {
-        const float PlayerX = Pawn->GetActorLocation().X;
-        DistanceMeters = FMath::Max(0.f, (PlayerX - StartX) / 100.f);
-        ExtendTrack(PlayerX);
+        const float PlayerDistance = TrackDistanceAt(Pawn->GetActorLocation());
+        DistanceMeters = FMath::Max(0.f, (PlayerDistance - StartDistance) / 100.f);
+        ExtendTrack(PlayerDistance);
     }
 }
 
-void ARunnerGameMode::ExtendTrack(float PlayerX)
+void ARunnerGameMode::ExtendTrack(float PlayerDistance)
 {
-    while (NextSegment * RunnerRules::SegmentLength < PlayerX + RunnerRules::LookAhead)
+    if (!Track) return;
+    const float Horizon = PlayerDistance + RunnerRules::LookAhead;
+    // Plan past the spawn horizon so new scenery can be trimmed against the path that will follow a turn.
+    Track->PlanTo(Horizon + 2.f * RunnerRules::SceneryReach + RunnerRules::SegmentLength);
+    const TArray<FRunnerPiece>& Pieces = Track->GetPieces();
+    for (; NextPiece < Pieces.Num() && Pieces[NextPiece].StartDistance < Horizon; ++NextPiece)
     {
-        ARunnerTrackSegment* Segment = GetWorld()->SpawnActor<ARunnerTrackSegment>(
-            FVector(NextSegment * RunnerRules::SegmentLength, 0.f, 0.f), FRotator::ZeroRotator);
+        const FRunnerPiece& Piece = Pieces[NextPiece];
+        // A long jump ahead (tests, tools) skips pieces that would be retired immediately.
+        if (RunnerRules::ShouldRetire(Piece.StartDistance, PlayerDistance)) continue;
+        ARunnerTrackSegment* Segment = GetWorld()->SpawnActor<ARunnerTrackSegment>(Piece.Location, FRotator(0.f, Piece.Yaw, 0.f));
         if (!Segment) break;
-        Segment->Build(NextSegment);
+        Segment->StartDistance = Piece.StartDistance;
+        Segment->TrackLength = Piece.Length;
+        if (Piece.Turn == 0)
+        {
+            Segment->Build(Piece.SegmentIndex);
+            Segment->TrimScenery(Pieces);
+        }
+        else Segment->BuildCorner(Piece.Turn);
         Segments.Add(Segment);
-        ++NextSegment;
     }
-    Segments.RemoveAll([PlayerX](ARunnerTrackSegment* Segment)
+    Segments.RemoveAll([PlayerDistance](ARunnerTrackSegment* Segment)
     {
         if (!IsValid(Segment)) return true;
-        if (RunnerRules::ShouldRetire(Segment->GetActorLocation().X, PlayerX))
+        if (RunnerRules::ShouldRetire(Segment->StartDistance, PlayerDistance))
         {
             Segment->Destroy();
             return true;
         }
         return false;
     });
+}
+
+FVector ARunnerGameMode::TrackLocation(float DistanceCm, int32 Lane, float Z)
+{
+    return Track ? Track->LocationAt(DistanceCm, Lane, Z) : FVector::ZeroVector;
+}
+
+float ARunnerGameMode::TrackDistanceAt(FVector WorldLocation) const
+{
+    return TrackFrameAt(WorldLocation).Distance;
+}
+
+int32 ARunnerGameMode::TrackLaneAt(FVector WorldLocation) const
+{
+    return Track ? Track->LaneAt(WorldLocation) : 0;
+}
+
+FRunnerTrackFrame ARunnerGameMode::TrackFrameAt(const FVector& WorldLocation) const
+{
+    return Track ? Track->FrameAt(WorldLocation) : FRunnerTrackFrame();
 }
 
 FPostHogProperties ARunnerGameMode::RunProperties() const

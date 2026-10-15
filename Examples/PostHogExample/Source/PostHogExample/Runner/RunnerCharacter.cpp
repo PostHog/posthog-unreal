@@ -112,12 +112,17 @@ void ARunnerCharacter::Tick(float DeltaSeconds)
 
 	GetCharacterMovement()->MaxWalkSpeed = RunnerGameMode->GetRunSpeed();
 	GetCharacterMovement()->MaxWalkSpeedCrouched = RunnerGameMode->GetRunSpeed();
-	AddMovementInput(FVector::ForwardVector);
+	// Follow the track's centre line; steering velocity directly keeps the runner from drifting wide in corners.
+	const FRunnerTrackFrame Frame = RunnerGameMode->TrackFrameAt(GetActorLocation());
+	FVector& Velocity = GetCharacterMovement()->Velocity;
+	Velocity = Frame.Forward * Velocity.Size2D() + FVector(0.f, 0.f, Velocity.Z);
+	AddMovementInput(Frame.Forward);
+	SetActorRotation(FMath::RInterpTo(GetActorRotation(), Frame.Forward.Rotation(), DeltaSeconds, 10.f));
 
-	const float DesiredY = FMath::FInterpConstantTo(GetActorLocation().Y,
-		RunnerRules::LaneY(TargetLane), DeltaSeconds, 1500.f);
+	const float Offset = FVector::DotProduct(GetActorLocation() - Frame.Center, Frame.Right);
+	const float DesiredOffset = FMath::FInterpConstantTo(Offset, RunnerRules::LaneY(TargetLane), DeltaSeconds, 1500.f);
 	FHitResult Hit;
-	AddActorWorldOffset(FVector(0.f, DesiredY - GetActorLocation().Y, 0.f), true, &Hit);
+	AddActorWorldOffset(Frame.Right * (DesiredOffset - Offset), true, &Hit);
 	if (Hit.bBlockingHit && Hit.GetComponent() && Hit.GetComponent()->ComponentHasTag(TEXT("RunnerHazard")))
 	{
 		RunnerGameMode->EndRun();
