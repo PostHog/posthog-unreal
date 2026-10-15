@@ -203,23 +203,28 @@ bool FPostHogFlagsTest::RunTest(const FString& Parameters)
         Check(CallCount() == BeforeCoalescing + 1, TEXT("concurrent reloads issue one request"));
         auto OldContext = Client->ReloadFeatureFlagsAsync();
         Client->Identify(TEXT("flag-user"));
-        Check(!Client->HasLoadedFeatureFlags(), TEXT("identify immediately invalidates cache"));
+        Check(Client->HasLoadedFeatureFlags() && Client->IsFeatureEnabled(TEXT("bool-value"), false), TEXT("identify keeps previous flags readable during reload"));
         Check(OldContext.Get().Status == EPostHogFlagReloadStatus::Success, TEXT("cycle follows newest context"));
         auto Calls = Control(TEXT("/__captured/all")); const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
         Check(Calls->TryGetArrayField(TEXT("flags_calls"), Entries) && Entries->Num() > 0 && Entries->Last()->AsObject()->GetStringField(TEXT("distinct_id")) == TEXT("flag-user"), TEXT("latest request uses current identity"));
         FPostHogProperties Person; Person.SetString(TEXT("plan"), TEXT("pro"));
-        Check(Client->SetPersonPropertiesForFlags(Person, false) && !Client->HasLoadedFeatureFlags(), TEXT("targeting invalidates without reload"));
-        auto WaitLoaded = [&]
+        auto PersistedWithoutCache = [&]
         {
-            for (int32 Attempt = 0; Attempt < 300 && !Client->HasLoadedFeatureFlags(); ++Attempt) { FPlatformProcess::SleepNoStats(0.01f); }
-            return Client->HasLoadedFeatureFlags();
+            Client->FlushAsync().Get(); FString StateText; FFileHelper::LoadFileToString(StateText, *StatePath);
+            auto State = PostHogJson::Decode(StateText);
+            return State && !State->HasField(TEXT("cached_flags")) && !State->HasField(TEXT("flag_context"));
         };
-        Check(Client->SetPersonPropertiesForFlags(Person, true) && WaitLoaded(), TEXT("same person properties honor requested reload"));
+        Check(Client->SetPersonPropertiesForFlags(Person, false) && Client->HasLoadedFeatureFlags(), TEXT("targeting keeps flags readable without reload"));
+        Check(PersistedWithoutCache(), TEXT("stale cache is not persisted under the new context"));
+        const int32 BeforePerson = CallCount();
+        Check(Client->SetPersonPropertiesForFlags(Person, true) && Client->ReloadFeatureFlagsAsync().Get().Status == EPostHogFlagReloadStatus::Success && CallCount() > BeforePerson, TEXT("same person properties honor requested reload"));
         Client->Group(TEXT("company"), TEXT("flags-company"));
         Client->ReloadFeatureFlagsAsync().Wait();
         FPostHogProperties Group; Group.SetNumber(TEXT("size"), 10);
-        Check(Client->SetGroupPropertiesForFlags(TEXT("company"), Group, false) && !Client->HasLoadedFeatureFlags(), TEXT("group targeting invalidates without reload"));
-        Check(Client->SetGroupPropertiesForFlags(TEXT("company"), Group, true) && WaitLoaded(), TEXT("same group properties honor requested reload"));
+        Check(Client->SetGroupPropertiesForFlags(TEXT("company"), Group, false) && Client->HasLoadedFeatureFlags(), TEXT("group targeting keeps flags readable without reload"));
+        Check(PersistedWithoutCache(), TEXT("stale cache is not persisted under the new group context"));
+        const int32 BeforeGroup = CallCount();
+        Check(Client->SetGroupPropertiesForFlags(TEXT("company"), Group, true) && Client->ReloadFeatureFlagsAsync().Get().Status == EPostHogFlagReloadStatus::Success && CallCount() > BeforeGroup, TEXT("same group properties honor requested reload"));
         Check(Client->ReloadFeatureFlagsAsync().Get().Status == EPostHogFlagReloadStatus::Success, TEXT("targeting reload"));
         FFileHelper::LoadFileToString(Text, *StatePath);
         Saved = PostHogJson::Decode(Text); const TSharedPtr<FJsonObject>* Context = nullptr;

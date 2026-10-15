@@ -188,7 +188,7 @@ Proposed settings include `ProjectToken`, `Host`, `PersonProfiles`, lifecycle ca
 
 Fetch flags asynchronously with explicit identity, groups, and targeting properties. Use only the project token in distributed games; local evaluation requiring a secret key is out of scope.
 
-Unreal owns a context-scoped cache and generation counter. Identity/reset/group/targeting changes invalidate the relevant context; stale completions cannot install another user's flags or publish callbacks after opt-out/shutdown. Refresh errors may retain previously valid values only for the same context. Getters never block on network requests.
+Unreal owns a context-scoped cache and generation counter. Reset and opt-out clear the cache; identity/group/targeting changes mark it stale and reload while keeping the previous values readable in memory (never persisted under the new context). Stale completions cannot install another user's flags or publish callbacks after opt-out/shutdown. Refresh errors leave the in-memory values unchanged. Getters never block on network requests.
 
 Expose values, payloads, and evaluation metadata from Rust without recording exposure while serializing/cache-loading. Rust's snapshot getters can emit `$feature_flag_called`; enumerating those getters is not a side-effect-free cache export. Add an explicit export path, and route actual exposure events once through the enriched Unreal client, including deduplication and server-controlled minimal-event rules from the spec.
 
