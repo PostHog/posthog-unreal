@@ -40,6 +40,7 @@ struct POSTHOG_API FPostHogConfig
     int32 MaxBatchSize = 50;
     int32 RequestTimeoutSeconds = 10;
     int32 ShutdownTimeoutMilliseconds = 3000;
+    FPostHogReplaySettings Replay;
     /** Plain context sampled by the host on the game thread, not by capture. */
     FPostHogProperties Context;
     /** Runs on the capturing thread outside state locks. Reentrant calls are
@@ -110,6 +111,8 @@ public:
     void ResetGroupPropertiesForFlags(const FString& Type = FString(), bool bReload = true);
 
     FString GetSessionId();
+    /** Current session id if one is active and unexpired; never starts or rotates a session. */
+    FString PeekSessionId() const;
     bool StartSession();
     void EndSession();
     bool SetSessionId(const FString& SessionId);
@@ -118,6 +121,12 @@ public:
     void StartApplicationLifecycle(bool bInForeground = true);
     void OnBackground();
     void OnForeground();
+
+    /** Submits one screenshot frame as a $snapshot event. Width/Height are the captured
+     * screen size, not the JPEG size. Skips BeforeSend and enrichment; no I/O on the caller. */
+    EPostHogCaptureResult SubmitReplaySnapshot(const FString& SessionId, int32 Width, int32 Height, const TArray64<uint8>& Jpeg, const FDateTime& CapturedAt);
+    /** Local opt-in, consent, and the last known remote session_recording config all allow recording. */
+    bool IsSessionReplayAllowed() const;
 
 private:
     friend class FPostHogModule;

@@ -32,7 +32,7 @@ bool ParseRecords(const FJsonObject& Records, TMap<FString, FPostHogFeatureFlagR
 
 void FPostHogFlagCache::Clear()
 {
-    Flags.Empty(); Reported.Empty(); bLoaded = false; ++Revision;
+    Flags.Empty(); Reported.Empty(); SessionRecording.Reset(); bLoaded = false; ++Revision;
 }
 
 EPostHogFlagReloadStatus FPostHogFlagCache::Apply(const TSharedRef<FJsonObject>& Response)
@@ -60,8 +60,19 @@ EPostHogFlagReloadStatus FPostHogFlagCache::Apply(const TSharedRef<FJsonObject>&
     for (auto& Pair : Incoming) { Flags.Add(Pair.Key, MoveTemp(Pair.Value)); }
     // Partial responses cannot grow the cache beyond the JSON admission bound.
     if (!Serialize().IsValid()) { Flags = MoveTemp(Previous); return EPostHogFlagReloadStatus::Failed; }
+    // Only an object enables replay; false, null, or a missing field disables it.
+    const TSharedPtr<FJsonObject>* Recording = nullptr;
+    if (Response->TryGetObjectField(TEXT("session_recording"), Recording)) { RestoreSessionRecording(*Recording); }
+    else { SessionRecording.Reset(); }
     bLoaded = true; Reported.Empty(); ++Revision;
     return bPartial ? EPostHogFlagReloadStatus::Partial : EPostHogFlagReloadStatus::Success;
+}
+
+void FPostHogFlagCache::RestoreSessionRecording(const TSharedPtr<FJsonObject>& Saved)
+{
+    SessionRecording.Reset();
+    auto Config = FPostHogProperties::FromNative(Saved.ToSharedRef());
+    if (Config.IsValid()) { SessionRecording = MoveTemp(Config); }
 }
 
 FPostHogProperties FPostHogFlagCache::Serialize() const

@@ -70,10 +70,15 @@ void RemoveNullObjectProperties(const TSharedPtr<FJsonValue>& Value)
     }
 }
 
+int64 UnixMilliseconds(const FDateTime& Time)
+{
+    return (Time - FDateTime(1970, 1, 1)).GetTicks() / ETimespan::TicksPerMillisecond;
+}
+
 FString NewUuidV7(const FDateTime& Now)
 {
     // RFC 9562: 48-bit Unix milliseconds, version 7, variant 10, random remainder.
-    const uint64 Milliseconds = static_cast<uint64>((Now - FDateTime(1970, 1, 1)).GetTotalMilliseconds());
+    const uint64 Milliseconds = static_cast<uint64>(UnixMilliseconds(Now));
     FGuid Random = FGuid::NewGuid();
     return FGuid(static_cast<uint32>(Milliseconds >> 16),
         (static_cast<uint32>(Milliseconds & 0xffff) << 16) | 0x7000 | (Random.B & 0x0fff),

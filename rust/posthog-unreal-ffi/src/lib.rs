@@ -1,12 +1,12 @@
 //! C ABI for the PostHog Unreal native integration.
-//! The upstream worker owns delivery. This bridge does not add a second queue.
+//! The upstream workers own delivery. This bridge does not add a second queue.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use posthog_rs::embedding::{EmbeddingOptions, EnqueueResult, FileEventStore};
+use posthog_rs::embedding::{EmbeddingOptions, EnqueueResult, FileEventStore, ReplayOptions};
 use posthog_rs::{Client, ClientOptionsBuilder, EvaluateFlagsOptions, Event};
 use serde::Deserialize;
 #[cfg(test)]
@@ -14,8 +14,9 @@ use serde_json::json;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const MAX_INPUT: usize = 1024 * 1024;
+const MAX_REPLAY_INPUT: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 
 #[repr(i32)]
@@ -78,6 +79,8 @@ struct Options {
     max_queue_size: usize,
     #[serde(default = "default_batch_size")]
     max_batch_size: usize,
+    #[serde(default)]
+    replay: Option<ReplayOptions>,
 }
 
 fn default_request_timeout() -> u64 {
@@ -182,7 +185,12 @@ fn contain(f: impl FnOnce() -> Result<Status>) -> Status {
 
 // SAFETY: the caller supplies readable bytes for the duration of the call.
 unsafe fn parse<T: serde::de::DeserializeOwned>(bytes: Bytes) -> Result<T> {
-    if bytes.data.is_null() || bytes.len == 0 || bytes.len > MAX_INPUT {
+    unsafe { parse_limited(bytes, MAX_INPUT) }
+}
+
+// SAFETY: as for `parse`.
+unsafe fn parse_limited<T: serde::de::DeserializeOwned>(bytes: Bytes, limit: usize) -> Result<T> {
+    if bytes.data.is_null() || bytes.len == 0 || bytes.len > limit {
         return Err(Status::InvalidInput);
     }
     let input = unsafe { std::slice::from_raw_parts(bytes.data, bytes.len) };
@@ -238,6 +246,12 @@ pub unsafe extern "C" fn phu_create(version: u32, options: Bytes, out_handle: *m
         {
             return Err(Status::InvalidInput);
         }
+        if options
+            .replay
+            .is_some_and(|replay| replay.validate().is_err())
+        {
+            return Err(Status::InvalidInput);
+        }
         let opted_out = options.opted_out;
         let store = Arc::new(
             FileEventStore::open(&options.storage_path).map_err(|_| Status::StorageError)?,
@@ -248,6 +262,7 @@ pub unsafe extern "C" fn phu_create(version: u32, options: Bytes, out_handle: *m
                 sdk_name: "posthog-unreal".into(),
                 sdk_version: env!("CARGO_PKG_VERSION").into(),
                 enabled: !opted_out,
+                replay: options.replay,
             })
             .api_key(options.project_token)
             .host(options.host)
@@ -286,33 +301,82 @@ pub unsafe extern "C" fn phu_create(version: u32, options: Bytes, out_handle: *m
 #[no_mangle]
 pub unsafe extern "C" fn phu_capture(handle: u64, event: Bytes) -> Status {
     contain(|| {
-        let call = acquire(handle)?;
-        {
-            let calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-            if calls.closed {
-                return Err(Status::Closed);
-            }
-            if calls.opted_out {
-                return Err(Status::Disabled);
-            }
-        }
+        let call = admit_capture(handle)?;
         let input: Capture = unsafe { parse(event)? };
         if input.event.trim().is_empty() || input.distinct_id.trim().is_empty() {
             return Err(Status::InvalidInput);
         }
-        let event = Event::from_prepared(
-            input.event,
-            input.distinct_id,
-            input.properties.into_iter().collect(),
-            input.timestamp,
-            input.uuid,
-        );
-        Ok(match call.0.client.capture_prepared(event) {
-            EnqueueResult::Accepted => Status::Accepted,
-            EnqueueResult::Disabled => Status::Disabled,
-            EnqueueResult::Closed => Status::Closed,
-            EnqueueResult::QueueFull => Status::QueueFull,
-        })
+        Ok(enqueue_status(
+            call.0.client.capture_prepared(input.into_event()),
+        ))
+    })
+}
+
+/// Acquire a call that may enqueue: open and not opted out.
+fn admit_capture(handle: u64) -> Result<Call> {
+    let call = acquire(handle)?;
+    {
+        let calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
+        if calls.closed {
+            return Err(Status::Closed);
+        }
+        if calls.opted_out {
+            return Err(Status::Disabled);
+        }
+    }
+    Ok(call)
+}
+
+impl Capture {
+    fn into_event(self) -> Event {
+        Event::from_prepared(
+            self.event,
+            self.distinct_id,
+            self.properties.into_iter().collect(),
+            self.timestamp,
+            self.uuid,
+        )
+    }
+}
+
+fn enqueue_status(result: EnqueueResult) -> Status {
+    match result {
+        EnqueueResult::Accepted => Status::Accepted,
+        EnqueueResult::Disabled => Status::Disabled,
+        EnqueueResult::Closed => Status::Closed,
+        EnqueueResult::QueueFull => Status::QueueFull,
+    }
+}
+
+fn is_snapshot(input: &Capture) -> bool {
+    input.event == "$snapshot"
+        && !input.distinct_id.trim().is_empty()
+        && input
+            .properties
+            .get("$session_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && input
+            .properties
+            .get("$snapshot_data")
+            .and_then(Value::as_array)
+            .is_some_and(|data| !data.is_empty())
+}
+
+/// Admits one prepared `$snapshot` event into the in-memory replay queue.
+/// # Safety
+/// `event` must reference readable memory for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn phu_capture_replay(handle: u64, event: Bytes) -> Status {
+    contain(|| {
+        let call = admit_capture(handle)?;
+        let input: Capture = unsafe { parse_limited(event, MAX_REPLAY_INPUT)? };
+        if !is_snapshot(&input) {
+            return Err(Status::InvalidInput);
+        }
+        Ok(enqueue_status(
+            call.0.client.capture_replay_snapshot(input.into_event()),
+        ))
     })
 }
 
@@ -566,6 +630,147 @@ mod tests {
         assert_eq!(value["text"], "玩家 🚀");
         unsafe {
             phu_buffer_free(output);
+        }
+    }
+
+    fn storage_path() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("phu-test-{}-{next}", std::process::id()))
+    }
+
+    fn create(replay: Option<Value>) -> (u64, std::path::PathBuf) {
+        let storage = storage_path();
+        let mut options = json!({
+            "project_token": "phc_test",
+            "host": "http://127.0.0.1:1",
+            "storage_path": storage,
+            "shutdown_timeout_ms": 100,
+        });
+        if let Some(replay) = replay {
+            options["replay"] = replay;
+        }
+        let options = options.to_string();
+        let mut handle = 0;
+        assert_eq!(
+            unsafe { phu_create(ABI_VERSION, bytes(&options), &mut handle) },
+            Status::Ok
+        );
+        (handle, storage)
+    }
+
+    fn close(handle: u64, storage: std::path::PathBuf) {
+        assert_eq!(phu_close(handle), Status::Ok);
+        let _ = std::fs::remove_dir_all(storage);
+    }
+
+    fn snapshot(properties: Value) -> String {
+        json!({
+            "event": "$snapshot",
+            "distinct_id": "user",
+            "uuid": Uuid::nil(),
+            "timestamp": "2026-10-15T12:00:00Z",
+            "properties": properties,
+        })
+        .to_string()
+    }
+
+    fn frame(padding: usize) -> String {
+        snapshot(json!({
+            "$session_id": "session",
+            "$window_id": "session",
+            "$snapshot_source": "mobile",
+            "$snapshot_data": [{"type": 4, "timestamp": 1, "data": {"href": "x".repeat(padding)}}],
+        }))
+    }
+
+    #[test]
+    fn replay_input_size_limit_is_separate_from_events() {
+        let oversized = Bytes {
+            data: std::ptr::NonNull::<u8>::dangling().as_ptr(),
+            len: MAX_REPLAY_INPUT + 1,
+        };
+        assert_eq!(
+            unsafe { parse_limited::<Value>(oversized, MAX_REPLAY_INPUT) }.unwrap_err(),
+            Status::InvalidInput
+        );
+        let (handle, storage) = create(Some(json!({})));
+        assert_eq!(
+            unsafe { phu_capture_replay(handle, oversized) },
+            Status::InvalidInput
+        );
+        let large = frame(2 * MAX_INPUT);
+        assert!(large.len() > MAX_INPUT && large.len() <= MAX_REPLAY_INPUT);
+        assert_eq!(
+            unsafe { phu_capture_replay(handle, bytes(&large)) },
+            Status::Accepted
+        );
+        assert_eq!(
+            unsafe { phu_capture(handle, bytes(&large)) },
+            Status::InvalidInput
+        );
+        close(handle, storage);
+    }
+
+    #[test]
+    fn replay_snapshots_are_validated() {
+        let (handle, storage) = create(Some(json!({"flush_interval_ms": 60000})));
+        let capture = |input: &str| unsafe { phu_capture_replay(handle, bytes(input)) };
+        assert_eq!(capture(&frame(0)), Status::Accepted);
+        let data = json!([{"type": 4, "timestamp": 1, "data": {}}]);
+        for invalid in [
+            snapshot(json!({"$snapshot_data": data})),
+            snapshot(json!({"$session_id": "", "$snapshot_data": data})),
+            snapshot(json!({"$session_id": 1, "$snapshot_data": data})),
+            snapshot(json!({"$session_id": "session", "$snapshot_data": []})),
+            snapshot(json!({"$session_id": "session"})),
+            frame(0).replace(r#""event":"$snapshot""#, r#""event":"$pageview""#),
+            frame(0).replace(r#""distinct_id":"user""#, r#""distinct_id":" ""#),
+        ] {
+            assert_eq!(capture(&invalid), Status::InvalidInput, "{invalid}");
+        }
+        assert_eq!(phu_opt_out(handle), Status::Ok);
+        assert_eq!(capture(&frame(0)), Status::Disabled);
+        assert_eq!(phu_begin_shutdown(handle), Status::Ok);
+        assert_eq!(capture(&frame(0)), Status::Closed);
+        close(handle, storage);
+    }
+
+    #[test]
+    fn replay_is_disabled_unless_configured() {
+        let (handle, storage) = create(None);
+        assert_eq!(
+            unsafe { phu_capture_replay(handle, bytes(&frame(0))) },
+            Status::Disabled
+        );
+        close(handle, storage);
+    }
+
+    #[test]
+    fn replay_options_are_bounded() {
+        for replay in [
+            json!({"unknown": 1}),
+            json!({"max_queue_bytes": 1024}),
+            json!({"max_queue_bytes": 1048576, "max_batch_bytes": 2097152}),
+            json!({"max_batch_bytes": 1024}),
+            json!({"flush_interval_ms": 99}),
+            json!({"flush_interval_ms": 60001}),
+        ] {
+            let storage = storage_path();
+            let options = json!({
+                "project_token": "phc_test",
+                "host": "http://127.0.0.1:1",
+                "storage_path": storage,
+                "replay": replay,
+            })
+            .to_string();
+            let mut handle = 0;
+            assert_eq!(
+                unsafe { phu_create(ABI_VERSION, bytes(&options), &mut handle) },
+                Status::InvalidInput,
+                "{replay}"
+            );
+            assert!(!storage.exists());
         }
     }
 }

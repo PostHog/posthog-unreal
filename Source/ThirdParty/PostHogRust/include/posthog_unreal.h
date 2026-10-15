@@ -9,8 +9,9 @@ extern "C" {
 #endif
 
 /* PostHog Unreal native ABI. */
-#define PHU_ABI_VERSION 1u
+#define PHU_ABI_VERSION 2u
 #define PHU_MAX_INPUT (1024u * 1024u)
+#define PHU_MAX_REPLAY_INPUT (8u * 1024u * 1024u)
 
 typedef uint64_t phu_handle;
 typedef int32_t phu_status;
@@ -45,7 +46,9 @@ typedef struct phu_buffer {
 uint32_t phu_abi_version(void);
 
 /* options: {project_token, host, storage_path, opted_out?, request_timeout_seconds?, shutdown_timeout_ms?,
- * flush_at?, flush_interval_ms?, max_queue_size?, max_batch_size?}.
+ * flush_at?, flush_interval_ms?, max_queue_size?, max_batch_size?, replay?}.
+ * replay: {max_queue_bytes? (16 MiB, 1 MiB..256 MiB), max_batch_bytes? (1 MiB, 64 KiB..queue),
+ * flush_interval_ms? (1000, 100..60000)}. Absent replay => phu_capture_replay returns DISABLED.
  * Configuration is explicit; there is no credential or host fallback.
  * Creates HTTP clients/threads: run off the game thread. Returns handle 0 on error.
  */
@@ -58,7 +61,16 @@ phu_status phu_create(uint32_t abi_version, phu_bytes options, phu_handle* out_h
  */
 phu_status phu_capture(phu_handle handle, phu_bytes event);
 
-/* Blocking delivery attempt, NOT a delivery receipt. Run off the game thread. */
+/* event: the complete $snapshot envelope, UTF-8 JSON, <= PHU_MAX_REPLAY_INPUT bytes.
+ * Validated: event == "$snapshot", non-empty distinct_id, properties.$session_id non-empty
+ * string, properties.$snapshot_data non-empty array. Admission into a bounded in-memory
+ * replay queue, separate from the /batch/ event store (never spooled to disk in the PoC).
+ * ACCEPTED | DISABLED (opted out, or replay not enabled in options) | CLOSED | QUEUE_FULL | INVALID_INPUT.
+ */
+phu_status phu_capture_replay(phu_handle handle, phu_bytes event);
+
+/* Blocking delivery attempt, NOT a delivery receipt. Does not touch replay.
+ * Run off the game thread. */
 phu_status phu_flush(phu_handle handle);
 
 /* context: {distinct_id, groups?, person_properties?, group_properties?}.
@@ -71,15 +83,19 @@ phu_status phu_flush(phu_handle handle);
  */
 phu_status phu_flags(phu_handle handle, phu_bytes context, phu_buffer* out_buffer);
 
-/* Stop admission immediately, then schedule durable purge. Host persists consent.
+/* Stop admission immediately, then schedule durable purge. Opt-out also drops queued
+ * replay frames; opt-in reopens replay admission. Host persists consent.
  * Opt-in waits for purge; checkpoint waits for preceding worker/disk operations.
  * Both opt-in and checkpoint must run off the game thread.
  */
 phu_status phu_opt_out(phu_handle handle);
 phu_status phu_opt_in(phu_handle handle);
+/* Checkpoint report: {pending, persistence_errors, delivered, terminally_dropped,
+ * replay_pending, replay_dropped}. Replay counters count frames. */
 phu_status phu_checkpoint(phu_handle handle, phu_buffer* out_report);
 
-/* Stops new admission, waits for admitted operations, drains/joins upstream.
+/* Stops new admission, waits for admitted operations, drains/joins upstream,
+ * including the replay worker, within the same shutdown budget.
  * Run off the game thread. Requests are bounded by shutdown_timeout_ms; thread
  * scheduling and filesystem calls are not hard realtime. CLOSED means invalid
  * handle or another caller has
