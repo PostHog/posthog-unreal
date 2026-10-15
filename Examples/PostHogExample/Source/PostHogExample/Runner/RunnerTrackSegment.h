@@ -4,11 +4,11 @@
 #include "GameFramework/Actor.h"
 #include "RunnerTrackSegment.generated.h"
 
-class UStaticMesh;
+class FRunnerRuins;
 class UStaticMeshComponent;
 class UMaterialInstanceDynamic;
 
-/** One disposable section of track, including its obstacles, coins, and scenery. */
+/** One disposable section of track, including its obstacles, relics, and ruins. */
 UCLASS()
 class ARunnerTrackSegment : public AActor
 {
@@ -19,14 +19,7 @@ public:
 	void Build(int32 SegmentIndex);
 
 private:
-	UPROPERTY()
-	TObjectPtr<UStaticMesh> Cube;
-	UPROPERTY()
-	TObjectPtr<UStaticMesh> Sphere;
-	UPROPERTY()
-	TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
-
-	UMaterialInstanceDynamic* MakeMaterial(FLinearColor Color);
-	UStaticMeshComponent* AddBlock(FVector Position, FVector Size, UMaterialInstanceDynamic* Material, bool bCollision);
-	void AddCoin(FVector Position, UMaterialInstanceDynamic* Material);
+	UStaticMeshComponent* AddBlock(FVector Position, FVector Size, UMaterialInstanceDynamic* Material, bool bVisible = true);
+	void AddCoin(FVector Position, FRunnerRuins& Ruins);
+	void AddHazards(int32 SafeLane, FRandomStream& Random, FRunnerRuins& Ruins);
 };

@@ -1,48 +1,26 @@
 #include "RunnerTrackSegment.h"
+#include "RunnerPalette.h"
 #include "RunnerRules.h"
+#include "RunnerRuins.h"
 #include "Components/SceneComponent.h"
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/CollisionProfile.h"
-#include "Engine/StaticMesh.h"
 #include "Materials/MaterialInstanceDynamic.h"
-#include "Materials/MaterialInterface.h"
-#include "UObject/ConstructorHelpers.h"
 
 ARunnerTrackSegment::ARunnerTrackSegment()
 {
 	RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeAsset(TEXT("/Engine/BasicShapes/Cube"));
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> SphereAsset(TEXT("/Engine/BasicShapes/Sphere"));
-	Cube = CubeAsset.Object;
-	Sphere = SphereAsset.Object;
-}
-
-UMaterialInstanceDynamic* ARunnerTrackSegment::MakeMaterial(FLinearColor Color)
-{
-	UMaterialInterface* Base = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial"));
-	UMaterialInstanceDynamic* Material = UMaterialInstanceDynamic::Create(Base, this);
-	Material->SetVectorParameterValue(TEXT("Color"), Color);
-	Materials.Add(Material);
-	return Material;
 }
 
 UStaticMeshComponent* ARunnerTrackSegment::AddBlock(FVector Position, FVector Size,
-	UMaterialInstanceDynamic* Material, bool bCollision)
+	UMaterialInstanceDynamic* Material, bool bVisible)
 {
-	UStaticMeshComponent* Mesh = NewObject<UStaticMeshComponent>(this);
-	Mesh->SetupAttachment(RootComponent);
-	Mesh->SetRelativeLocation(Position);
-	Mesh->SetRelativeScale3D(Size / 100.f);
-	Mesh->SetStaticMesh(Cube);
-	Mesh->SetMaterial(0, Material);
-	Mesh->SetCollisionProfileName(bCollision ? UCollisionProfile::BlockAll_ProfileName : UCollisionProfile::NoCollision_ProfileName);
-	Mesh->RegisterComponent();
-	AddInstanceComponent(Mesh);
-	return Mesh;
+	return RunnerRuins::AttachMesh(this, RootComponent, URunnerPaletteSubsystem::Get(this).Cube, Material, Position, Size,
+		FRotator::ZeroRotator, UCollisionProfile::BlockAll_ProfileName, bVisible);
 }
 
-void ARunnerTrackSegment::AddCoin(FVector Position, UMaterialInstanceDynamic* Material)
+void ARunnerTrackSegment::AddCoin(FVector Position, FRunnerRuins& Ruins)
 {
 	USphereComponent* Trigger = NewObject<USphereComponent>(this);
 	Trigger->SetupAttachment(RootComponent);
@@ -55,83 +33,74 @@ void ARunnerTrackSegment::AddCoin(FVector Position, UMaterialInstanceDynamic* Ma
 	Trigger->ComponentTags.Add(TEXT("RunnerCoin"));
 	Trigger->RegisterComponent();
 	AddInstanceComponent(Trigger);
-
-	UStaticMeshComponent* Visual = NewObject<UStaticMeshComponent>(this);
-	Visual->SetupAttachment(Trigger);
-	Visual->SetStaticMesh(Sphere);
-	Visual->SetRelativeScale3D(FVector(0.4f, 0.13f, 0.4f));
-	Visual->SetMaterial(0, Material);
-	Visual->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	Visual->RegisterComponent();
-	AddInstanceComponent(Visual);
+	Ruins.Relic(Trigger);
 }
 
 void ARunnerTrackSegment::Build(int32 SegmentIndex)
 {
+	URunnerPaletteSubsystem& Palette = URunnerPaletteSubsystem::Get(this);
 	FRandomStream Random(17389 + SegmentIndex);
-	UMaterialInstanceDynamic* Road = MakeMaterial(FLinearColor(0.025f, 0.035f, 0.055f));
-	UMaterialInstanceDynamic* Cyan = MakeMaterial(FLinearColor(0.02f, 0.7f, 0.85f));
-	UMaterialInstanceDynamic* Gold = MakeMaterial(FLinearColor(1.f, 0.65f, 0.03f));
-	UMaterialInstanceDynamic* Red = MakeMaterial(FLinearColor(0.9f, 0.07f, 0.12f));
-	UMaterialInstanceDynamic* Building = MakeMaterial(FLinearColor(0.055f, 0.08f, 0.13f));
+	// Own stream: dressing edits must not shift obstacle draws.
+	FRunnerRuins Ruins(this, Palette, 52711 + SegmentIndex);
 
 	const float Length = RunnerRules::SegmentLength;
-	AddBlock(FVector(Length / 2.f, 0.f, -25.f), FVector(Length, 1100.f, 50.f), Road, true);
-
-	// Dashed lane markings and continuous edge strips make the three paths legible at speed.
-	for (float X = 150.f; X < Length; X += 400.f)
-	{
-		for (float Y : {-150.f, 150.f})
-			AddBlock(FVector(X, Y, 1.f), FVector(160.f, 8.f, 2.f), Cyan, false);
-	}
+	AddBlock(FVector(Length / 2.f, 0.f, -25.f), FVector(Length, 1100.f, 50.f), Palette.Paint(RunnerPalette::Dirt));
+	Ruins.Path();
+	Ruins.Chasm();
+	// Skyline draws must precede the lane draws to keep the course layout stable.
 	for (float Side : {-1.f, 1.f})
 	{
-		AddBlock(FVector(Length / 2.f, Side * 525.f, 12.f), FVector(Length, 18.f, 24.f), Cyan, false);
-		AddBlock(FVector(Length / 2.f, Side * 650.f, -10.f), FVector(Length, 220.f, 25.f), Building, false);
 		for (float X = 400.f; X < Length; X += 800.f)
-		{
-			const float Height = Random.FRandRange(650.f, 2000.f);
-			AddBlock(FVector(X, Side * 1100.f, Height / 2.f), FVector(550.f, 500.f, Height), Building, false);
-			for (float Z = 180.f; Z < Height; Z += 240.f)
-				AddBlock(FVector(X, Side * 845.f, Z), FVector(350.f, 4.f, 40.f), Cyan, false);
-		}
+			Ruins.MistTower(X, Side, Random.FRandRange(650.f, 2000.f));
 	}
+	Ruins.Edges(SegmentIndex % 3 == 0);
+	if (SegmentIndex % 3 == 1) Ruins.Statue(1200.f, SegmentIndex % 2 ? 1.f : -1.f, SegmentIndex % 4 == 1);
+	Ruins.Torch(600.f, -1.f);
+	Ruins.Torch(1800.f, 1.f);
 
-	// Every row has a fully open lane. The opening is also marked by a line of coins.
+	// Every row has a fully open lane. The opening is also marked by a line of relics.
 	const int32 SafeLane = Random.RandRange(-1, 1);
-	if (SegmentIndex > 0)
-	{
-		for (int32 Lane = -1; Lane <= 1; ++Lane)
-		{
-			if (Lane == SafeLane) continue;
-			const int32 Kind = Random.RandRange(0, 2);
-			FVector Position(1400.f, RunnerRules::LaneY(Lane), 0.f);
-			FVector Size(100.f, 220.f, 240.f);
-			UMaterialInstanceDynamic* Material = Red;
-			if (Kind == 0) // Jumpable low hurdle.
-			{
-				Size.Z = 80.f;
-				Position.Z = 40.f;
-				Material = Gold;
-			}
-			else if (Kind == 1) // Slide beneath a beam with 130 cm of clearance.
-			{
-				Size.Z = 110.f;
-				Position.Z = 185.f;
-				Material = Cyan;
-				for (float Offset : {-125.f, 125.f})
-				{
-					UStaticMeshComponent* Post = AddBlock(Position + FVector(0.f, Offset, -65.f),
-						FVector(100.f, 18.f, 240.f), Cyan, true);
-					Post->ComponentTags.Add(TEXT("RunnerHazard"));
-				}
-			}
-			else Position.Z = 120.f;
-			UStaticMeshComponent* Hazard = AddBlock(Position, Size, Material, true);
-			Hazard->ComponentTags.Add(TEXT("RunnerHazard"));
-		}
-	}
+	if (SegmentIndex > 0) AddHazards(SafeLane, Random, Ruins);
 	const int32 CoinLane = SegmentIndex == 0 ? 0 : SafeLane;
 	for (float X = 950.f; X <= 2150.f; X += 300.f)
-		AddCoin(FVector(X, RunnerRules::LaneY(CoinLane), 95.f), Gold);
+		AddCoin(FVector(X, RunnerRules::LaneY(CoinLane), 95.f), Ruins);
+}
+
+void ARunnerTrackSegment::AddHazards(int32 SafeLane, FRandomStream& Random, FRunnerRuins& Ruins)
+{
+	UMaterialInstanceDynamic* Masonry = URunnerPaletteSubsystem::Get(this).Paint(RunnerPalette::Masonry);
+	auto AddHazard = [&](FVector Position, FVector Size, bool bVisible)
+	{
+		AddBlock(Position, Size, Masonry, bVisible)->ComponentTags.Add(TEXT("RunnerHazard"));
+	};
+	for (int32 Lane = -1; Lane <= 1; ++Lane)
+	{
+		if (Lane == SafeLane) continue;
+		const int32 Kind = Random.RandRange(0, 2);
+		FVector Position(1400.f, RunnerRules::LaneY(Lane), 0.f);
+		FVector Size(100.f, 220.f, 240.f);
+		if (Kind == 0) // Jumpable low hurdle; the collision box stays authoritative and the fallen pillar only dresses it.
+		{
+			Size.Z = 80.f;
+			Position.Z = 40.f;
+			AddHazard(Position, Size, false);
+			Ruins.FallenPillar(Position);
+		}
+		else if (Kind == 1) // Slide beneath a beam with 130 cm of clearance.
+		{
+			Size.Z = 110.f;
+			Position.Z = 185.f;
+			for (float Offset : {-RunnerRuins::PostOffset, RunnerRuins::PostOffset})
+				AddHazard(Position + FVector(0.f, Offset, -65.f), FVector(100.f, 18.f, 240.f), true);
+			AddHazard(Position, Size, true);
+			Ruins.CrackedPosts(Position);
+			Ruins.CarvedLintel(Position);
+		}
+		else
+		{
+			Position.Z = 120.f;
+			AddHazard(Position, Size, true);
+			Ruins.BlockStack(Position);
+		}
+	}
 }
