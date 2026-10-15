@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.8",
+  "Category": "Analytics",
+  "Description": "PostHog native integration example",
+  "Modules": [
+    {
+      "Name": "PostHogExample",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "PostHog",
+      "Enabled": true
+    }
+  ]
+}

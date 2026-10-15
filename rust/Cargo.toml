@@ -1,0 +1,7 @@
+[workspace]
+members = ["posthog-unreal-ffi"]
+resolver = "2"
+
+[profile.release]
+panic = "unwind"
+strip = "debuginfo"

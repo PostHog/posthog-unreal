@@ -22,6 +22,14 @@ Saved/
 *.code-workspace
 
 # Build artifacts
+rust/target/
+Source/ThirdParty/PostHogRust/lib/
+artifacts/
+Examples/PostHogExample/Plugins/
+Examples/PostHogExample/Config/DefaultEngine.ini
+Examples/PostHogExample/Config/DefaultInput.ini
+__pycache__/
+*.pyc
 *.o
 *.obj
 *.pdb

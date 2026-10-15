@@ -1,0 +1,17 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.0.1",
+  "FriendlyName": "PostHog",
+  "Description": "PostHog analytics and feature flags for Unreal Engine (in development).",
+  "Category": "Analytics",
+  "CreatedBy": "PostHog",
+  "CreatedByURL": "https://posthog.com",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "SupportedTargetPlatforms": ["Mac"],
+  "Modules": [
+    {"Name": "PostHog", "Type": "Runtime", "LoadingPhase": "Default", "PlatformAllowList": ["Mac"]}
+  ]
+}
