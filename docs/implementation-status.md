@@ -25,11 +25,36 @@ The integration is in development. Native delivery, the stateful C++ client, cac
 
 ## Upstream dependency
 
-The bridge pins `posthog-rs` mainline `b0038bde4f8ea39b6440ddc9fde376ac602c5b65` as its baseline. Required embedding additions are being implemented separately on `feat/unreal-embedding` in `~/dev/worktrees/posthog-rs-unreal`.
+The bridge pins `posthog-rs` v1 baseline `934113e63b9ad292de45d7db0af53913eb6eb117`. Required embedding additions are being ported separately on `feat/unreal-embedding-v1` in `~/dev/worktrees/posthog-rs-unreal-v1`; they have not landed in this baseline.
 
-During development, `POSTHOG_RS_PATH` supplies that checkout as a Cargo patch. The bridge cannot build against unmodified mainline yet. The Cargo lockfile currently records the patched dependency. Before distribution, review and land the Rust additions, replace the pin, regenerate the lockfile without the local patch, and remove the local-build requirement. Do not copy the upstream implementation into this repository.
+During development, set `POSTHOG_RS_PATH` to that checkout to supply it as a Cargo patch. The bridge cannot build against the unmodified baseline yet. The refreshed Cargo lockfile records the locally patched v1 dependency. Before distribution, review and land the Rust additions, replace the pin, regenerate the lockfile without the local patch, and remove the local-build requirement. Do not copy the upstream implementation into this repository.
 
-The Rust additions are opt-in. The plugin selects legacy batch ingestion, disables default features including error interception, and attributes transport requests to `posthog-unreal`.
+The Rust additions are behind the optional `embedding` Cargo feature (off by default). The plugin enables `embedding` and `tls` and uses v1 analytics ingestion at `/i/v1/analytics/events`, disables default features including error interception and the async client, and explicitly enables `tls` for HTTPS. Unreal continues to submit prepared events through the existing Rust analytics worker. Rust's v1 conversion moves legacy processing properties such as `$process_person_profile` into event options.
+
+SDK attribution is transport-owned: embedding `sdk_name` and `sdk_version` set `PostHog-Sdk-Info` to `posthog-unreal/<bridge version>`. V1 removes `$lib` and `$lib_version` from wire properties; the server materializes them from that header. `BeforeSend` cannot remove or override those two server-materialized fields. It retains control over custom and context properties, which Rust must not restore after the hook.
+
+## V1 validation gates
+
+`Tests/mock_server_v1_test.py` exercises the maintained mock without loading a native library:
+
+```sh
+python3 Tests/mock_server_v1_test.py --mock-server ~/.agents/skills/sdk-mock-server/server.py
+```
+
+The mock's `/i/v1/analytics/events` route returns UUID-keyed `ok`, `retry`, `drop`, and `warning` verdicts. Set `analyticsV1Results` through `/__control/state` to a map of event UUIDs to status strings, result objects (with optional `details`), or nonempty sequences of these. Sequences advance per appearance and repeat their last verdict; unconfigured UUIDs return `ok`. `force500.analytics` and `delays.analytics` control this route independently of legacy `batch` controls.
+
+`/__captured/analytics_requests` contains attempted requests: original body bytes as base64 (after HTTP transfer decoding, before content decompression), decoded JSON, selected protocol headers (excluding credentials), and the returned status/results. `/__captured/events` contains mock-materialized v1 events only for `ok` and `warning`; legacy batch capture behavior is unchanged. The mock models SDK attribution, session/window fields, and known processing-option property injection. It does not implement the full backend pipeline, clock-skew correction, quotas, person processing, or downstream enrichment. Its fixture tests are not real-server ingestion evidence.
+
+The native suite separately asserts wire options/session fields, header attribution, hook-minimized properties, partial-verdict retirement, and retry retention after the attempt limit followed by a fresh bounded flush sequence. Build manifests label analytics ingestion as `v1` and record the selected `tls`/`embedding` features.
+
+On macOS arm64 with UE 5.8, the v1 port passes:
+
+- All 8 maintained-mock fixture tests and all 5 Rust bridge unit tests.
+- All 11 Python integration tests, including the 6 Unreal automation tests and their wire assertions.
+- Native release build and UE Editor Development build.
+- Rust full async and blocking suites with `embedding`, plus default-feature unit tests with embedding disabled. Rust formatting, default+embedding clippy, and the feature-inclusive public API snapshot pass. The default-feature public API matches the v1 baseline.
+
+Rust 1.78 validation is blocked by the upstream v1 lockfile: both the unmodified baseline and this port fail to parse `icu_normalizer_data 2.3.0`'s edition-2024 manifest. This port does not raise the advertised minimum Rust version. The new optional `fs2 0.4.3` dependency is MIT/Apache-2.0 licensed; it is absent from the default dependency graph. Cross-platform dependency/license packaging remains a release gate.
 
 ## Behavioral sources
 
@@ -39,7 +64,9 @@ The Rust additions are opt-in. The plugin selects legacy batch ingestion, disabl
 
 Specs take precedence over divergent Unity behavior. Reset clears persisted opt-out as specified while preserving queued event identity and emitting no reset event. Automatic sessions use Unity's 30-minute inactivity and 24-hour maximum, with UUIDv7 IDs; expiration occurs strictly after each boundary. Initial delivery settings follow Unity: threshold 20, interval 30 seconds, queue capacity 1,000, batch size 50, request timeout 10 seconds, and shutdown budget 3 seconds. Embedding caps individual requests by the shutdown budget so already-running requests cannot consume a longer request timeout during close.
 
-## Validation so far
+## Previous legacy validation
+
+The following evidence predates the v1 port. Current v1 results are listed above.
 
 On macOS arm64:
 
@@ -63,7 +90,7 @@ This does not establish Windows, Linux, macOS x64, Shipping, packaged-game, Blue
 
 ## Delivery and shutdown limits
 
-`ACCEPTED` means bounded memory admission, not disk or server acknowledgement. Checkpoint waits for earlier worker operations and reports storage errors. A flush is one delivery attempt; pending, delivered, terminally dropped, and storage-error counters describe the outcome.
+`ACCEPTED` means bounded memory admission, not disk or server acknowledgement. Checkpoint waits for earlier worker operations and reports storage errors. A flush is one delivery attempt; pending, delivered, terminally dropped, and storage-error counters describe the outcome. V1 retry verdicts and retryable request failures retain their durable records and capacity reservations after the attempt limit. A later flush or timer starts a new bounded sequence in the same analytics worker; normal non-embedding Rust behavior is unchanged.
 
 Shutdown closes admission and sets a total work deadline before waiting for admitted calls. Requests use the remaining budget; the worker does not start another event persistence write after expiry. An event accepted only into memory can be lost at the deadline. Previously durable unsent events remain for restart. An already-running filesystem operation and OS scheduling cannot be preempted; shutdown still joins workers rather than abandoning code that could outlive the module.
 

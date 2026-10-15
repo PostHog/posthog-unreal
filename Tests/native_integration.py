@@ -34,24 +34,7 @@ def encoded(value):
     return storage, Bytes(c.cast(storage, c.c_void_p), len(data))
 
 
-class NativeTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.lib = c.CDLL(ARGS.library)
-        for name, args in {
-            "phu_create": [c.c_uint32, Bytes, c.POINTER(c.c_uint64)],
-            "phu_capture": [c.c_uint64, Bytes],
-            "phu_flags": [c.c_uint64, Bytes, c.POINTER(Buffer)],
-            "phu_checkpoint": [c.c_uint64, c.POINTER(Buffer)],
-            "phu_flush": [c.c_uint64], "phu_close": [c.c_uint64],
-            "phu_begin_shutdown": [c.c_uint64],
-            "phu_opt_in": [c.c_uint64], "phu_opt_out": [c.c_uint64],
-        }.items():
-            function = getattr(cls.lib, name)
-            function.argtypes, function.restype = args, c.c_int32
-        cls.lib.phu_buffer_free.argtypes = [Buffer]
-        cls.lib.phu_buffer_free.restype = None
-
+class MockServerTestCase(unittest.TestCase):
     @classmethod
     def start_server(cls):
         with socket.socket() as sock:
@@ -59,7 +42,7 @@ class NativeTests(unittest.TestCase):
             port = sock.getsockname()[1]
         cls.host = f"http://127.0.0.1:{port}"
         cls.log = tempfile.TemporaryFile()
-        cls.server = subprocess.Popen([sys.executable, ARGS.mock_server], env={**os.environ, "PORT": str(port)}, stdout=cls.log, stderr=cls.log)
+        cls.server = subprocess.Popen([sys.executable, cls.mock_server_path], env={**os.environ, "PORT": str(port)}, stdout=cls.log, stderr=cls.log)
         try:
             for _ in range(100):
                 try:
@@ -92,6 +75,26 @@ class NativeTests(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.load(response)
 
+
+class NativeTests(MockServerTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mock_server_path = ARGS.mock_server
+        cls.lib = c.CDLL(ARGS.library)
+        for name, args in {
+            "phu_create": [c.c_uint32, Bytes, c.POINTER(c.c_uint64)],
+            "phu_capture": [c.c_uint64, Bytes],
+            "phu_flags": [c.c_uint64, Bytes, c.POINTER(Buffer)],
+            "phu_checkpoint": [c.c_uint64, c.POINTER(Buffer)],
+            "phu_flush": [c.c_uint64], "phu_close": [c.c_uint64],
+            "phu_begin_shutdown": [c.c_uint64],
+            "phu_opt_in": [c.c_uint64], "phu_opt_out": [c.c_uint64],
+        }.items():
+            function = getattr(cls.lib, name)
+            function.argtypes, function.restype = args, c.c_int32
+        cls.lib.phu_buffer_free.argtypes = [Buffer]
+        cls.lib.phu_buffer_free.restype = None
+
     def setUp(self):
         self.start_server()
         self.http("/__control/reset", {})
@@ -117,7 +120,7 @@ class NativeTests(unittest.TestCase):
 
     def capture(self, handle, **overrides):
         event = {"event": "native integration", "distinct_id": "玩家 🚀",
-                 "uuid": str(uuid.uuid4()), "timestamp": "2026-01-01T12:00:00Z",
+                 "uuid": str(uuid.uuid4()), "timestamp": "2026-01-01T12:00:00.000Z",
                  "properties": {"$lib": "posthog-unreal", "$lib_version": "0.0.1", "number": 123, "string": "00123", "nested": [False, None, {"x": "ü"}]}, **overrides}
         storage, data = encoded(event)
         return self.lib.phu_capture(handle, data), event
@@ -139,16 +142,31 @@ class NativeTests(unittest.TestCase):
         finally:
             self.lib.phu_buffer_free(output)
 
+    def wire_events(self):
+        requests = self.http("/__captured/analytics_requests")
+        self.assertTrue(requests, "No v1 analytics request captured")
+        for request in requests:
+            self.assertEqual(request["path"], "/i/v1/analytics/events")
+            self.assertEqual(request["headers"]["posthog-sdk-info"], "posthog-unreal/0.0.1")
+            for event in request["body"]["batch"]:
+                for key in ("$lib", "$lib_version", "$session_id", "$window_id", "$process_person_profile"):
+                    self.assertNotIn(key, event["properties"])
+                self.assertIsInstance(event["options"], dict)
+        return [event for request in requests for event in request["body"]["batch"]]
+
     def test_capture_snapshot_and_side_effect_free_flags(self):
         handle = self.create()
         status, event = self.capture(handle)
         self.assertEqual(status, 1)
         self.assertEqual(self.checkpoint(handle)["persistence_errors"], 0)
         self.assertEqual(self.lib.phu_flush(handle), 0)
-        wire = self.http("/__captured/events")
+        wire = self.wire_events()
         self.assertEqual(len(wire), 1)
-        for key in ("uuid", "timestamp", "distinct_id", "properties"):
+        for key in ("uuid", "timestamp", "distinct_id"):
             self.assertEqual(wire[0][key], event[key])
+        self.assertEqual(wire[0]["properties"], {key: value for key, value in event["properties"].items()
+                                                if key not in ("$lib", "$lib_version")})
+        self.assertEqual(self.http("/__captured/events")[0]["properties"], event["properties"])
         status, flags = self.flags(handle)
         self.assertEqual(status, 0)
         self.assertIs(flags["flags"]["disabled-flag"]["value"], False)
@@ -160,7 +178,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(list((self.directory / "spool").glob("*.json")), [])
 
     def test_offline_close_restart_replays_original_event(self):
-        self.http("/__control/state", {"force500": {"batch": True}})
+        self.http("/__control/state", {"force500": {"analytics": True}})
         handle = self.create()
         status, event = self.capture(handle)
         self.assertEqual(status, 1)
@@ -170,10 +188,74 @@ class NativeTests(unittest.TestCase):
         self.http("/__control/reset", {})
         restarted = self.create()
         self.assertEqual(self.lib.phu_flush(restarted), 0)
-        wire = self.http("/__captured/events")
+        wire = self.wire_events()
         self.assertEqual(len(wire), 1)
-        for key in ("uuid", "timestamp", "distinct_id", "properties"):
+        for key in ("uuid", "timestamp", "distinct_id"):
             self.assertEqual(wire[0][key], event[key])
+        self.assertEqual(wire[0]["properties"], {key: value for key, value in event["properties"].items()
+                                                if key not in ("$lib", "$lib_version")})
+        self.assertEqual(self.http("/__captured/events")[0]["properties"], event["properties"])
+
+    def test_prepared_properties_options_and_transport_attribution(self):
+        handle = self.create()
+        session = str(uuid.uuid4())
+        self.assertEqual(self.capture(handle, properties={
+            "$lib": "caller-override", "$lib_version": "caller-version",
+            "$session_id": session, "$process_person_profile": False, "custom": "kept",
+        })[0], 1)
+        self.assertEqual(self.capture(handle, event="hook minimized", properties={})[0], 1)
+        self.assertEqual(self.lib.phu_flush(handle), 0)
+        wire = self.wire_events()
+        self.assertEqual(wire[0]["properties"], {"custom": "kept"})
+        self.assertEqual(wire[0]["options"], {"process_person_profile": False})
+        self.assertEqual(wire[0]["session_id"], session)
+        self.assertEqual(wire[1]["properties"], {})
+        self.assertEqual(wire[1]["options"], {})
+        self.assertNotIn("session_id", wire[1])
+        accepted = self.http("/__captured/events")
+        self.assertEqual(accepted[0]["properties"], {
+            "$lib": "posthog-unreal", "$lib_version": "0.0.1", "$session_id": session,
+            "$process_person_profile": False, "custom": "kept",
+        })
+        self.assertEqual(accepted[1]["properties"], {"$lib": "posthog-unreal", "$lib_version": "0.0.1"})
+
+    def test_partial_verdicts_retain_retry_after_attempt_limit_until_later_flush(self):
+        handle = self.create()
+        events = {}
+        for result in ("ok", "retry", "drop", "warning"):
+            status, event = self.capture(handle, event=result)
+            self.assertEqual(status, 1)
+            events[result] = event
+        self.http("/__control/state", {"analyticsV1Results": {
+            events["retry"]["uuid"]: [{"result": "retry", "details": "not_persisted"}] * 3 + ["ok"],
+            events["drop"]["uuid"]: {"result": "drop", "details": "event_restriction_drop"},
+            events["warning"]["uuid"]: {"result": "warning", "details": "person_processing_disabled"},
+        }})
+        # Each flush makes one attempt; exhausting a sequence must retain the retry.
+        for _ in range(3):
+            self.assertEqual(self.lib.phu_flush(handle), 0)
+        report = self.checkpoint(handle)
+        self.assertEqual(report["pending"], 1)
+        self.assertEqual(report["delivered"], 2)
+        self.assertEqual(report["terminally_dropped"], 1)
+        self.assertEqual(len(list((self.directory / "spool").glob("*.json"))), 1)
+        requests = self.http("/__captured/analytics_requests")
+        self.assertEqual([r["headers"]["posthog-attempt"] for r in requests], ["1", "2", "3"])
+        self.assertEqual(len({r["headers"]["posthog-request-id"] for r in requests}), 1)
+        self.assertEqual(len(requests[0]["body"]["batch"]), 4)
+        retry_wire = next(e for e in requests[0]["body"]["batch"] if e["uuid"] == events["retry"]["uuid"])
+        for request in requests[1:]:
+            self.assertEqual(request["body"]["batch"], [retry_wire])
+        self.assertEqual({e["event"] for e in self.http("/__captured/events")}, {"ok", "warning"})
+        self.assertEqual(self.lib.phu_flush(handle), 0)
+        requests = self.http("/__captured/analytics_requests")
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(requests[-1]["headers"]["posthog-attempt"], "1")
+        self.assertNotEqual(requests[-1]["headers"]["posthog-request-id"], requests[0]["headers"]["posthog-request-id"])
+        self.assertEqual(requests[-1]["body"]["batch"], [retry_wire])
+        self.assertEqual(self.checkpoint(handle)["pending"], 0)
+        self.assertEqual(list((self.directory / "spool").glob("*.json")), [])
+        self.assertEqual({e["event"] for e in self.http("/__captured/events")}, {"ok", "warning", "retry"})
 
     def test_opt_out_purges_and_blocks_events_and_flags(self):
         handle = self.create()
@@ -190,7 +272,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual([e["event"] for e in self.http("/__captured/events")], ["after opt in"])
 
     def test_restored_opt_out_purges_before_replay(self):
-        self.http("/__control/state", {"force500": {"batch": True}})
+        self.http("/__control/state", {"force500": {"analytics": True}})
         handle = self.create()
         self.capture(handle)
         self.checkpoint(handle)
@@ -204,7 +286,7 @@ class NativeTests(unittest.TestCase):
 
     def test_queue_bound_and_concurrent_close(self):
         handle = self.create(max_queue_size=2, max_batch_size=2, flush_at=2)
-        self.http("/__control/state", {"delays": {"batch": 1}})
+        self.http("/__control/state", {"delays": {"analytics": 1}})
         self.assertEqual(self.capture(handle)[0], 1)
         self.assertEqual(self.capture(handle)[0], 1)
         self.assertEqual(self.capture(handle)[0], 8)
@@ -215,7 +297,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(self.capture(handle)[0], 3)
 
     def test_close_stalled_request_and_retry_backlog(self):
-        self.http("/__control/state", {"delays": {"batch": 2}})
+        self.http("/__control/state", {"delays": {"analytics": 2}})
         handle = self.create(flush_at=20, max_batch_size=1)
         for _ in range(10):
             self.assertEqual(self.capture(handle)[0], 1)
@@ -276,8 +358,10 @@ class NativeTests(unittest.TestCase):
         result = json.loads((report / "index.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["failed"], 0, result)
         self.assertEqual(result["succeeded"], 6, result)
-        wire = self.http("/__captured/events")
-        events = {event["event"]: event for event in wire}
+        wire = self.wire_events()
+        wire_by_name = {event["event"]: event for event in wire}
+        materialized = self.http("/__captured/events")
+        events = {event["event"]: event for event in materialized}
         self.assertEqual(events["unreal_native_integration"]["properties"]["$lib"], "posthog-unreal")
         anonymous = events["stateful_anonymous"]
         identified = events["stateful_identified"]
@@ -296,21 +380,29 @@ class NativeTests(unittest.TestCase):
         self.assertNotEqual(reset["properties"]["$session_id"], identified["properties"]["$session_id"])
         self.assertNotIn("registered", reset["properties"])
         self.assertNotIn("$groups", reset["properties"])
-        identity_events = [event for event in wire if event["event"] == "$identify" and event["distinct_id"] == "user-one"]
+        identity_events = [event for event in materialized if event["event"] == "$identify" and event["distinct_id"] == "user-one"]
         self.assertEqual(len(identity_events), 1)
         self.assertEqual(identity_events[0]["properties"]["$anon_distinct_id"], anonymous["distinct_id"])
-        self.assertEqual(sum(event["event"] == "$set" for event in wire), 1)
+        self.assertEqual(sum(event["event"] == "$set" for event in materialized), 1)
         self.assertNotIn("secret", events["stateful_redacted"]["properties"])
-        self.assertNotIn("$lib", events["stateful_redacted"]["properties"])
+        self.assertNotIn("secret", wire_by_name["stateful_redacted"]["properties"])
+        self.assertEqual(events["stateful_redacted"]["properties"]["$lib"], "posthog-unreal")
+        self.assertIs(wire_by_name["stateful_anonymous"]["options"]["process_person_profile"], False)
+        self.assertIs(wire_by_name["stateful_never"]["options"]["process_person_profile"], False)
+        self.assertEqual(wire_by_name["stateful_anonymous"]["session_id"],
+                         anonymous["properties"]["$session_id"])
+        for name in ("explicit_before", "explicit_after"):
+            self.assertNotIn("session_id", wire_by_name[name])
         for name in ("ignored", "closed", "hook_withdraw", "hook_withdraw_resume", "must_not_replay", "$reset"):
             self.assertNotIn(name, events)
+            self.assertNotIn(name, wire_by_name)
         self.assertNotIn("$session_id", events["explicit_before"]["properties"])
         self.assertIn("$session_id", events["explicit_during"]["properties"])
         self.assertNotIn("$session_id", events["explicit_after"]["properties"])
         self.assertNotIn("payload", events["stateful_bounds"]["properties"])
         self.assertFalse(events["stateful_never"]["properties"]["$process_person_profile"])
-        parallel_a = [event for event in wire if event["event"] == "parallel_a"]
-        parallel_b = [event for event in wire if event["event"] == "parallel_b"]
+        parallel_a = [event for event in materialized if event["event"] == "parallel_a"]
+        parallel_b = [event for event in materialized if event["event"] == "parallel_b"]
         self.assertEqual(len(parallel_a), 25)
         self.assertEqual(len(parallel_b), 25)
         self.assertEqual(len({event["distinct_id"] for event in parallel_a}), 1)
@@ -323,7 +415,7 @@ class NativeTests(unittest.TestCase):
         for event in (first, second, events["subsystem_auto"], events["subsystem_replacement"]):
             self.assertTrue(event["properties"]["$engine_version"])
             self.assertTrue(event["properties"]["$os"])
-        lifecycle = [event for event in wire if event["event"].startswith("Application ")]
+        lifecycle = [event for event in materialized if event["event"].startswith("Application ")]
         main_lifecycle = [event for event in lifecycle if event["properties"].get("instance") in ("one", "two", "one-updated")]
         self.assertEqual(sum(event["event"] == "Application Installed" for event in main_lifecycle), 2)
         self.assertEqual(sum(event["event"] == "Application Backgrounded" for event in main_lifecycle), 2)
@@ -339,15 +431,20 @@ class NativeTests(unittest.TestCase):
         for event in lifecycle:
             self.assertNotIn("version", event["properties"])
             self.assertNotIn("build", event["properties"])
-        exposures = [event for event in wire if event["event"] == "$feature_flag_called"]
+        exposures = [event for event in materialized if event["event"] == "$feature_flag_called"]
         initial = [event for event in exposures if event["properties"].get("stage") == "initial"]
         self.assertEqual(len(initial), 3)
         self.assertEqual({event["properties"]["$feature_flag"] for event in initial},
                          {"bool-value", "disabled-flag", "string-value"})
         self.assertEqual(len([event for event in exposures if event["properties"].get("stage") == "restored"]), 4)
         minimal = next(event["properties"] for event in exposures if event["properties"]["$feature_flag"] == "minimal")
-        for key in ("test_suite", "stage", "hook_private", "$referrer", "$lib_version"):
+        for key in ("test_suite", "stage", "hook_private", "$referrer"):
             self.assertNotIn(key, minimal)
+        minimal_wire = next(event["properties"] for event in wire if
+                            event["event"] == "$feature_flag_called" and event["properties"]["$feature_flag"] == "minimal")
+        for key in ("test_suite", "stage", "hook_private", "$referrer"):
+            self.assertNotIn(key, minimal_wire)
+        self.assertEqual(minimal["$lib_version"], "0.0.1")
         self.assertEqual(minimal["utm_source"], "campaign")
         self.assertEqual(minimal["$referring_domain"], "example.com")
         self.assertEqual(minimal["$feature_flag_request_id"], "rich-request")
@@ -358,13 +455,13 @@ class NativeTests(unittest.TestCase):
             self.assertEqual(full["hook_private"], "custom")
             self.assertEqual(full["stage"], "restored")
             self.assertIn("$referrer", full)
-            self.assertNotIn("$lib_version", full)
+            self.assertEqual(full["$lib_version"], "0.0.1")
         enriched = events["flags_enriched"]["properties"]
         self.assertIs(enriched["$feature/bool-value"], True)
         self.assertIs(enriched["$feature/disabled-flag"], False)
         self.assertEqual(enriched["$feature/string-value"], "test")
         self.assertEqual(set(enriched["$active_feature_flags"]), {"bool-value", "string-value"})
-        for event in wire:
+        for event in materialized:
             if event["event"].startswith("stateful_"):
                 self.assertEqual(uuid.UUID(event["uuid"]).version, 7)
 

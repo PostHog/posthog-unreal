@@ -350,18 +350,14 @@ pub unsafe extern "C" fn phu_flags(handle: u64, context: Bytes, out_buffer: *mut
             }
             calls.generation
         };
+        let mut options = EvaluateFlagsOptions::default();
+        options.groups = context.groups;
+        options.person_properties = context.person_properties;
+        options.group_properties = context.group_properties;
         let flags = call
             .0
             .client
-            .evaluate_flags(
-                context.distinct_id,
-                EvaluateFlagsOptions {
-                    groups: context.groups,
-                    person_properties: context.person_properties,
-                    group_properties: context.group_properties,
-                    ..Default::default()
-                },
-            )
+            .evaluate_flags(context.distinct_id, options)
             .map_err(|_| Status::RequestFailed)?;
         let calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
         if calls.closed {

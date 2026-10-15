@@ -9,7 +9,7 @@ publish = false
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-posthog-rs = { git = "ssh://git@github.com/PostHog/posthog-rs.git", rev = "b0038bde4f8ea39b6440ddc9fde376ac602c5b65", default-features = false }
+posthog-rs = { git = "ssh://git@github.com/PostHog/posthog-rs.git", rev = "934113e63b9ad292de45d7db0af53913eb6eb117", default-features = false, features = ["tls", "embedding"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

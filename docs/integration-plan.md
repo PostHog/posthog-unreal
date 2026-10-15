@@ -48,7 +48,7 @@ Match the applicable client contracts in `PostHog/sdk-specs`, not every Unity im
 
 The inspected local `origin/main` has explicit-identity events, batching/retries, blocking and async clients, immediate-send results, and remote flags. It does not expose a C ABI, a durable queue backend, or a runtime purge/consent barrier. `capture()` and `flush()` do not return delivery receipts. Shutdown drains rather than discards, and its timeout is not a hard bound on all work already underway.
 
-The local Rust checkout is a different development branch: it renames the crate to `posthog` and uses a different ingestion baseline. Plan against the inspected mainline `posthog-rs` package, pin a reviewed version/commit during native validation, and do not accidentally depend on that branch. Mainline defaults to legacy ingestion and gates Capture v1 behind a feature; adopting v1 is a separate compatibility decision.
+The integration now targets the `posthog-rs` v1 baseline `934113e63b9ad292de45d7db0af53913eb6eb117`, with embedding additions being ported separately. V1 analytics uses `/i/v1/analytics/events` and per-event verdicts; it has no legacy ingestion feature. The bridge enables the optional `embedding` and `tls` features with defaults disabled. See [implementation status](implementation-status.md) for the development patch and pending validation gates.
 
 ## 3. Architecture and ownership
 
@@ -82,7 +82,7 @@ The analytics adapter forwards into `FPostHogClient`; it does not submit indepen
 | Flag cache, identity-generation checks, exposure deduplication | Unreal client |
 | UObject lifetime, reflected APIs, game-thread notifications | Subsystem and Blueprint layer |
 
-There must be one enrichment pass, one event delivery owner, and one exposure tracker. Rust must not silently add back properties removed by `BeforeSend`, overwrite Unreal SDK attribution, or produce a second exposure event.
+There must be one enrichment pass, one event delivery owner, and one exposure tracker. Rust must not silently add back custom/context properties removed by `BeforeSend` or produce a second exposure event. V1 SDK attribution is transport-owned: `PostHog-Sdk-Info: posthog-unreal/<version>` causes the server to materialize `$lib` and `$lib_version`. These two fields cannot be removed or overridden by the hook.
 
 Serialize native state mutations and capture snapshots so each event sees a complete identity/consent transition. Engine and UObject context is sampled on the game thread and passed as plain data. Native capture may run on other threads without touching UObjects; hooks run outside state locks under a documented reentrancy policy, with consent rechecked before queue admission. Network, flag refresh, and disk work must not hold the state lock or block the game thread.
 
@@ -249,7 +249,7 @@ Keep Epic headers, engine binaries, and platform SDKs out of the public reposito
 ### Phase 0 — Decide ownership and prove native feasibility
 
 1. Agree the ownership modes, platform/engine floor, initial feature scope, defaults, and reset/consent behavior.
-2. Pin mainline Rust and the ingestion mode; record dependency versions and upstream changes required.
+2. Pin the reviewed Rust v1 embedding implementation; record dependency versions and upstream changes required.
 3. Build a minimal bridge and load it in UE 5.8. Send one explicitly attributed event to the SDK mock server, fetch flags, and destroy the client.
 4. Prove a durable event round trip and a purge/close prototype, including stalled requests and retry backlogs. Measure native binary size, thread count, and capture/game-thread cost.
 5. Confirm Rust queue extension versus the request-only alternative before production implementation.
