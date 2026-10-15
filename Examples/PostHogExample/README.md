@@ -1,6 +1,6 @@
-# Neon Runner
+# Tim Raider
 
-A playable three-lane infinite runner demonstrating the PostHog Unreal SDK. The track, robot, obstacles, coins, lighting, and HUD are built from engine primitives at runtime. There are no project content assets to download or generate.
+A playable three-lane runner, set in a jungle temple, demonstrating the PostHog Unreal SDK. The track, runner, obstacles, relics, lighting, menus, and HUD are built from engine primitives and Canvas drawing at runtime. There are no project content assets to download or generate.
 
 ## Build and play
 
@@ -17,19 +17,36 @@ export PYTHON=python3 # Python 3.11+ for the native build
 ./scripts/run-example.sh
 ```
 
-In the editor, press **Play**, click the game viewport, and wait for the three-second countdown. Forward movement is automatic.
+In the editor, press **Play** and click the game viewport so it receives keyboard input.
+
+### Screens
+
+| Screen | What it shows |
+| --- | --- |
+| Title | The wordmark. Press Enter or Space to open the main menu. |
+| Main menu | **START RUN**, **ANALYTICS: ON/OFF**, **RELOAD FLAGS**, and **QUIT**, plus an SDK panel with the analytics status, the cached difficulty flag, and shortened distinct and session IDs. |
+| Countdown and run | A three-second countdown, then distance, relics, score, speed, difficulty, and analytics status. Score is `distance in meters + 25 × relics` and is display-only. |
+| Pause | **RESUME**, **RESTART**, **ANALYTICS: ON/OFF**, **MAIN MENU**, and **QUIT**. The game is paused while this menu is open. |
+| Run over | Score, distance, and relics for the finished run, plus the best score and distance of this session (kept in memory only; NEW BEST marks a higher score). |
+
+The analytics and reload items are greyed out when no SDK client is configured.
+
+### Controls
 
 | Control | Action |
 | --- | --- |
+| Up / Down or W / S | Move through a menu |
+| Enter / Space | Confirm a menu item |
+| Esc | Pause or resume a run; back from the main menu; main menu after a run is over |
 | A / Left | Switch one lane left |
 | D / Right | Switch one lane right |
 | Space / Up | Jump |
 | S / Down | Slide |
-| R / Enter / Space after game over | Restart |
+| R / Enter / Space after a run is over | Run again (skips the menus) |
 
-Jump gold hurdles, slide under cyan beams, and dodge red walls. Every obstacle row has an open lane marked by coins. Speed increases with distance, and old track sections are retired as new ones appear.
+Forward movement is automatic. The track is dressed at runtime as sunlit jungle-temple ruins: sandstone flagstones over a dirt path, a colonnade with arches and guardian statues, torches, and a misty chasm. Jump fallen pillars, slide under collapsed lintels, dodge stone block walls, and collect gold relics along the open lane of every obstacle row. Speed increases with distance, and old track sections are retired as new ones appear.
 
-After building, you can open `PostHogExample.uproject` directly or use the launch script. Project defaults select the engine's empty Entry map, `RunnerGameMode`, and `RunnerGameInstance`. The track and robot appear when you press **Play**, not in the editing viewport. Keep machine-specific overrides in ignored `Config/UserEngine.ini`. Restart the editor after changing project defaults or rebuilding C++; the SDK does not support Live Coding/module reloading.
+After building, you can open `PostHogExample.uproject` directly or use the launch script. Project defaults select the engine's empty Entry map, `RunnerGameMode`, and `RunnerGameInstance`. The track and runner appear when you press **Play**, not in the editing viewport. Keep machine-specific overrides in ignored `Config/UserEngine.ini`. Restart the editor after changing project defaults or rebuilding C++; the SDK does not support Live Coding/module reloading.
 
 ## Analytics
 
@@ -43,19 +60,24 @@ export POSTHOG_HOST=http://127.0.0.1:9999
 ./scripts/run-example.sh
 ```
 
-The HUD shows whether the client is disabled, initializing, ready, or failed. Ready means initialized, not that the server has accepted every event.
+The HUD shows whether the client is disabled, initializing, ready, opted out, or failed. Ready means initialized, not that the server has accepted every event.
 
 | Event | When |
 | --- | --- |
 | `run_started` | Countdown finishes |
-| `coin_collected` | A coin is collected |
-| `run_ended` | Collision, or leaving a started run |
+| `coin_collected` | A relic is collected |
+| `run_ended` | Collision, or leaving a started run (restart from pause, main menu, quit) |
+| `$screen` | The `title`, `main_menu`, `pause`, or `game_over` screen opens |
 
-Events include `run_id`, `difficulty`, `distance_meters`, `coins`, `duration_seconds`, `speed_cm_per_second`, and the target `lane` (-1, 0, 1). `run_ended.reason` is `collision` or `abandoned`. Run IDs change on restart; the SDK's anonymous identity, session, and client survive because they belong to the game instance, not the level. Early events are buffered in memory during initialization (up to 64); a failed setup drops them. The subsystem owns initialization/shutdown, and delivery never blocks the game thread.
+Relics are the in-game name for coins; the event name and its `coins` property are unchanged. Run events include `run_id`, `difficulty`, `distance_meters`, `coins`, `duration_seconds`, `speed_cm_per_second`, and the target `lane` (-1, 0, 1). `run_ended.reason` is `collision` or `abandoned`. `$screen` events carry `$screen_name` and are dropped, not buffered, while the client is still initializing, so the first title screen is usually not recorded. Run IDs change on restart; the SDK's anonymous identity, session, and client survive because they belong to the game instance, not the level. Early run events are buffered in memory during initialization (up to 64); a failed setup drops them. The subsystem owns initialization/shutdown, and delivery never blocks the game thread.
+
+### Opting out
+
+**ANALYTICS: ON/OFF** calls the client's `OptOutAsync` / `OptInAsync`. The choice is persisted by the SDK, so it survives restarts. Opting out also clears cached flags; choose **RELOAD FLAGS** after opting back in to fetch them again.
 
 ### Difficulty flag
 
-Create the boolean flag **`runner-hard-mode`**. When true, the initial speed increases from 900 to 1050 cm/s; both modes cap at 1800 cm/s. The game reads the cached value once per run, records the flag exposure through the SDK, and uses normal mode if no value is available. Late flag results affect the next run rather than changing difficulty mid-run.
+Create the boolean flag **`runner-hard-mode`**. When true, the initial speed increases from 900 to 1050 cm/s; both modes cap at 1800 cm/s. The game reads the cached value once per run, records the flag exposure through the SDK, and uses normal mode if no value is available. Late flag results affect the next run rather than changing difficulty mid-run. The main menu's **DIFFICULTY FLAG** line reads the same cached value without sending an exposure event.
 
 With the mock server:
 
@@ -65,11 +87,11 @@ curl -X POST http://127.0.0.1:9999/__control/state \
   -d '{"flags":{"runner-hard-mode":true}}'
 ```
 
-Restart PIE to fetch the new response, or reload flags through the SDK before the next run. Changing the mock response alone does not update the client's cached flags.
+Changing the mock response alone does not update the client's cached flags. Choose **RELOAD FLAGS** on the main menu (or restart PIE) before the next run.
 
 ## Optional character art
 
-The built-in articulated robot makes the example runnable without a skeletal mesh or animation pack. To use your own art, derive a Blueprint from `RunnerCharacter`, assign its inherited skeletal mesh and animation class, and select that Blueprint as the game mode's default pawn. The procedural robot hides itself when a skeletal mesh is assigned. A production character should provide its own crouch/slide animation.
+The built-in articulated runner makes the example runnable without a skeletal mesh or animation pack. To use your own art, derive a Blueprint from `RunnerCharacter`, assign its inherited skeletal mesh and animation class, and select that Blueprint as the game mode's default pawn. The procedural runner hides itself when a skeletal mesh is assigned. A production character should provide its own crouch/slide animation.
 
 ## Validation
 
@@ -87,4 +109,4 @@ python3 Tests/runner_integration.py \
   --mock-server /path/to/sdk-mock-server/server.py
 ```
 
-The driver launches the same public run script, enables Python only for the test process, and checks the unconfigured game, normal/hard flags, a late flag response, a flag-request timeout, real obstacle traversal, track cleanup, game over, and restart. The late-response scenario shortens the first countdown to ensure the run starts before the response arrives. It inspects ingested events, including run correlation and identity/session continuity. Logs, results, and captured mock events are written to ignored `artifacts/runner/`.
+The driver launches the same public run script, enables Python only for the test process, and checks the unconfigured game, normal/hard flags, a late flag response, a flag-request timeout, the title screen holding the countdown, real obstacle traversal, track cleanup, game over, and restart. The late-response scenario shortens the first countdown to ensure the run starts before the response arrives. It inspects ingested events, including run correlation and identity/session continuity. Logs, results, and captured mock events are written to ignored `artifacts/runner/`.

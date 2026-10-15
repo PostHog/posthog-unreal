@@ -8,7 +8,10 @@
 class ARunnerTrackSegment;
 class APlayerStart;
 
-/** Owns run state and a bounded window of procedurally generated track. */
+UENUM(BlueprintType)
+enum class ERunnerMenu : uint8 { None, Title, Main, Pause };
+
+/** Owns run state, the menu flow, and a bounded window of procedurally generated track. */
 UCLASS()
 class ARunnerGameMode : public AGameModeBase
 {
@@ -25,13 +28,31 @@ public:
 	UFUNCTION(BlueprintPure, Category="Runner")
 	bool IsRunning() const { return Countdown <= 0.f && !bGameOver; }
 	UFUNCTION(BlueprintPure, Category="Runner")
+	bool IsInFrontMenu() const { return Menu == ERunnerMenu::Title || Menu == ERunnerMenu::Main; }
+	UFUNCTION(BlueprintPure, Category="Runner")
 	float GetRunSpeed() const;
 	UFUNCTION(BlueprintCallable, Category="Runner")
 	void EndRun();
 	UFUNCTION(BlueprintCallable, Category="Runner")
 	void CollectCoin();
+	/** Reloads straight into a new countdown; only after game over or from the pause menu. */
 	UFUNCTION(BlueprintCallable, Category="Runner")
 	void RestartRun();
+
+	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
+	void StartRun();
+	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
+	void ShowMainMenu();
+	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
+	void ShowTitle();
+	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
+	void ReturnToMainMenu();
+	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
+	void SetPaused(bool bPause);
+	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
+	void TogglePause();
+	UFUNCTION(BlueprintCallable, Category="Runner|Menu")
+	void QuitGame();
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Runner")
 	float Countdown = 3.f;
@@ -43,6 +64,8 @@ public:
 	bool bGameOver = false;
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Runner")
 	bool bHardMode = false;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Runner|Menu")
+	ERunnerMenu Menu = ERunnerMenu::Title;
 
 private:
 	UPROPERTY()
@@ -54,9 +77,12 @@ private:
 	int32 NextSegment = 0;
 	bool bRunStarted = false;
 	bool bEndCaptured = false;
+	bool bLeavingLevel = false;
 	float RunSeconds = 0.f;
 	FString RunId;
 	void ExtendTrack(float PlayerX);
 	void CaptureRunEnd(const FString& Reason);
 	FPostHogProperties RunProperties() const;
+	void OpenMenu(ERunnerMenu NewMenu);
+	void ReloadLevel(const TCHAR* Options);
 };

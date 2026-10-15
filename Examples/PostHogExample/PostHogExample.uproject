@@ -2,7 +2,7 @@
 	"FileVersion": 3,
 	"EngineAssociation": "5.8",
 	"Category": "Analytics",
-	"Description": "Playable three-lane runner demonstrating PostHog analytics and feature flags",
+	"Description": "Tim Raider: a playable three-lane runner set in a jungle temple, demonstrating PostHog analytics, feature flags, and opt-out",
 	"Modules": [
 		{
 			"Name": "PostHogExample",

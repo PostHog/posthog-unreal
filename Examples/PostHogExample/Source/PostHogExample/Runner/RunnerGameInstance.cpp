@@ -27,6 +27,7 @@ void URunnerGameInstance::Shutdown()
 {
     if (PostHog) PostHog->OnSetupCompleted.RemoveDynamic(this, &URunnerGameInstance::SetupCompleted);
     Pending.Empty();
+    FlagReload.Reset();
     // UPostHogSubsystem handles shutdown when the game instance's subsystems deinitialize.
     Super::Shutdown();
 }
@@ -55,8 +56,81 @@ bool URunnerGameInstance::UseHardMode() const
 
 FString URunnerGameInstance::AnalyticsStatus() const
 {
-    if (PostHog->IsInitialized()) return TEXT("ANALYTICS READY");
+    if (PostHog->IsInitialized()) return IsAnalyticsEnabled() ? TEXT("ANALYTICS READY") : TEXT("ANALYTICS OPTED OUT");
     if (PostHog->GetState() == EPostHogSubsystemState::Initializing) return TEXT("ANALYTICS CONNECTING");
     if (PostHog->GetState() == EPostHogSubsystemState::Failed) return TEXT("ANALYTICS FAILED");
     return TEXT("ANALYTICS OFFLINE DEMO");
+}
+
+void URunnerGameInstance::ViewScreen(const FString& Name)
+{
+    if (auto Client = GetClient()) Client->Screen(Name);
+}
+
+FPostHogClient::FPtr URunnerGameInstance::GetClient() const
+{
+    return PostHog ? PostHog->GetClient() : FPostHogClient::FPtr();
+}
+
+bool URunnerGameInstance::HasClient() const
+{
+    return GetClient().IsValid();
+}
+
+bool URunnerGameInstance::IsAnalyticsEnabled() const
+{
+    auto Client = GetClient();
+    return Client && !Client->IsOptedOut();
+}
+
+void URunnerGameInstance::SetAnalyticsEnabled(bool bEnabled)
+{
+    auto Client = GetClient();
+    if (!Client) return;
+    if (bEnabled) Client->OptInAsync();
+    else Client->OptOutAsync();
+}
+
+void URunnerGameInstance::ReloadFlags()
+{
+    if (auto Client = GetClient()) FlagReload = Client->ReloadFeatureFlagsAsync();
+}
+
+FString URunnerGameInstance::FlagReloadStatus() const
+{
+    if (!FlagReload) return FString();
+    if (!FlagReload->IsReady()) return TEXT("FLAGS RELOADING...");
+    const EPostHogFlagReloadStatus Status = FlagReload->Get().Status;
+    return Status == EPostHogFlagReloadStatus::Success || Status == EPostHogFlagReloadStatus::Partial
+        ? TEXT("FLAGS RELOADED") : TEXT("FLAG RELOAD FAILED");
+}
+
+FString URunnerGameInstance::DifficultyFlagLabel() const
+{
+    auto Client = GetClient();
+    if (!Client) return TEXT("UNKNOWN");
+    // Mirrors IsFeatureEnabled: true or any variant string enables hard mode.
+    const FString Json = Client->GetFeatureFlag(TEXT("runner-hard-mode"), false).ToJson();
+    if (Json == TEXT("null")) return TEXT("UNKNOWN");
+    return Json == TEXT("true") || Json.StartsWith(TEXT("\"")) ? TEXT("HARD") : TEXT("NORMAL");
+}
+
+FString URunnerGameInstance::ShortDistinctId() const
+{
+    auto Client = GetClient();
+    return Client ? Client->GetDistinctId().Left(8) : FString();
+}
+
+FString URunnerGameInstance::ShortSessionId() const
+{
+    auto Client = GetClient();
+    return Client ? Client->GetSessionId().Left(8) : FString();
+}
+
+void URunnerGameInstance::RecordFinishedRun(int32 Meters, int32 Relics)
+{
+    const int32 Score = ScoreFor(Meters, Relics);
+    bLastRunBest = Score > BestScore;
+    BestScore = FMath::Max(BestScore, Score);
+    BestDistance = FMath::Max(BestDistance, Meters);
 }
