@@ -19,6 +19,12 @@ export UE_ROOT="/path/to/UE_5.8"
 
 The native build writes ignored artifacts and a checksum/version manifest under `Source/ThirdParty/PostHogRust/lib/`. The example build links this checkout into its ignored `Plugins` directory.
 
+## Playable runner example
+
+After building, open `Examples/PostHogExample/PostHogExample.uproject` directly or run `./scripts/run-example.sh`, press **Play** in Unreal, and wait for the countdown. The three-lane runner uses only built-in engine shapes, so no character or map assets are needed. It works without analytics credentials; optional capture demonstrates run/coin events, game-instance ownership across restarts, and a cached difficulty flag.
+
+See [the example README](Examples/PostHogExample/README.md) for controls, runtime configuration, and mock-backed gameplay tests. The current launch script targets UE 5.8 on macOS arm64, matching the development build above.
+
 ## Game-instance integration
 
 Use **Project Settings → Plugins → PostHog** to configure automatic setup. A project token is required. Editor/PIE capture and dedicated-server initialization are disabled unless explicitly enabled. Runtime options include lifecycle capture, flag preloading, consent, person profiles, sessions, and delivery settings. Keep credentials out of source-controlled configuration.
