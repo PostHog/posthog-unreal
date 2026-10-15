@@ -81,6 +81,7 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
     FPostHogFlagCache FlagCache;
     uint64 FlagGeneration = 0;
     uint64 LoadingFlagGeneration = 0;
+    uint64 CacheFlagGeneration = 0;
     bool bLoadingFlags = false;
     bool bReloadFlagsRequested = false;
     TSharedFuture<FPostHogFlagReloadResult> FlagFuture;
@@ -125,7 +126,7 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         if (!bOptedOut && State->TryGetObjectField(TEXT("flag_context"), Context) &&
             SameProperties(FPostHogProperties::FromNative(Context->ToSharedRef()), FlagContextLocked()) &&
             State->TryGetObjectField(TEXT("cached_flags"), Object))
-        { FlagCache.Restore(FPostHogProperties::FromNative(Object->ToSharedRef())); }
+        { FlagCache.Restore(FPostHogProperties::FromNative(Object->ToSharedRef())); CacheFlagGeneration = FlagGeneration; }
     }
 
     FPostHogProperties FlagContextLocked() const
@@ -154,7 +155,7 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         State->SetObjectField(TEXT("person_flag_properties"), PersonFlagProperties.ToNative());
         State->SetObjectField(TEXT("group_flag_properties"), GroupFlagProperties.ToNative());
         if (CacheIncluded) { *CacheIncluded = false; }
-        if (bIncludeFlags && FlagCache.bLoaded && !bOptedOut)
+        if (bIncludeFlags && FlagCache.bLoaded && !bOptedOut && CacheFlagGeneration == FlagGeneration)
         {
             State->SetObjectField(TEXT("flag_context"), FlagContextLocked().ToNative());
             State->SetObjectField(TEXT("cached_flags"), FlagCache.Serialize().ToNative());
@@ -308,6 +309,8 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         FlagCache.Clear();
     }
 
+    void StaleFlagsLocked() { ++FlagGeneration; }
+
     TSharedFuture<FPostHogFlagReloadResult> ReloadFlagsLocked()
     {
         if (!CanCaptureLocked())
@@ -358,6 +361,7 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
                         Result.Status = Self->FlagCache.Apply(Response.ToSharedRef());
                         if (Result.Status == EPostHogFlagReloadStatus::Success || Result.Status == EPostHogFlagReloadStatus::Partial)
                         {
+                            Self->CacheFlagGeneration = Generation;
                             CacheRevision = Self->FlagCache.Revision;
                             Saved = Self->PersistLocked();
                         }
@@ -423,7 +427,9 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
     {
         FScopeLock Lock(&Mutex);
         if (CloseFuture.IsValid()) { return CloseFuture; }
+        const bool bCacheCurrent = CacheFlagGeneration == FlagGeneration;
         bClosed = true; ++ConsentGeneration; ++FlagGeneration; FlagCache.Reported.Empty(); DesiredOptOut = bOptedOut;
+        if (bCacheCurrent) { CacheFlagGeneration = FlagGeneration; }
         if (Handle != 0) { phu_begin_shutdown(Handle); }
         const auto Saved = PersistLocked();
         const phu_handle NativeHandle = Handle;
@@ -508,25 +514,32 @@ EPostHogCaptureResult FPostHogClient::Screen(const FString& Name, const FPostHog
 
 bool FPostHogClient::Identify(const FString& Id, const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
 {
-    if (!NonBlank(Id) || !Set.IsValid() || !SetOnce.IsValid()) { return false; }
+    if (!NonBlank(Id) || !Set.IsValid() || !SetOnce.IsValid())
+    { UE_LOG(LogPostHogClient, Warning, TEXT("Ignored identify: invalid distinct id or properties.")); return false; }
     FPostHogEvent Event;
     uint64 Generation = 0;
     {
         FScopeLock Lock(&Impl->Mutex);
-        if (!Impl->CanProcessPeopleLocked() || (Impl->bIdentified && Impl->DistinctId != Id) || !Impl->CanPersistLocked(Id)) { return false; }
+        if (!Impl->CanProcessPeopleLocked()) { UE_LOG(LogPostHogClient, Warning, TEXT("Ignored identify: person processing is unavailable.")); return false; }
+        if (Impl->bIdentified && Impl->DistinctId != Id) { UE_LOG(LogPostHogClient, Warning, TEXT("Ignored identify: already identified as a different user.")); return false; }
+        if (!Impl->CanPersistLocked(Id)) { UE_LOG(LogPostHogClient, Warning, TEXT("Ignored identify: client state is too large to persist.")); return false; }
         const bool bWasIdentified = Impl->bIdentified;
-        if (bWasIdentified && ((Set.IsEmpty() && SetOnce.IsEmpty()) || (Impl->bHasPersonProperties && SameProperties(Set, Impl->LastSet) && SameProperties(SetOnce, Impl->LastSetOnce)))) { return false; }
+        if (bWasIdentified && ((Set.IsEmpty() && SetOnce.IsEmpty()) || (Impl->bHasPersonProperties && SameProperties(Set, Impl->LastSet) && SameProperties(SetOnce, Impl->LastSetOnce))))
+        { UE_LOG(LogPostHogClient, Warning, TEXT("Ignored identify: duplicate of the current identity.")); return false; }
         auto Properties = MakeShared<FJsonObject>();
         const bool bLink = !bWasIdentified && Id != Impl->DistinctId;
         if (bLink) { Properties->SetStringField(TEXT("$anon_distinct_id"), Impl->DistinctId); }
         Properties->SetObjectField(TEXT("$set"), Set.ToNative());
         Properties->SetObjectField(TEXT("$set_once"), SetOnce.ToNative());
+        const bool bReload = !bWasIdentified && (bLink || !Set.IsEmpty() || !SetOnce.IsEmpty());
         Impl->DistinctId = Id; Impl->bIdentified = true;
-        if (!bWasIdentified) { ++Impl->IdentityGeneration; Impl->InvalidateFlagsLocked(); }
+        if (!bWasIdentified) { ++Impl->IdentityGeneration; }
+        if (bLink) { Impl->FlagCache.Reported.Empty(); }
+        if (bReload) { Impl->StaleFlagsLocked(); }
         Generation = Impl->IdentityGeneration;
         Event = Impl->SnapshotLocked(bLink ? TEXT("$identify") : TEXT("$set"), FPostHogProperties::FromNative(Properties));
         Impl->PersistLocked();
-        if (!bWasIdentified) { Impl->ReloadFlagsLocked(); }
+        if (bReload) { Impl->ReloadFlagsLocked(); }
     }
     if (Impl->Emit(MoveTemp(Event)) == EPostHogCaptureResult::Accepted)
     {
@@ -598,14 +611,15 @@ void FPostHogClient::SetPersonProperties(const FPostHogProperties& Set, const FP
 }
 void FPostHogClient::Group(const FString& Type, const FString& Key, const FPostHogProperties& Properties)
 {
-    if (!NonBlank(Type) || !NonBlank(Key)) { return; }
+    if (!NonBlank(Type) || !NonBlank(Key)) { UE_LOG(LogPostHogClient, Warning, TEXT("Ignored group: blank group type or key.")); return; }
     FPostHogEvent Event;
-    { FScopeLock Lock(&Impl->Mutex); if (!Impl->CanProcessPeopleLocked()) { return; }
+    { FScopeLock Lock(&Impl->Mutex);
+        if (!Impl->CanProcessPeopleLocked()) { UE_LOG(LogPostHogClient, Warning, TEXT("Ignored group: person processing is unavailable.")); return; }
         auto Previous = Impl->Groups;
         if (!Impl->Groups.SetString(Type, Key)) { return; }
         if (!Impl->CanPersistLocked()) { Impl->Groups = MoveTemp(Previous); return; }
         if (!SameProperties(Previous, Impl->Groups))
-        { Impl->GroupFlagProperties.Remove(Type); Impl->InvalidateFlagsLocked(); Impl->ReloadFlagsLocked(); }
+        { Impl->GroupFlagProperties.Remove(Type); Impl->StaleFlagsLocked(); Impl->ReloadFlagsLocked(); }
         Impl->bPersonProcessing = true; Impl->PersistLocked();
         FPostHogProperties Values; Values.SetString(TEXT("$group_type"), Type); Values.SetString(TEXT("$group_key"), Key); Values.Set(TEXT("$group_set"), FPostHogValue::Object(Properties));
         Event = Impl->SnapshotLocked(TEXT("$groupidentify"), Values); }
@@ -725,7 +739,7 @@ bool FPostHogClient::SetPersonPropertiesForFlags(const FPostHogProperties& Prope
     { if (bReload) { Impl->ReloadFlagsLocked(); } return true; }
     auto Previous = Impl->PersonFlagProperties; Impl->PersonFlagProperties = MoveTemp(Candidate);
     if (!Impl->CanPersistLocked()) { Impl->PersonFlagProperties = MoveTemp(Previous); return false; }
-    Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
+    Impl->StaleFlagsLocked(); Impl->PersistLocked();
     if (bReload) { Impl->ReloadFlagsLocked(); }
     return true;
 }
@@ -743,7 +757,7 @@ bool FPostHogClient::SetGroupPropertiesForFlags(const FString& Type, const FPost
     { if (bReload) { Impl->ReloadFlagsLocked(); } return true; }
     auto Previous = Impl->GroupFlagProperties; Impl->GroupFlagProperties = MoveTemp(Candidate);
     if (!Impl->CanPersistLocked()) { Impl->GroupFlagProperties = MoveTemp(Previous); return false; }
-    Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
+    Impl->StaleFlagsLocked(); Impl->PersistLocked();
     if (bReload) { Impl->ReloadFlagsLocked(); }
     return true;
 }
@@ -751,7 +765,7 @@ void FPostHogClient::ResetPersonPropertiesForFlags(bool bReload)
 {
     FScopeLock Lock(&Impl->Mutex);
     if (!Impl->CanCaptureLocked() || Impl->PersonFlagProperties.IsEmpty()) { return; }
-    Impl->PersonFlagProperties = {}; Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
+    Impl->PersonFlagProperties = {}; Impl->StaleFlagsLocked(); Impl->PersistLocked();
     if (bReload) { Impl->ReloadFlagsLocked(); }
 }
 void FPostHogClient::ResetGroupPropertiesForFlags(const FString& Type, bool bReload)
@@ -761,7 +775,7 @@ void FPostHogClient::ResetGroupPropertiesForFlags(const FString& Type, bool bRel
     auto Previous = Impl->GroupFlagProperties;
     if (Type.IsEmpty()) { Impl->GroupFlagProperties = {}; } else { Impl->GroupFlagProperties.Remove(Type); }
     if (SameProperties(Previous, Impl->GroupFlagProperties)) { return; }
-    Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
+    Impl->StaleFlagsLocked(); Impl->PersistLocked();
     if (bReload) { Impl->ReloadFlagsLocked(); }
 }
 FString FPostHogClient::GetSessionId()

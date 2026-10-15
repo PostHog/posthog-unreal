@@ -383,7 +383,17 @@ class NativeTests(MockServerTestCase):
         identity_events = [event for event in materialized if event["event"] == "$identify" and event["distinct_id"] == "user-one"]
         self.assertEqual(len(identity_events), 1)
         self.assertEqual(identity_events[0]["properties"]["$anon_distinct_id"], anonymous["distinct_id"])
-        self.assertEqual(sum(event["event"] == "$set" for event in materialized), 1)
+        anon_identified = events["stateful_anon_identified"]
+        anon_id = anon_identified["distinct_id"]
+        self.assertEqual(sum(event["event"] == "$set" for event in materialized), 2)
+        anon_sets = [event for event in materialized if event["event"] == "$set" and event["distinct_id"] == anon_id]
+        self.assertEqual(len(anon_sets), 1)
+        self.assertNotIn("$anon_distinct_id", anon_sets[0]["properties"])
+        self.assertFalse(any(event["event"] == "$identify" and event["distinct_id"] == anon_id for event in materialized))
+        self.assertFalse(any(event["event"] == "$groupidentify" and event["distinct_id"] == anon_id for event in materialized))
+        self.assertNotIn("$groups", anon_identified["properties"])
+        self.assertIs(anon_identified["properties"]["$is_identified"], True)
+        self.assertIs(anon_sets[0]["properties"]["$is_identified"], True)
         self.assertNotIn("secret", events["stateful_redacted"]["properties"])
         self.assertNotIn("secret", wire_by_name["stateful_redacted"]["properties"])
         self.assertEqual(events["stateful_redacted"]["properties"]["$lib"], "posthog-unreal")

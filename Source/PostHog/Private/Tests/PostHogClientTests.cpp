@@ -62,6 +62,11 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
 {
     const FString Host = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_TEST_HOST"));
     if (Host.IsEmpty()) { AddError(TEXT("Set POSTHOG_TEST_HOST to the SDK mock server.")); return false; }
+    AddExpectedMessagePlain(TEXT("Ignored identify: duplicate of the current identity."), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 3);
+    AddExpectedMessagePlain(TEXT("Ignored identify: already identified as a different user."), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
+    AddExpectedMessagePlain(TEXT("Ignored identify: person processing is unavailable."), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 2);
+    AddExpectedMessagePlain(TEXT("Ignored group: blank group type or key."), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 2);
+    AddExpectedMessagePlain(TEXT("Ignored group: person processing is unavailable."), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
     const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("PostHogClientTests") / FGuid::NewGuid().ToString());
     auto Future = Async(EAsyncExecution::Thread, [Host, Root]
     {
@@ -116,6 +121,17 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
         Check(Client->Capture(TEXT("stateful_after_reset_optout")) == EPostHogCaptureResult::Accepted, TEXT("capture after reset consent"));
         Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush reset consent"));
         Check(Client->ShutdownAsync().Get(), TEXT("shutdown reset consent")); Client.Reset();
+
+        Config.ClientName = TEXT("anon-identify");
+        Client = FPostHogClient::CreateAsync(Config).Get();
+        Check(Client.IsValid(), TEXT("anonymous identify client")); if (!Client) { return Result; }
+        const FString AnonymousUser = Client->GetDistinctId();
+        Check(Client->Identify(AnonymousUser) && Client->GetDistinctId() == AnonymousUser, TEXT("identify with current anonymous id"));
+        Check(!Client->Identify(AnonymousUser), TEXT("repeat identify of same id suppressed"));
+        Client->Group(TEXT(""), TEXT("empty-type")); Client->Group(TEXT("empty-key"), TEXT(""));
+        Check(Client->Capture(TEXT("stateful_anon_identified")) == EPostHogCaptureResult::Accepted, TEXT("capture after anonymous identify"));
+        Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush anonymous identify"));
+        Check(Client->ShutdownAsync().Get(), TEXT("close anonymous identify client")); Client.Reset();
 
         Config.ClientName = TEXT("hook");
         auto Weak = MakeShared<TWeakPtr<FPostHogClient, ESPMode::ThreadSafe>, ESPMode::ThreadSafe>();
