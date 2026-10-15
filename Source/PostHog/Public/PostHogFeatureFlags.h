@@ -43,4 +43,7 @@ struct POSTHOG_API FPostHogFlagReloadResult
      * values for the same context; disabled/closed/stale results are empty. */
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     FPostHogProperties Flags;
+
+    /** Native context stamp used to reject stale deferred notifications. */
+    uint64 ContextGeneration = 0;
 };

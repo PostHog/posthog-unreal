@@ -37,6 +37,19 @@ Storage defaults to `Saved/PostHog`, with separate runtime, editor-standalone, a
 
 The subsystem samples OS, engine version, locale, and app metadata on the game thread. Application version defaults to the project's Description settings; application build is optional. Lifecycle capture defaults on and emits `Application Installed`, `Application Updated`, `Application Opened`, and `Application Backgrounded` through normal consent/hook handling. Version/build markers survive identity reset. Core lifecycle and Slate activation signals are deduplicated; shutdown removes observers.
 
+## Blueprint analytics and flags
+
+Get **PostHog Subsystem** with **Get Game Instance Subsystem**, then wait for successful setup. The subsystem exposes:
+
+- **Capture**: event name and optional typed properties. Its result reports queue admission, not delivery.
+- **Identify**: distinct ID, optional `Set` and `Set Once` properties. Updates local identity immediately and schedules flag refresh; false also covers duplicate identifies with no changes. Switching between identified accounts requires a native reset first.
+- **Get Feature Flag**: a local cache read returning `Found`, `Value`, payload presence/value, and metadata. Break the result struct and use **Try Get Boolean** or **Try Get String** on `Value`. A missing flag differs from a known false flag. `Send Event` defaults to true, so this node has execution pins.
+- **Reload Feature Flags**: starts an asynchronous refresh. Bind **On Feature Flags Reloaded** before calling it; the event supplies status, persistence acknowledgement, and a completion-time flag snapshot on the game thread. Repeated calls before notification share one completion. Context changes after native completion produce `Stale` with no snapshot; shutdown or game-instance destruction cancels notification. This event covers explicit reloads, not automatic setup/identity refreshes.
+
+Create a **PostHog Properties** variable and fill it with **Set Property**, using **Make String/Boolean/Number/Object/Array/Null Value** nodes. Alternatively, **Parse Properties** validates a JSON object and reports success. **Properties to Json** and **Value to Json** expose snapshots and payloads without losing their JSON types.
+
+Before setup finishes or after shutdown, Capture returns `Closed`, Identify and Reload Feature Flags return false, and Get Feature Flag returns a missing result. A true reload return value means a completion was scheduled, not that the request succeeded; for example, opted-out clients complete with `Disabled`.
+
 ## Stateful C++ client
 
 Add `PostHog` to your module dependencies and include `PostHogClient.h`.

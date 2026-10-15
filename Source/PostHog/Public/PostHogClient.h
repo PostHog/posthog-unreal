@@ -121,6 +121,9 @@ public:
 
 private:
     friend class FPostHogModule;
+    friend class UPostHogSubsystem;
+    /** Recheck a completion before publishing it on the game thread. */
+    FPostHogFlagReloadResult ValidateFlagReloadResult(FPostHogFlagReloadResult Result) const;
     /** Runtime module teardown: closes clients and joins all native work. */
     static void ShutdownAll();
     struct FImpl;

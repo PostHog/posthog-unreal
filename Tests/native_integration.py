@@ -275,7 +275,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, str(evidence / "stdout.log"))
         result = json.loads((report / "index.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["failed"], 0, result)
-        self.assertEqual(result["succeeded"], 6, result)
+        self.assertEqual(result["succeeded"], 7, result)
         wire = self.http("/__captured/events")
         events = {event["event"]: event for event in wire}
         self.assertEqual(events["unreal_native_integration"]["properties"]["$lib"], "posthog-unreal")
@@ -316,6 +316,18 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(len({event["distinct_id"] for event in parallel_a}), 1)
         self.assertEqual(len({event["distinct_id"] for event in parallel_b}), 1)
         self.assertNotEqual(parallel_a[0]["distinct_id"], parallel_b[0]["distinct_id"])
+        blueprint = events["blueprint_anonymous"]
+        self.assertEqual(blueprint["properties"]["string"], "00123 玩家 🚀")
+        self.assertEqual(blueprint["properties"]["number"], 42)
+        self.assertIs(blueprint["properties"]["boolean"], False)
+        self.assertEqual(blueprint["properties"]["array"], [None, {"string": "00123 玩家 🚀", "number": 42, "boolean": False}])
+        self.assertEqual(events["blueprint_identified"]["distinct_id"], "blueprint-user")
+        blueprint_identify = next(event for event in wire if event["event"] == "$identify" and event["distinct_id"] == "blueprint-user")
+        self.assertEqual(blueprint_identify["properties"]["$anon_distinct_id"], blueprint["distinct_id"])
+        self.assertEqual(blueprint_identify["properties"]["$set"], {"name": "Blueprint player"})
+        self.assertEqual(blueprint_identify["properties"]["$set_once"], {"origin": "blueprint"})
+        self.assertNotIn("blueprint_not_ready", events)
+        self.assertNotIn("blueprint_opted_out", events)
         first = events["subsystem_one"]
         second = events["subsystem_two"]
         self.assertNotEqual(first["distinct_id"], second["distinct_id"])
@@ -340,6 +352,8 @@ class NativeTests(unittest.TestCase):
             self.assertNotIn("version", event["properties"])
             self.assertNotIn("build", event["properties"])
         exposures = [event for event in wire if event["event"] == "$feature_flag_called"]
+        blueprint_exposures = [event for event in exposures if event["properties"].get("test_suite") == "blueprint"]
+        self.assertEqual([event["properties"]["$feature_flag"] for event in blueprint_exposures], ["disabled-flag"])
         initial = [event for event in exposures if event["properties"].get("stage") == "initial"]
         self.assertEqual(len(initial), 3)
         self.assertEqual({event["properties"]["$feature_flag"] for event in initial},

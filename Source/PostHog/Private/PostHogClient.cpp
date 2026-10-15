@@ -374,6 +374,7 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
                     if (Self->CanCaptureLocked() && Self->bReloadFlagsRequested) { continue; }
                     if (Self->CanCaptureLocked() && Self->FlagGeneration == Generation && Self->ConsentGeneration == Consent)
                     { Result.Flags = Self->FlagCache.Values(); }
+                    Result.ContextGeneration = Generation;
                     Self->bLoadingFlags = false;
                     return Result;
                 }
@@ -694,6 +695,15 @@ FPostHogFeatureFlagResult FPostHogClient::GetFeatureFlagResult(const FString& Ke
     }
     return Result;
 }
+FPostHogFlagReloadResult FPostHogClient::ValidateFlagReloadResult(FPostHogFlagReloadResult Result) const
+{
+    FScopeLock Lock(&Impl->Mutex);
+    if (Impl->bClosed) { return {EPostHogFlagReloadStatus::Closed, false}; }
+    if (Impl->bOptedOut) { return {EPostHogFlagReloadStatus::Disabled, false}; }
+    if (Result.ContextGeneration != Impl->FlagGeneration) { return {EPostHogFlagReloadStatus::Stale, false}; }
+    return Result;
+}
+
 FPostHogValue FPostHogClient::GetFeatureFlag(const FString& Key, bool bSendEvent)
 { return GetFeatureFlagResult(Key, bSendEvent).Value; }
 bool FPostHogClient::IsFeatureEnabled(const FString& Key, bool bSendEvent, bool bDefaultValue)
