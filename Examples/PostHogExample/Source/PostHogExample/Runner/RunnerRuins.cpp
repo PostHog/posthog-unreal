@@ -14,9 +14,11 @@ namespace
 		FLinearColor(0.40f, 0.31f, 0.18f), FLinearColor(0.34f, 0.27f, 0.16f),
 		FLinearColor(0.46f, 0.37f, 0.22f), FLinearColor(0.26f, 0.27f, 0.26f)};
 	const FLinearColor Leaves[] = {
-		FLinearColor(0.04f, 0.22f, 0.02f), FLinearColor(0.10f, 0.32f, 0.03f), FLinearColor(0.03f, 0.14f, 0.04f)};
+		FLinearColor(0.05f, 0.30f, 0.02f), FLinearColor(0.13f, 0.42f, 0.03f), FLinearColor(0.025f, 0.19f, 0.04f)};
+	const FLinearColor Bark[] = {
+		FLinearColor(0.13f, 0.08f, 0.045f), FLinearColor(0.19f, 0.13f, 0.075f), FLinearColor(0.09f, 0.07f, 0.05f)};
 	const FLinearColor Mortar(0.03f, 0.026f, 0.022f);
-	const FLinearColor LeafEdge(0.32f, 0.48f, 0.05f);
+	const FLinearColor LeafEdge(0.42f, 0.6f, 0.05f);
 	const FLinearColor Rut(0.20f, 0.13f, 0.06f);
 	const FLinearColor Cliff(0.07f, 0.08f, 0.06f);
 	const FLinearColor Waterfall(0.78f, 0.84f, 0.86f);
@@ -29,7 +31,9 @@ namespace
 	const FLinearColor Flame(2.4f, 0.7f, 0.06f);
 	const FLinearColor Gleam(2.5f, 1.2f, 0.12f);
 	const FLinearColor ChasmFloor(0.012f, 0.025f, 0.018f);
-	const FLinearColor MistRock(0.16f, 0.18f, 0.14f);
+	const FLinearColor Earth(0.085f, 0.06f, 0.035f);
+	const FLinearColor FarLeaves(0.035f, 0.1f, 0.035f);
+	const FLinearColor FarTrunk(0.055f, 0.05f, 0.04f);
 
 	constexpr float SegmentLength = RunnerRules::SegmentLength;
 	constexpr float LaneHalf = RunnerRules::LaneWidth / 2.f;
@@ -45,6 +49,12 @@ namespace
 	constexpr int32 ArchPillarIndex = 3;
 	constexpr float ArchX = PillarStart + ArchPillarIndex * PillarSpacing;
 	constexpr float PanelLength = 440.f;
+	// The jungle floor is a bank beyond a strip of open chasm, so the drop at the path edge stays visible.
+	constexpr float BankY = 1150.f;
+	constexpr float BankDepth = 2200.f;
+	constexpr float BankTop = -120.f;
+	// Arch lintels bottom out near 830 cm and the jump apex is lower, so foliage stays clear above this.
+	constexpr float CanopyFloor = 950.f;
 }
 
 UStaticMeshComponent* RunnerRuins::AttachMesh(AActor* Owner, USceneComponent* Parent, UStaticMesh* Mesh,
@@ -186,7 +196,10 @@ void FRunnerRuins::Edges(bool bArch)
 			Ferns(FVector(X, Side * Random.FRandRange(560.f, 600.f), 0.f));
 		for (int32 Index = 0; Index < 3; ++Index)
 			Foliage(FVector(Random.FRandRange(0.f, SegmentLength), Side * Random.FRandRange(640.f, 690.f), 5.f), Random.FRandRange(60.f, 140.f));
+		Undergrowth(Side);
+		Jungle(Side);
 	}
+	Overhang();
 	if (bArch) Arch();
 }
 
@@ -332,18 +345,30 @@ void FRunnerRuins::MistTower(float X, float Side, float Height)
 		const float Y = Side * Random.FRandRange(13000.f, 20000.f);
 		Box(Cliff, FVector(X, Y, -900.f), FVector(Width, 500.f, Height + 2600.f));
 		Box(Waterfall, FVector(X + Jitter(0.3f) * Width, Y - Side * 251.f, -900.f), FVector(Random.FRandRange(60.f, 140.f), 4.f, Height + 2600.f));
+		const float Rim = 400.f + Height / 2.f;
+		for (int32 Index = 0; Index < 3; ++Index)
+		{
+			const float Lobe = Random.FRandRange(500.f, 900.f);
+			Add(Palette.Sphere, FarLeaves, FVector(X + Jitter(0.4f) * Width, Y + Jitter(150.f), Rim + Random.FRandRange(0.f, 120.f)),
+				FVector(Lobe, Random.FRandRange(500.f, 800.f), Lobe * 0.4f));
+		}
 		return;
 	}
-	if (Random.FRand() < 0.5f) return;
-	const float Width = Random.FRandRange(300.f, 700.f);
-	const float Top = Height - 2100.f;
-	const FVector Base(X + Jitter(200.f), Side * Random.FRandRange(3200.f, 9000.f), -2500.f);
-	Box(MistRock, Base + FVector(0.f, 0.f, (Top + 2500.f) / 2.f), FVector(Width, Width * Random.FRandRange(0.7f, 1.2f), Top + 2500.f),
-		FRotator(0.f, Jitter(20.f), 0.f));
-	if (Random.FRand() < 0.5f)
-		Box(MistRock, FVector(Base.X, Base.Y, Top + 40.f), FVector(Width * 1.15f, Width * 1.15f, 80.f),
-			FRotator(Jitter(6.f), Random.FRandRange(0.f, 90.f), Jitter(6.f)));
-	if (Random.FRand() < 0.6f) Foliage(FVector(Base.X, Base.Y, Top + 20.f), Width * 0.5f);
+	if (Random.FRand() < 0.15f) return;
+	const FVector Base(X + Jitter(200.f), Side * Random.FRandRange(4500.f, 9000.f), -2500.f);
+	const float Top = Height + 300.f;
+	for (int32 Index = 0, Count = Random.RandRange(2, 3); Index < Count; ++Index)
+	{
+		const float Trunk = Random.FRandRange(90.f, 180.f);
+		Add(Palette.Cylinder, FarTrunk, Base + FVector(Jitter(300.f), Jitter(300.f), (Top - Base.Z) / 2.f),
+			FVector(Trunk, Trunk, Top - Base.Z), FRotator(Jitter(3.f), 0.f, Jitter(3.f)));
+	}
+	for (int32 Index = 0, Count = Random.RandRange(3, 5); Index < Count; ++Index)
+	{
+		const float Lobe = Random.FRandRange(500.f, 1100.f);
+		Add(Palette.Sphere, FarLeaves, FVector(Base.X + Jitter(450.f), Base.Y + Jitter(450.f), Top + Random.FRandRange(-250.f, 150.f)),
+			FVector(Lobe, Lobe * Random.FRandRange(0.8f, 1.1f), Lobe * 0.5f), FRotator(0.f, Random.FRandRange(0.f, 360.f), 0.f));
+	}
 }
 
 void FRunnerRuins::Statue(float X, float Side, bool bSeated)
@@ -466,4 +491,138 @@ void FRunnerRuins::Relic(USceneComponent* Trigger)
 	Attach(Trigger, Palette.Sphere, Metal, FVector::ZeroVector, FVector(12.f, 46.f, 46.f));
 	Attach(Trigger, Palette.Sphere, Palette.Glow(Gleam), FVector(-4.f, 0.f, 0.f), FVector(10.f, 18.f, 18.f));
 	Attach(Trigger, Palette.Sphere, Metal, FVector(0.f, 0.f, 30.f), FVector(14.f, 18.f, 18.f));
+}
+
+void FRunnerRuins::Undergrowth(float Side)
+{
+	for (float X = Random.FRandRange(0.f, 120.f); X < SegmentLength; X += Random.FRandRange(110.f, 210.f))
+		BroadLeaves(FVector(X, Side * Random.FRandRange(640.f, 700.f), Random.FRandRange(-15.f, 15.f)), Side);
+	for (float X = Random.FRandRange(0.f, 300.f); X < SegmentLength; X += Random.FRandRange(220.f, 420.f))
+	{
+		const float Height = Random.FRandRange(60.f, 260.f);
+		Box(Moss, FVector(X, Side * (LedgeY + 1.5f), -Height / 2.f - Random.FRandRange(0.f, 60.f)),
+			FVector(Random.FRandRange(70.f, 220.f), 3.f, Height));
+	}
+}
+
+void FRunnerRuins::BroadLeaves(FVector Center, float Side)
+{
+	for (int32 Index = 0, Count = Random.RandRange(2, 4); Index < Count; ++Index)
+	{
+		const float Leaf = Random.FRandRange(80.f, 160.f);
+		// Leaves fan outward over the drop and droop at the tips.
+		const float Yaw = Side * 90.f + Random.FRandRange(-70.f, 70.f);
+		const FRotator Rotation(Random.FRandRange(-30.f, 10.f), Yaw, Jitter(20.f));
+		const FVector Offset = Rotation.RotateVector(FVector(Leaf * 0.4f, 0.f, 0.f));
+		Add(Palette.Sphere, Random.FRand() < 0.2f ? LeafEdge : Pick(Leaves), Center + Offset + FVector(0.f, 0.f, Leaf * 0.15f),
+			FVector(Leaf, Leaf * 0.38f, 6.f), Rotation);
+	}
+}
+
+void FRunnerRuins::Jungle(float Side)
+{
+	Box(Earth, FVector(SegmentLength / 2.f, Side * (BankY + BankDepth / 2.f), BankTop - 700.f),
+		FVector(SegmentLength + 4.f, BankDepth, 1400.f));
+	for (float X = Random.FRandRange(0.f, 200.f); X < SegmentLength; X += Random.FRandRange(300.f, 500.f))
+		Vines(FVector(X, Side * (BankY - 6.f), BankTop + 10.f), FVector(160.f, 0.f, 0.f), Random.RandRange(2, 4), 150.f, 600.f);
+
+	bool bNearRow = Random.FRand() < 0.5f;
+	for (float X = Random.FRandRange(0.f, 150.f); X < SegmentLength; X += Random.FRandRange(190.f, 320.f))
+	{
+		bNearRow = !bNearRow;
+		const float Y = bNearRow ? Random.FRandRange(BankY + 90.f, BankY + 450.f) : Random.FRandRange(BankY + 550.f, BankY + 1800.f);
+		Tree(FVector(X, Side * Y, BankTop), Random.FRandRange(1500.f, 2500.f),
+			bNearRow ? Random.FRandRange(100.f, 170.f) : Random.FRandRange(70.f, 130.f));
+	}
+	// Understory masses close the gaps between trunks at eye height.
+	for (float X = Random.FRandRange(0.f, 150.f); X < SegmentLength; X += Random.FRandRange(170.f, 280.f))
+		Canopy(FVector(X, Side * Random.FRandRange(BankY + 150.f, BankY + 1300.f), Random.FRandRange(150.f, 650.f)),
+			Random.FRandRange(260.f, 460.f), BankTop + 20.f);
+	for (float X = Random.FRandRange(0.f, 100.f); X < SegmentLength; X += Random.FRandRange(130.f, 230.f))
+		Foliage(FVector(X, Side * Random.FRandRange(BankY + 30.f, BankY + 380.f), BankTop + 15.f), Random.FRandRange(90.f, 190.f));
+	for (float X = Random.FRandRange(0.f, 300.f); X < SegmentLength; X += Random.FRandRange(300.f, 600.f))
+		Ferns(FVector(X, Side * Random.FRandRange(BankY + 20.f, BankY + 200.f), BankTop));
+	for (float X = Random.FRandRange(0.f, 200.f); X < SegmentLength; X += Random.FRandRange(250.f, 450.f))
+		Add(Palette.Sphere, Moss, FVector(X, Side * Random.FRandRange(BankY + 100.f, BankY + 1900.f), BankTop),
+			FVector(Random.FRandRange(200.f, 420.f), Random.FRandRange(150.f, 300.f), 14.f), FRotator(0.f, Random.FRandRange(0.f, 180.f), 0.f));
+	Log(FVector(Random.FRandRange(300.f, SegmentLength - 300.f), Side * Random.FRandRange(BankY + 150.f, BankY + 450.f), BankTop + 30.f),
+		Random.FRandRange(260.f, 460.f), Jitter(35.f));
+	for (float X = Random.FRandRange(0.f, 200.f); X < SegmentLength; X += Random.FRandRange(260.f, 420.f))
+		Canopy(FVector(X, Side * Random.FRandRange(750.f, 2400.f), Random.FRandRange(1300.f, 2100.f)), Random.FRandRange(320.f, 540.f), CanopyFloor);
+	// Hazy back wall of foliage behind the trunks keeps the sides closed.
+	for (int32 Index = 0; Index < 3; ++Index)
+	{
+		const float Mass = Random.FRandRange(1000.f, 1600.f);
+		Add(Palette.Sphere, FarLeaves, FVector((Index + Random.FRand()) * SegmentLength / 3.f, Side * Random.FRandRange(3400.f, 4200.f),
+			Random.FRandRange(300.f, 1400.f)), FVector(Mass, Random.FRandRange(700.f, 1000.f), Mass * Random.FRandRange(0.7f, 1.f)));
+	}
+}
+
+void FRunnerRuins::Tree(FVector Base, float Height, float Diameter)
+{
+	const FRotator Lean(Jitter(4.f), 0.f, Jitter(4.f));
+	const FVector Up = Lean.RotateVector(FVector::UpVector);
+	Add(Palette.Cylinder, Pick(Bark), Base + Up * (Height / 2.f), FVector(Diameter, Diameter, Height), Lean);
+	Add(Palette.Cone, Bark[0], Base + FVector(0.f, 0.f, Diameter * 0.6f), FVector(Diameter * 2.4f, Diameter * 2.4f, Diameter * 1.4f));
+	if (Random.FRand() < 0.4f)
+	{
+		const float Band = Random.FRandRange(60.f, 160.f);
+		Add(Palette.Cylinder, Moss, Base + Up * Random.FRandRange(Band, Height * 0.4f), FVector(Diameter + 4.f, Diameter + 4.f, Band), Lean);
+	}
+	Canopy(Base + Up * Height + FVector(0.f, 0.f, Random.FRandRange(-60.f, 60.f)), Random.FRandRange(450.f, 720.f), CanopyFloor);
+}
+
+void FRunnerRuins::Canopy(FVector Center, float Size, float MinBottom)
+{
+	Center.Z = FMath::Max(Center.Z, MinBottom + Size * 0.3f);
+	for (int32 Index = 0, Lobes = Random.RandRange(3, 5); Index < Lobes; ++Index)
+	{
+		const float Lobe = Size * Random.FRandRange(0.55f, 1.f);
+		const float Thickness = Lobe * Random.FRandRange(0.5f, 0.75f);
+		FVector Position = Center + FVector(Jitter(0.6f) * Size, Jitter(0.6f) * Size, Jitter(0.15f) * Size);
+		Position.Z = FMath::Max(Position.Z, MinBottom + Thickness / 2.f);
+		Add(Palette.Sphere, Pick(Leaves), Position, FVector(Lobe, Lobe * Random.FRandRange(0.8f, 1.1f), Thickness),
+			FRotator(0.f, Random.FRandRange(0.f, 360.f), 0.f));
+	}
+	Add(Palette.Sphere, LeafEdge, Center + FVector(Jitter(0.3f) * Size, Jitter(0.3f) * Size, Size * 0.2f),
+		FVector(Size * 0.5f, Size * 0.4f, Size * 0.16f), FRotator(0.f, Random.FRandRange(0.f, 360.f), 0.f));
+	if (Random.FRand() < 0.3f)
+		Add(Palette.Cone, Pick(Leaves), Center + FVector(0.f, 0.f, Size * 0.3f), FVector(Size * 0.6f, Size * 0.6f, Size * 0.5f));
+}
+
+void FRunnerRuins::Bough(FVector Root, FVector Tip)
+{
+	const FVector Along = Tip - Root;
+	Add(Palette.Cylinder, Pick(Bark), (Root + Tip) / 2.f, FVector(45.f, 45.f, Along.Size()),
+		FRotationMatrix::MakeFromZ(Along.GetSafeNormal()).Rotator());
+}
+
+void FRunnerRuins::Overhang()
+{
+	for (int32 Index = 0, Count = Random.RandRange(2, 3); Index < Count; ++Index)
+	{
+		const float Side = Random.FRand() < 0.5f ? -1.f : 1.f;
+		const float X = (Index + Random.FRandRange(0.2f, 0.8f)) * SegmentLength / Count;
+		const float RootY = Random.FRandRange(BankY + 200.f, BankY + 500.f);
+		const float RootZ = Random.FRandRange(1500.f, 1900.f);
+		Tree(FVector(X, Side * RootY, BankTop), RootZ - BankTop + Random.FRandRange(200.f, 500.f), Random.FRandRange(100.f, 140.f));
+		const FVector Root(X, Side * RootY, RootZ);
+		const FVector Tip(X + Jitter(300.f), Side * Random.FRandRange(-250.f, 350.f), Random.FRandRange(1200.f, 1400.f));
+		Bough(Root, Tip);
+		Canopy((Root + Tip) / 2.f, Random.FRandRange(380.f, 520.f), CanopyFloor);
+		Canopy(Tip, Random.FRandRange(420.f, 600.f), CanopyFloor);
+		// Vines over the lanes stop well above the jump apex so they never read as an obstacle.
+		const float Hang = CanopyFloor + 20.f;
+		Vines(FVector(Tip.X, Tip.Y, Hang), FVector(150.f, 150.f, 0.f), Random.RandRange(3, 6), 100.f, Hang - 640.f);
+	}
+}
+
+void FRunnerRuins::Log(FVector Center, float Length, float Yaw)
+{
+	const float Diameter = Random.FRandRange(55.f, 85.f);
+	const FRotator Lying(90.f, Yaw, 0.f);
+	Add(Palette.Cylinder, Pick(Bark), Center + FVector(0.f, 0.f, Diameter / 2.f - 10.f), FVector(Diameter, Diameter, Length), Lying);
+	Add(Palette.Sphere, Moss, Center + FVector(0.f, 0.f, Diameter - 12.f), FVector(Length * 0.5f, Diameter * 0.7f, 10.f),
+		FRotator(0.f, Yaw, 0.f));
+	Ferns(Center + Lying.RotateVector(FVector(0.f, 0.f, Length * 0.45f)));
 }

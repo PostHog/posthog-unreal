@@ -30,8 +30,8 @@ namespace
 		ASkyLight* Sky = World->SpawnActor<ASkyLight>();
 		USkyLightComponent* Light = Sky->GetLightComponent();
 		Light->SetMobility(EComponentMobility::Movable);
-		Light->SetIntensity(1.4f);
-		Light->SetLightColor(FLinearColor(0.72f, 0.9f, 1.f));
+		Light->SetIntensity(1.15f);
+		Light->SetLightColor(FLinearColor(0.7f, 0.92f, 0.9f));
 		Light->SetRealTimeCaptureEnabled(true);
 	}
 
@@ -46,7 +46,7 @@ namespace
 		Component->SetSecondFogDensity(1.f);
 		Component->SetSecondFogHeightOffset(-1700.f);
 		Component->SetSecondFogHeightFalloff(3.f);
-		Component->SetFogInscatteringColor(FLinearColor(1.25f, 1.02f, 0.76f));
+		Component->SetFogInscatteringColor(FLinearColor(1.08f, 1.06f, 0.74f));
 		Component->SetDirectionalInscatteringColor(FLinearColor(2.5f, 1.5f, 0.6f));
 		Component->SetDirectionalInscatteringExponent(4.f);
 	}
@@ -59,7 +59,7 @@ namespace
 		Settings.bOverride_WhiteTemp = true;
 		Settings.WhiteTemp = 7200.f;
 		Settings.bOverride_AutoExposureBias = true;
-		Settings.AutoExposureBias = -0.2f;
+		Settings.AutoExposureBias = -1.f;
 		Settings.bOverride_ColorSaturation = true;
 		Settings.ColorSaturation = FVector4(1.06f, 1.06f, 1.06f, 1.f);
 		Settings.bOverride_VignetteIntensity = true;

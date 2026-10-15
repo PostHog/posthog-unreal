@@ -44,7 +44,7 @@ The analytics and reload items are greyed out when no SDK client is configured.
 | S / Down | Slide |
 | R / Enter / Space after a run is over | Run again (skips the menus) |
 
-Forward movement is automatic. The track is dressed at runtime as sunlit jungle-temple ruins: sandstone flagstones over a dirt path, a colonnade with arches and guardian statues, torches, and a misty chasm. Jump fallen pillars, slide under collapsed lintels, dodge stone block walls, and collect gold relics along the open lane of every obstacle row. Speed increases with distance, and old track sections are retired as new ones appear.
+Forward movement is automatic. The track is dressed at runtime as a sunlit path cut through dense jungle, with temple ruins along it: sandstone flagstones over a dirt path, a colonnade with arches and guardian statues, torches, tree trunks and canopy closing in on both sides, and a misty chasm at the path edges. Jump fallen pillars, slide under collapsed lintels, dodge stone block walls, and collect gold relics along the open lane of every obstacle row. Speed increases with distance, and old track sections are retired as new ones appear.
 
 After building, you can open `PostHogExample.uproject` directly or use the launch script. Project defaults select the engine's empty Entry map, `RunnerGameMode`, and `RunnerGameInstance`. The track and runner appear when you press **Play**, not in the editing viewport. Keep machine-specific overrides in ignored `Config/UserEngine.ini`. Restart the editor after changing project defaults or rebuilding C++; the SDK does not support Live Coding/module reloading.
 

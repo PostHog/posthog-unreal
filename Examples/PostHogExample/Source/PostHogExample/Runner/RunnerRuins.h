@@ -27,7 +27,10 @@ namespace RunnerRuins
 		bool bVisible = true);
 }
 
-/** Dresses one track segment as jungle-temple ruins. Decorative pieces are collision-free and batched per (shape, color). */
+/**
+ * Dresses one track segment as temple ruins on a causeway cut through dense jungle. Decorative pieces are
+ * collision-free and batched per (shape, color).
+ */
 class FRunnerRuins
 {
 public:
@@ -36,6 +39,7 @@ public:
 	void Path();
 	void Edges(bool bArch);
 	void Chasm();
+	/** A distant jungle mass, or occasionally a cliff with a waterfall, rising out of the mist. */
 	void MistTower(float X, float Side, float Height);
 	void Statue(float X, float Side, bool bSeated);
 	void Torch(float X, float Side);
@@ -69,6 +73,14 @@ private:
 	void CarvedPanel(float X, float Side);
 	void Arch();
 	void Vines(FVector Top, FVector Spread, int32 Count, float MinLength, float MaxLength);
+	void Jungle(float Side);
+	void Undergrowth(float Side);
+	void Tree(FVector Base, float Height, float Diameter);
+	void Bough(FVector Root, FVector Tip);
+	void Canopy(FVector Center, float Size, float MinBottom);
+	void Overhang();
+	void Log(FVector Center, float Length, float Yaw);
+	void BroadLeaves(FVector Center, float Side);
 	void Foliage(FVector Center, float Size);
 	void Ferns(FVector Center);
 	void Inset(FVector FaceCenter, FVector Normal, float Width, float Height);
