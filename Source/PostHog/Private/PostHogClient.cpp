@@ -138,9 +138,11 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         if (!bOptedOut && State->TryGetObjectField(TEXT("flag_context"), Context) &&
             SameProperties(FPostHogProperties::FromNative(Context->ToSharedRef()), FlagContextLocked()) &&
             State->TryGetObjectField(TEXT("cached_flags"), Object) &&
-            FlagCache.Restore(FPostHogProperties::FromNative(Object->ToSharedRef())) &&
-            State->TryGetObjectField(TEXT("cached_session_recording"), Object))
-        { FlagCache.RestoreSessionRecording(*Object); CacheFlagGeneration = FlagGeneration; }
+            FlagCache.Restore(FPostHogProperties::FromNative(Object->ToSharedRef())))
+        {
+            CacheFlagGeneration = FlagGeneration;
+            if (State->TryGetObjectField(TEXT("cached_session_recording"), Object)) { FlagCache.RestoreSessionRecording(*Object); }
+        }
     }
 
     FPostHogProperties FlagContextLocked() const
