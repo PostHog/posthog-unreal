@@ -1,6 +1,6 @@
 # PostHog Unreal Engine integration plan
 
-Status: implementation in progress. The C ABI, Rust durable-delivery extension, stateful C++ client, typed properties, cached feature flags, game-instance subsystem, Project Settings, lifecycle capture, and UE 5.8 macOS arm64 runtime tests are implemented locally. The full Blueprint surface, flag-change notifications, Analytics provider, and packaged consumers remain. See [implementation status](implementation-status.md) for validation and upstream dependencies.
+Status: implementation in progress. The C ABI, Rust durable-delivery extension, stateful C++ client, typed properties, cached feature flags, game-instance subsystem, Project Settings, lifecycle capture, and UE 5.8 macOS arm64 runtime tests are implemented locally. Core Blueprint nodes and the explicitly bound Analytics adapter/provider are implemented. Real Blueprint graphs, multi-PIE lifecycle, and Blueprint-only Development/Shipping consumers pass on UE 5.8 macOS arm64. The remaining Blueprint surface, automatic flag-change notifications, and cross-platform/prebuilt-plugin consumer validation remain. See [implementation status](implementation-status.md) for validation and upstream dependencies.
 
 ## Recommendation
 
@@ -96,15 +96,14 @@ Recommended primary mode: **game-instance-owned clients**.
 - Level travel does not recreate the client or rotate identity. PIE instances have isolated state and storage namespaces.
 - A game instance represents one ambient analytics identity, not every player connected to a server. Dedicated-server auto-initialization is disabled by default. Multi-user server capture and split-screen identities need explicit per-user clients or an agreed explicit-identity API, not repeated `SetUserID` calls on a shared singleton.
 
-Compatibility mode: **engine-configured provider** for existing Analytics integrations and Epic's Blueprint library.
+Compatibility path: **explicitly bound, engine-configured provider** for existing Analytics integrations and Epic's Blueprint library.
 
-- A `PostHogAnalytics` module implements `IAnalyticsProviderModule` and retains a provider/client for repeated factory calls. Returning a new client per Blueprint call would lose identity and session state.
-- This mode is process-scoped. It cannot isolate multiple game instances through Epic's world-less nodes.
-- Do not auto-create a second subsystem client when this mode is selected. In a single-game-instance application, PostHog nodes can attach to the configured client; the module remains its owner. Reject ambiguous multi-instance use rather than select a world arbitrarily.
-- Honor the configuration delegate and reject conflicting configuration for an already-created default client; do not silently reuse a client configured for another project.
-- Make the two ownership modes explicit in settings and documentation. Both use the same client implementation.
-
-Provider selection uses `[Analytics] ProviderModuleName=PostHogAnalytics`. Credential/settings lookup must honor Unreal's build-specific sections (`AnalyticsDevelopment`, `AnalyticsDebug`, `AnalyticsTest`, and `Analytics`) and custom delegates. Define precedence as explicit runtime/delegate configuration over Project Settings defaults; never route development data to production through an implicit credential fallback.
+- A `PostHogAnalytics` module implements `IAnalyticsProviderModule` and resolves the adapter explicitly designated by `UPostHogSubsystem::BindAnalyticsProvider`. Repeated factory calls return the same adapter; the game instance remains the client/lifecycle owner.
+- The designation is process-wide because Epic's nodes do not receive a world. It does not provide per-caller multi-PIE isolation. A second live owner cannot replace the binding; unbind explicitly before selecting another owner.
+- World-aware callers resolve World -> GameInstance -> PostHogSubsystem -> adapter. Never select an arbitrary world or create a second client for the configured provider.
+- Bind only after setup succeeds, on the game thread. Shutdown/destruction clears the weak binding. Retained adapters stay attached to their original client and close with it; they never retarget replacement owners.
+- Provider selection uses `[Analytics] ProviderModuleName=PostHogAnalytics`. Initialize credentials and options through subsystem setup. The provider factory rejects non-empty `ProjectToken`, `Host`, and `ClientName` values from INI/configuration delegates: it cannot reconfigure an already-owned client.
+- Bind before creating an AnalyticsMulticast provider, which retains its child adapters. Binding itself never changes the engine's configured provider.
 
 ## 4. Public surfaces
 
@@ -146,7 +145,7 @@ Names below are proposed, not a frozen API.
 | Default event attribute setters/getters | Replace/read an adapter-default layer; do not erase separately registered PostHog properties |
 | Purchase, currency, progress, error, demographic helpers | Initially retain Unreal's documented generic event mappings through `RecordEvent`; no inferred revenue schema or crash report |
 
-Define and test explicit versus automatic session mode before freezing the adapter. In explicit mode, events before `StartSession` or after `EndSession` are still valid and must not silently create a session. In automatic mode, use PostHog's normal session rotation. Agree start/end event names and duplicate handling with lifecycle events; these are observable contracts, not adapter implementation details.
+The adapter shares the client's configured session mode. In explicit mode, events before `StartSession` or after `EndSession` remain sessionless. Automatic mode retains PostHog's normal session rotation. Explicit adapter calls emit ordinary `SessionStart`/`SessionEnd` events, distinct from application lifecycle events; repeated starts in an active session and repeated ends without a session are suppressed. Session transitions and event snapshots use the native state lock; hooks run after unlocking.
 
 For attribute collisions, use adapter defaults below registered properties and explicit event attributes, subject to the client spec's protected identity/person-processing keys. Parse only values marked as JSON fragments. A string such as `"00123"` stays a string. Invalid fragments are logged and omitted without rejecting unrelated event properties.
 
@@ -236,7 +235,7 @@ Examples/PostHogExample/  # C++ and Blueprint usage in a packaged-test project
 scripts/                  # Reproducible native builds and plugin packaging
 ```
 
-Keep the native analytics adapter in the runtime module so the subsystem can expose it directly. The configured-provider module depends on the runtime module, not the reverse; subsystem attachment uses Unreal's Analytics interface and the shared adapter. This avoids a module-dependency cycle.
+Keep the native analytics adapter in the runtime module so the subsystem can expose it directly. The configured-provider module depends on the runtime module, not the reverse; the runtime module owns the shared adapter and explicit binding. This avoids a module-dependency cycle.
 
 Start with Rust static libraries, linked once through the runtime module and Unreal's external-module mechanism. Validate Windows CRT compatibility, macOS architecture/deployment targets, Linux toolchain/sysroot requirements, symbol collisions, and Shipping link settings. Reconsider dynamic libraries only with evidence; they add runtime staging and loading requirements.
 
@@ -270,7 +269,7 @@ Implement identity, registered properties, groups, person processing, sessions, 
 
 ### Phase 3 — Unreal Analytics and Blueprints
 
-Add typed reflected APIs, async action nodes, the adapter, explicit-session behavior, configured-provider mode, Project Settings, and C++/Blueprint examples. Test both ownership modes and mixed calls on the same client.
+Add typed reflected APIs, async action nodes, the adapter, explicit-session behavior, configured-provider mode, Project Settings, and C++/Blueprint examples. Test both lookup paths and mixed calls on the same client.
 
 **Exit:** Epic's Analytics nodes work with the configured provider; PostHog nodes work with isolated game instances; both produce equivalent analytics without duplicate identity, sessions, or lifecycle capture.
 
@@ -306,11 +305,11 @@ Flush completion means the defined delivery attempt has completed, not that Post
 ## 10. Implementation decisions and release gates
 
 1. **Rust commitment:** the existing delivery worker now has opt-in durable storage and consent/close control. The Unreal client submits prepared events without a second delivery queue. Upstream changes still need to land and receive an immutable dependency pin.
-2. **Ownership:** game-instance mode as primary, with an explicit process-scoped compatibility mode for stock Analytics nodes. Do not promise multi-PIE isolation for the latter.
+2. **Ownership:** game-instance-owned clients for both APIs, with an explicit process-wide adapter binding for stock Analytics nodes. Do not promise per-caller multi-PIE isolation for the latter.
 3. **Public contracts:** initial engine/platform support, automatic versus explicit sessions and their event names, defaults, reset/consent semantics, and the typed Blueprint properties/result surface.
 4. **Release scope:** analytics plus remote flags for beta; crash capture and replay follow separately.
 
-The next ready work is the full Blueprint surface and flag-change notifications, followed by Analytics-provider integration and consumer validation. Existing Mac arm64 tests do not clear the cross-platform or packaged-consumer gates.
+The next ready work is the remaining Blueprint surface and automatic flag-change notifications, maintained consumer examples, and manual Blueprint/Project Settings UI validation. Real Blueprint, multi-PIE lifecycle, and Development/Shipping packaged-consumer checks pass on UE 5.8 Mac arm64; they do not clear cross-platform or prebuilt-plugin installation gates.
 
 ## Sources and inspected baselines
 

@@ -5,7 +5,7 @@ public class PostHog : ModuleRules
     public PostHog(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Json", "Engine", "DeveloperSettings" });
+        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Json", "Engine", "DeveloperSettings", "Analytics" });
         PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore", "PostHogRust" });
     }
 }

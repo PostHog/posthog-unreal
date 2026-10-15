@@ -15,6 +15,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FPostHogFeatureFlagsReloaded, const 
 
 struct FPostHogInitialization;
 struct FPostHogLifecycleSignals;
+class FPostHogAnalyticsProvider;
+class IAnalyticsProvider;
 
 /** One client per game instance. All UObject entry points run on the game thread. */
 UCLASS()
@@ -58,6 +60,17 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "PostHog|Feature Flags")
     FPostHogFeatureFlagsReloaded OnFeatureFlagsReloaded;
 
+    /** Same adapter for this initialized client; null while not ready. Game thread only. */
+    TSharedPtr<IAnalyticsProvider> GetAnalyticsProvider();
+
+    /** Designates this initialized instance for Unreal's world-less Analytics API.
+     * Returns false if another live instance is bound. Does not change engine INI configuration. */
+    UFUNCTION(BlueprintCallable, Category = "PostHog|Analytics")
+    bool BindAnalyticsProvider();
+    /** Releases only this instance's designation; existing adapter pointers remain instance-bound. */
+    UFUNCTION(BlueprintCallable, Category = "PostHog|Analytics")
+    void UnbindAnalyticsProvider();
+
     /** Native callers may retain the shared pointer, but teardown still closes it. */
     FPostHogClient::FPtr GetClient() const;
     UPROPERTY(BlueprintAssignable, Category = "PostHog")
@@ -75,6 +88,7 @@ private:
     EPostHogSubsystemState State = EPostHogSubsystemState::Idle;
     bool bForeground = true;
     FPostHogClient::FPtr Client;
+    TSharedPtr<FPostHogAnalyticsProvider> AnalyticsProvider;
     TSharedPtr<FPostHogInitialization, ESPMode::ThreadSafe> Initialization;
     TSharedPtr<FPostHogLifecycleSignals, ESPMode::ThreadSafe> Signals;
     TSharedFuture<bool> Closing;

@@ -1,6 +1,6 @@
 # PostHog Unreal SDK
 
-PostHog SDK for Unreal Engine, currently in development. Native delivery, the stateful C++ client, cached feature flags, game-instance ownership, Project Settings, and application lifecycle capture are implemented. The full Blueprint function/async surface and Unreal Analytics adapter are still being built. **Not ready for production use.**
+PostHog SDK for Unreal Engine, currently in development. Native delivery, the stateful C++ client, cached feature flags, game-instance ownership, Project Settings, and application lifecycle capture are implemented. Core Blueprint nodes and Unreal Analytics integration are implemented; the remaining Blueprint function/async surface is still being built. **Not ready for production use.**
 
 See [the integration plan](docs/integration-plan.md) and [implementation status](docs/implementation-status.md).
 
@@ -18,6 +18,17 @@ export UE_ROOT="/path/to/UE_5.8"
 ```
 
 The native build writes ignored artifacts and a checksum/version manifest under `Source/ThirdParty/PostHogRust/lib/`. The example build links this checkout into its ignored `Plugins` directory.
+
+## macOS packaged games
+
+Sandboxed macOS apps need the `com.apple.security.network.client` entitlement for PostHog delivery. UE 5.8's default Shipping entitlements omit network access even though Development permits it. With Unreal's default entitlements, select the client template in the project's `Config/DefaultEngine.ini`:
+
+```ini
+[/Script/MacTargetPlatform.XcodeProjectSettings]
+ShippingSpecificMacEntitlements=(FilePath="/Game/Build/Mac/Resources/Sandbox.Client.entitlements")
+```
+
+If your project uses custom entitlements, add outgoing-network access to that file instead of replacing its other permissions.
 
 ## Playable runner example
 
@@ -49,6 +60,52 @@ Get **PostHog Subsystem** with **Get Game Instance Subsystem**, then wait for su
 Create a **PostHog Properties** variable and fill it with **Set Property**, using **Make String/Boolean/Number/Object/Array/Null Value** nodes. Alternatively, **Parse Properties** validates a JSON object and reports success. **Properties to Json** and **Value to Json** expose snapshots and payloads without losing their JSON types.
 
 Before setup finishes or after shutdown, Capture returns `Closed`, Identify and Reload Feature Flags return false, and Get Feature Flag returns a missing result. A true reload return value means a completion was scheduled, not that the request succeeded; for example, opted-out clients complete with `Disabled`.
+
+## Unreal Analytics integration
+
+The `PostHogAnalytics` provider module implements Unreal's standard `IAnalyticsProvider` interface over the **existing game-instance client**. It does not create a second client, identity, delivery queue, or lifecycle owner.
+
+### World-aware C++ callers
+
+Add `PostHog` to your module dependencies and include `PostHogAnalyticsProvider.h`. After subsystem setup succeeds:
+
+```cpp
+auto Analytics = FPostHogAnalyticsProvider::GetForWorld(WorldContextObject);
+if (Analytics)
+{
+    Analytics->RecordEvent(TEXT("level_started"),
+        MakeAnalyticsEventAttributeArray(TEXT("level"), TEXT("tutorial"), TEXT("score"), 42));
+}
+```
+
+You can also call `Subsystem->GetAnalyticsProvider()` directly. Lookup is game-thread-only and returns null until ready. Each game instance has its own stable adapter; world changes within that instance retain it. Adapter event methods operate on native data and are thread-safe.
+
+### Unreal's built-in Analytics Blueprint nodes
+
+Enable Unreal's **Analytics Blueprint Library** plugin and select the provider in the game's `DefaultEngine.ini`:
+
+```ini
+[Analytics]
+ProviderModuleName=PostHogAnalytics
+```
+
+Initialize PostHog through Project Settings or explicit `Setup` as usual. After successful setup, call **Bind Analytics Provider** on the intended **PostHog Subsystem**. Unreal's stock Analytics nodes and `FAnalytics::Get().GetDefaultConfiguredProvider()` then use that same client.
+
+Binding is explicit and process-wide because the stock nodes do not receive a world. A second live instance cannot replace the binding; binding the same instance again succeeds. **Unbind Analytics Provider** releases only the caller's binding, and shutdown/destruction unbinds automatically. Before binding, or after unbinding, the factory returns null. In multi-instance PIE, stock nodes target the designated instance regardless of the caller's world; use instance-specific PostHog nodes/adapters for isolation.
+
+Configure credentials and client options on the subsystem, not in Analytics INI sections or configuration delegates. The factory rejects supplied `ProjectToken`, `Host`, or `ClientName` values instead of silently applying them to an already-bound client. Binding does not change the engine's configured provider.
+
+For **AnalyticsMulticast**, configure `PostHogAnalytics` in `ProviderModuleNames` and bind before the multicast provider is first created. Retained adapters, including those held by multicast, stay attached to their original client. Rebinding affects new factory lookups only; old adapters close with their owner and never attach to a replacement client.
+
+### Behavior mapping
+
+- `RecordEvent` captures through the native client; `Immediate` requests an asynchronous flush. `FlushEvents` never waits for delivery.
+- Native numeric/boolean/JSON-fragment attributes retain their JSON types. Ordinary strings stay strings, including `"00123"`. Invalid JSON fragments are logged without their contents and omitted.
+- Adapter defaults apply below registered properties, SDK context, and explicit event attributes. Replacing defaults leaves registered properties intact. Defaults apply only to events recorded through that adapter.
+- `SetUserID` uses `Identify`: empty IDs and switching between identified accounts are rejected. Use PostHog's native reset before switching accounts.
+- `StartSession` emits `SessionStart` with its attributes once per active session; `EndSession` emits `SessionEnd` when a session exists, clears it, and requests a flush. These are ordinary events, distinct from application lifecycle events. Session IDs and the configured session mode are shared with the native client: Explicit mode allows sessionless events before start/after end; Automatic mode creates a session on subsequent foreground activity. `SetSessionID` accepts UUIDv7 IDs.
+- Unreal's purchase, currency, progression, error, and demographic helpers retain their standard event mappings. `RecordError` is an ordinary event, not crash reporting.
+- Consent and shutdown apply equally to all entry points. Releasing an adapter does not shut down its game instance.
 
 ## Stateful C++ client
 

@@ -12,6 +12,7 @@
   "Installed": false,
   "SupportedTargetPlatforms": ["Mac"],
   "Modules": [
-    {"Name": "PostHog", "Type": "Runtime", "LoadingPhase": "Default", "PlatformAllowList": ["Mac"]}
+    {"Name": "PostHog", "Type": "Runtime", "LoadingPhase": "Default", "PlatformAllowList": ["Mac"]},
+    {"Name": "PostHogAnalytics", "Type": "Runtime", "LoadingPhase": "None", "PlatformAllowList": ["Mac"]}
   ]
 }
