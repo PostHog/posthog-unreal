@@ -129,10 +129,37 @@ bool UPostHogSubsystem::IsInitialized() const
 FPostHogClient::FPtr UPostHogSubsystem::GetClient() const
 { return IsInitialized() ? Client : nullptr; }
 
+EPostHogCaptureResult UPostHogSubsystem::Capture(const FString& Event, const FPostHogProperties& Properties)
+{
+    auto Current = GetClient();
+    return Current ? Current->Capture(Event, Properties) : EPostHogCaptureResult::Closed;
+}
+
+bool UPostHogSubsystem::Identify(const FString& DistinctId, const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
+{
+    auto Current = GetClient();
+    return Current && Current->Identify(DistinctId, Set, SetOnce);
+}
+
+FPostHogFeatureFlagResult UPostHogSubsystem::GetFeatureFlag(const FString& Key, bool bSendEvent)
+{
+    auto Current = GetClient();
+    return Current ? Current->GetFeatureFlagResult(Key, bSendEvent) : FPostHogFeatureFlagResult();
+}
+
+bool UPostHogSubsystem::ReloadFeatureFlags()
+{
+    auto Current = GetClient();
+    if (!Current) { return false; }
+    if (!FlagReload.IsValid()) { FlagReload = Current->ReloadFeatureFlagsAsync(); }
+    return true;
+}
+
 void UPostHogSubsystem::Shutdown()
 {
     if (!IsInGameThread() || State == EPostHogSubsystemState::ShuttingDown || State == EPostHogSubsystemState::Deinitialized) { return; }
     StopObserving();
+    FlagReload = {};
     if (Initialization)
     {
         auto Request = Initialization; Request->Cancel(); Initialization.Reset(); Client.Reset();
@@ -182,6 +209,12 @@ bool UPostHogSubsystem::Tick(float DeltaTime)
             if (State == EPostHogSubsystemState::Ready && Client == Current) { OnSetupCompleted.Broadcast(true); }
         }
         else { Initialization->Cancel(); Initialization.Reset(); StopObserving(); OnSetupCompleted.Broadcast(false); }
+    }
+    if (State == EPostHogSubsystemState::Ready && FlagReload.IsValid() && FlagReload.IsReady())
+    {
+        auto Result = FlagReload.Get(); FlagReload = {};
+        Result = Client->ValidateFlagReloadResult(MoveTemp(Result));
+        OnFeatureFlagsReloaded.Broadcast(Result);
     }
     if (State == EPostHogSubsystemState::ShuttingDown && Closing.IsReady())
     {
