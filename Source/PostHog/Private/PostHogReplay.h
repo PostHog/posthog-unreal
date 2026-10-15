@@ -13,6 +13,13 @@ class ISlateViewportProvider;
 class IImageWrapperModule;
 class SWindow;
 
+namespace PostHogReplay
+{
+    /** The rrweb $snapshot event for one screenshot frame, encoded as JSON. Width/Height are the captured screen size. */
+    FString BuildSnapshotEnvelope(const FString& DistinctId, const FString& SessionId, int32 Width, int32 Height,
+        const TArray64<uint8>& Jpeg, const FDateTime& CapturedAt);
+}
+
 /** Screenshot session replay: captures the main game window's back buffer on the render
  * thread without stalling, then converts, scales, and JPEG-encodes frames on one worker.
  * Start, SetPaused, and Stop run on the game thread. */
@@ -65,6 +72,8 @@ private:
     std::atomic<bool> bPaused{false};
     std::atomic<bool> bGateOpen{false};
     std::atomic<bool> bWarnedFormat{false};
+    std::atomic<bool> bWarnedEncode{false};
+    std::atomic<bool> bWarnedResult{false};
     /** Identity only, never dereferenced off the game thread. */
     std::atomic<const SWindow*> TargetWindow{nullptr};
 
@@ -78,7 +87,7 @@ private:
     TArray<FFrame> Queue;
     TArray<TArray64<uint8>> FreeBuffers;
 
-    std::atomic<int64> Captured{0}, DroppedNoSlot{0}, DroppedBacklog{0}, DroppedGated{0};
+    std::atomic<int64> Captured{0}, DroppedNoSlot{0}, DroppedBacklog{0}, DroppedGated{0}, EncodeFailed{0};
     std::atomic<int64> RenderSamples{0}, RenderNanoseconds{0};
     // Worker only; read by Stop after the join.
     double WorkerSeconds = 0.0;

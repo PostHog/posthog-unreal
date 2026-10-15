@@ -159,8 +159,13 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
         const FString Session = Client->GetSessionId();
         *Now += FTimespan::FromMinutes(30);
         Check(Client->GetSessionId() == Session, TEXT("exact inactivity boundary"));
+        Check(Client->PeekSessionId() == Session, TEXT("peek returns the active session"));
         *Now += FTimespan::FromMilliseconds(1);
-        Check(Client->GetSessionId() != Session, TEXT("past inactivity boundary"));
+        Check(Client->PeekSessionId().IsEmpty(), TEXT("peek hides an expired session"));
+        Check(Client->PeekSessionId().IsEmpty(), TEXT("peek does not start a session"));
+        const FString RotatedSession = Client->GetSessionId();
+        Check(!RotatedSession.IsEmpty() && RotatedSession != Session, TEXT("past inactivity boundary"));
+        Check(Client->PeekSessionId() == RotatedSession, TEXT("peek returns the rotated session"));
         Client->OnBackground(); *Now += FTimespan::FromMinutes(31);
         Check(Client->GetSessionId().IsEmpty(), TEXT("background expired session is empty"));
         Client->OnForeground(); Check(!Client->GetSessionId().IsEmpty(), TEXT("foreground starts session"));

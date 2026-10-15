@@ -1,4 +1,5 @@
 #include "PostHogReplay.h"
+#include "PostHogJson.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Framework/Application/SlateApplication.h"
@@ -13,6 +14,7 @@
 #include "ImageUtils.h"
 #include "Math/Float16Color.h"
 #include "Misc/App.h"
+#include "Misc/Base64.h"
 #include "Misc/ScopeLock.h"
 #include "Modules/ModuleManager.h"
 #include "RHIGPUReadback.h"
@@ -81,6 +83,46 @@ bool ToBgra8(EPixelFormat Format, const uint8* Source, int64 Count, FColor* Out)
     for (int64 Index = 0; Index < Count; ++Index) { Out[Index].A = 255; }
     return true;
 }
+}
+
+FString PostHogReplay::BuildSnapshotEnvelope(const FString& DistinctId, const FString& SessionId, int32 Width, int32 Height,
+    const TArray64<uint8>& Jpeg, const FDateTime& CapturedAt)
+{
+    const double Timestamp = static_cast<double>(PostHogJson::UnixMilliseconds(CapturedAt));
+    auto Meta = MakeShared<FJsonObject>();
+    Meta->SetNumberField(TEXT("width"), Width); Meta->SetNumberField(TEXT("height"), Height);
+    Meta->SetStringField(TEXT("href"), FApp::GetProjectName());
+    auto MetaEvent = MakeShared<FJsonObject>();
+    MetaEvent->SetNumberField(TEXT("type"), 4); MetaEvent->SetNumberField(TEXT("timestamp"), Timestamp); MetaEvent->SetObjectField(TEXT("data"), Meta);
+    auto Offset = MakeShared<FJsonObject>();
+    Offset->SetNumberField(TEXT("top"), 0); Offset->SetNumberField(TEXT("left"), 0);
+    auto Wireframe = MakeShared<FJsonObject>();
+    Wireframe->SetNumberField(TEXT("id"), 1); Wireframe->SetNumberField(TEXT("x"), 0); Wireframe->SetNumberField(TEXT("y"), 0);
+    Wireframe->SetNumberField(TEXT("width"), Width); Wireframe->SetNumberField(TEXT("height"), Height);
+    Wireframe->SetStringField(TEXT("type"), TEXT("screenshot"));
+    Wireframe->SetStringField(TEXT("base64"), TEXT("data:image/jpeg;base64,") + FBase64::Encode(Jpeg.GetData(), static_cast<uint32>(Jpeg.Num())));
+    auto Full = MakeShared<FJsonObject>();
+    Full->SetObjectField(TEXT("initialOffset"), Offset);
+    TArray<TSharedPtr<FJsonValue>> Wireframes; Wireframes.Add(MakeShared<FJsonValueObject>(Wireframe));
+    Full->SetArrayField(TEXT("wireframes"), Wireframes);
+    auto FullEvent = MakeShared<FJsonObject>();
+    FullEvent->SetNumberField(TEXT("type"), 2); FullEvent->SetNumberField(TEXT("timestamp"), Timestamp); FullEvent->SetObjectField(TEXT("data"), Full);
+    auto Properties = MakeShared<FJsonObject>();
+    Properties->SetStringField(TEXT("$snapshot_source"), TEXT("mobile"));
+    Properties->SetStringField(TEXT("$session_id"), SessionId);
+    Properties->SetStringField(TEXT("$window_id"), SessionId);
+    Properties->SetStringField(TEXT("$lib"), PostHogJson::LibName);
+    Properties->SetStringField(TEXT("$lib_version"), PostHogJson::LibVersion);
+    TArray<TSharedPtr<FJsonValue>> SnapshotData;
+    SnapshotData.Add(MakeShared<FJsonValueObject>(MetaEvent)); SnapshotData.Add(MakeShared<FJsonValueObject>(FullEvent));
+    Properties->SetArrayField(TEXT("$snapshot_data"), SnapshotData);
+    auto Envelope = MakeShared<FJsonObject>();
+    Envelope->SetStringField(TEXT("event"), TEXT("$snapshot"));
+    Envelope->SetStringField(TEXT("distinct_id"), DistinctId);
+    Envelope->SetStringField(TEXT("uuid"), PostHogJson::NewUuidV7(CapturedAt));
+    Envelope->SetStringField(TEXT("timestamp"), CapturedAt.ToIso8601());
+    Envelope->SetObjectField(TEXT("properties"), Properties);
+    return PostHogJson::Encode(Envelope);
 }
 
 FPostHogReplayRecorder::FPostHogReplayRecorder(FPostHogClient::FPtr InClient, const FPostHogReplaySettings& Settings)
@@ -179,8 +221,8 @@ void FPostHogReplayRecorder::Stop()
         Recorders.RemoveAll([this](const auto& Weak) { const auto Pinned = Weak.Pin(); return !Pinned || Pinned.Get() == this; });
     }
     UE_LOG(LogPostHogReplay, Log,
-        TEXT("Session replay stopped: captured %lld, dropped (no slot) %lld, dropped (backlog) %lld, dropped (gated) %lld, discarded at stop %lld; results accepted %lld, disabled %lld, invalid %lld, queue full %lld, closed %lld."),
-        Captured.load(), DroppedNoSlot.load(), DroppedBacklog.load(), DroppedGated.load(), Discarded,
+        TEXT("Session replay stopped: captured %lld, dropped (no slot) %lld, dropped (backlog) %lld, dropped (gated) %lld, encode failed %lld, discarded at stop %lld; results accepted %lld, disabled %lld, invalid %lld, queue full %lld, closed %lld."),
+        Captured.load(), DroppedNoSlot.load(), DroppedBacklog.load(), DroppedGated.load(), EncodeFailed.load(), Discarded,
         Results[static_cast<uint8>(EPostHogCaptureResult::Accepted)], Results[static_cast<uint8>(EPostHogCaptureResult::Disabled)],
         Results[static_cast<uint8>(EPostHogCaptureResult::Invalid)], Results[static_cast<uint8>(EPostHogCaptureResult::QueueFull)],
         Results[static_cast<uint8>(EPostHogCaptureResult::Closed)]);
@@ -316,22 +358,33 @@ void FPostHogReplayRecorder::RecycleLocked(TArray64<uint8>&& Pixels)
 
 void FPostHogReplayRecorder::RefreshGate()
 {
-    bGateOpen.store(Client->IsSessionReplayAllowed() && !Client->GetSessionId().IsEmpty(), std::memory_order_release);
+    bGateOpen.store(Client->IsSessionReplayAllowed() && !Client->PeekSessionId().IsEmpty(), std::memory_order_release);
 }
 
 void FPostHogReplayRecorder::Submit(const FFrame& Frame)
 {
-    const FString SessionId = Client->GetSessionId();
+    const FString SessionId = Client->PeekSessionId();
     if (SessionId.IsEmpty() || !Client->IsSessionReplayAllowed()) { DroppedGated.fetch_add(1); return; }
     const double Start = FPlatformTime::Seconds();
     TArray64<uint8> Jpeg;
     int32 ScaledWidth = 0, ScaledHeight = 0;
-    if (!Encode(Frame, Jpeg, ScaledWidth, ScaledHeight)) { return; }
+    if (!Encode(Frame, Jpeg, ScaledWidth, ScaledHeight))
+    {
+        EncodeFailed.fetch_add(1);
+        if (!bWarnedEncode.exchange(true))
+        { UE_LOG(LogPostHogReplay, Warning, TEXT("Session replay could not encode a %dx%d %s frame; dropping it."), Frame.Width, Frame.Height, GetPixelFormatString(Frame.Format)); }
+        return;
+    }
     WorkerSeconds += FPlatformTime::Seconds() - Start; ++WorkerSamples;
     LastJpegBytes = Jpeg.Num();
     const EPostHogCaptureResult Result = Client->SubmitReplaySnapshot(SessionId, Frame.Width, Frame.Height, Jpeg, Frame.CapturedAt);
     const int64 Count = ++Results[static_cast<uint8>(Result)];
-    if (Result != EPostHogCaptureResult::Accepted) { return; }
+    if (Result != EPostHogCaptureResult::Accepted)
+    {
+        if (!bWarnedResult.exchange(true))
+        { UE_LOG(LogPostHogReplay, Warning, TEXT("Session replay frame was not accepted: %s."), *UEnum::GetValueAsString(Result)); }
+        return;
+    }
     if (Count % LogEvery == 0)
     {
         const int64 Samples = RenderSamples.load();

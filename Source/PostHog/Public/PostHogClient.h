@@ -111,6 +111,8 @@ public:
     void ResetGroupPropertiesForFlags(const FString& Type = FString(), bool bReload = true);
 
     FString GetSessionId();
+    /** Current session id if one is active and unexpired; never starts or rotates a session. */
+    FString PeekSessionId() const;
     bool StartSession();
     void EndSession();
     bool SetSessionId(const FString& SessionId);

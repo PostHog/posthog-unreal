@@ -4,8 +4,6 @@
 #include "PostHogReplay.h"
 #include "PostHogTasks.h"
 #include "HAL/PlatformFileManager.h"
-#include "Misc/App.h"
-#include "Misc/Base64.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
@@ -243,14 +241,16 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
     {
         SessionId = PostHogJson::NewUuidV7(Now); SessionStarted = Now; LastActivity = Now;
     }
+    bool SessionExpiredLocked(const FDateTime& Now) const
+    {
+        return Config.SessionMode == EPostHogSessionMode::Automatic && !SessionId.IsEmpty() &&
+            (Now - LastActivity > FTimespan::FromMinutes(30) || Now - SessionStarted > FTimespan::FromHours(24));
+    }
     FString SessionLocked(const FDateTime& Now, bool bActivity)
     {
         if (Config.SessionMode == EPostHogSessionMode::Automatic)
         {
-            if (!SessionId.IsEmpty() && (Now - LastActivity > FTimespan::FromMinutes(30) || Now - SessionStarted > FTimespan::FromHours(24)))
-            {
-                SessionId.Empty();
-            }
+            if (SessionExpiredLocked(Now)) { SessionId.Empty(); }
             if (SessionId.IsEmpty() && bForeground) { StartSessionLocked(Now); }
         }
         if (bActivity && !SessionId.IsEmpty()) { LastActivity = Now; }
@@ -796,6 +796,12 @@ FString FPostHogClient::GetSessionId()
     FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return FString(); }
     return Impl->SessionLocked(Impl->Config.Now(), false);
 }
+FString FPostHogClient::PeekSessionId() const
+{
+    FScopeLock Lock(&Impl->Mutex);
+    if (Impl->bClosed || Impl->SessionExpiredLocked(Impl->Config.Now())) { return FString(); }
+    return Impl->SessionId;
+}
 bool FPostHogClient::StartSession()
 {
     FScopeLock Lock(&Impl->Mutex); if (!Impl->CanCaptureLocked()) { return false; }
@@ -882,42 +888,8 @@ EPostHogCaptureResult FPostHogClient::SubmitReplaySnapshot(const FString& Sessio
         if (!Impl->CanCaptureLocked() || !Impl->Config.Replay.bEnabled) { return EPostHogCaptureResult::Disabled; }
         DistinctId = Impl->DistinctId; AdmissionGeneration = Impl->ConsentGeneration;
     }
-    const double Timestamp = static_cast<double>(PostHogJson::UnixMilliseconds(CapturedAt));
-    auto Meta = MakeShared<FJsonObject>();
-    Meta->SetNumberField(TEXT("width"), Width); Meta->SetNumberField(TEXT("height"), Height);
-    Meta->SetStringField(TEXT("href"), FApp::GetProjectName());
-    auto MetaEvent = MakeShared<FJsonObject>();
-    MetaEvent->SetNumberField(TEXT("type"), 4); MetaEvent->SetNumberField(TEXT("timestamp"), Timestamp); MetaEvent->SetObjectField(TEXT("data"), Meta);
-    auto Offset = MakeShared<FJsonObject>();
-    Offset->SetNumberField(TEXT("top"), 0); Offset->SetNumberField(TEXT("left"), 0);
-    auto Wireframe = MakeShared<FJsonObject>();
-    Wireframe->SetNumberField(TEXT("id"), 1); Wireframe->SetNumberField(TEXT("x"), 0); Wireframe->SetNumberField(TEXT("y"), 0);
-    Wireframe->SetNumberField(TEXT("width"), Width); Wireframe->SetNumberField(TEXT("height"), Height);
-    Wireframe->SetStringField(TEXT("type"), TEXT("screenshot"));
-    Wireframe->SetStringField(TEXT("base64"), TEXT("data:image/jpeg;base64,") + FBase64::Encode(Jpeg.GetData(), static_cast<uint32>(Jpeg.Num())));
-    auto Full = MakeShared<FJsonObject>();
-    Full->SetObjectField(TEXT("initialOffset"), Offset);
-    TArray<TSharedPtr<FJsonValue>> Wireframes; Wireframes.Add(MakeShared<FJsonValueObject>(Wireframe));
-    Full->SetArrayField(TEXT("wireframes"), Wireframes);
-    auto FullEvent = MakeShared<FJsonObject>();
-    FullEvent->SetNumberField(TEXT("type"), 2); FullEvent->SetNumberField(TEXT("timestamp"), Timestamp); FullEvent->SetObjectField(TEXT("data"), Full);
-    auto Properties = MakeShared<FJsonObject>();
-    Properties->SetStringField(TEXT("$snapshot_source"), TEXT("mobile"));
-    Properties->SetStringField(TEXT("$session_id"), SessionId);
-    Properties->SetStringField(TEXT("$window_id"), SessionId);
-    Properties->SetStringField(TEXT("$lib"), PostHogJson::LibName);
-    Properties->SetStringField(TEXT("$lib_version"), PostHogJson::LibVersion);
-    TArray<TSharedPtr<FJsonValue>> SnapshotData;
-    SnapshotData.Add(MakeShared<FJsonValueObject>(MetaEvent)); SnapshotData.Add(MakeShared<FJsonValueObject>(FullEvent));
-    Properties->SetArrayField(TEXT("$snapshot_data"), SnapshotData);
-    auto Envelope = MakeShared<FJsonObject>();
-    Envelope->SetStringField(TEXT("event"), TEXT("$snapshot"));
-    Envelope->SetStringField(TEXT("distinct_id"), DistinctId);
-    Envelope->SetStringField(TEXT("uuid"), PostHogJson::NewUuidV7(CapturedAt));
-    Envelope->SetStringField(TEXT("timestamp"), CapturedAt.ToIso8601());
-    Envelope->SetObjectField(TEXT("properties"), Properties);
     // Frames exceed the analytics JSON bound, so this path is limited only by the native replay input size.
-    const FTCHARToUTF8 Utf8(*PostHogJson::Encode(Envelope));
+    const FTCHARToUTF8 Utf8(*PostHogReplay::BuildSnapshotEnvelope(DistinctId, SessionId, Width, Height, Jpeg, CapturedAt));
     if (static_cast<uint64>(Utf8.Length()) > PHU_MAX_REPLAY_INPUT) { return EPostHogCaptureResult::Invalid; }
     phu_handle NativeHandle = 0;
     {
