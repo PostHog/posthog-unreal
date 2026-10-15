@@ -23,6 +23,20 @@ The integration is in development. Native delivery, the stateful C++ client, cac
 - Tracked native tasks, creation/teardown admission locking, and module shutdown that closes clients and joins work. Dynamic module reloading is disabled.
 - C ABI/mock-server integration tests and Unreal automation covering native delivery, property values, and the stateful client.
 
+## Implemented (proof of concept)
+
+- Screenshot session replay behind `Replay.bEnabled`. The subsystem owns a recorder that hooks Slate's back-buffer-ready delegate on the render thread. It throttles to the configured interval and copies the main game window into a ring of three non-blocking GPU readbacks. A frame is dropped when no readback is free. One worker thread converts 8-bit, 10-bit, and FP16 back buffers to BGRA8, scales them, and encodes JPEGs. Each frame becomes one `$snapshot` event (a meta event and a full snapshot with one screenshot wireframe) submitted through `phu_capture_replay`. Rust batches the frames per session and sends them to `/s/`.
+- Recording requires the local setting, consent, an active session, and a `session_recording` object in the last flags response. That remote value is cached and persisted with the flag cache. The recorder pauses in the background. Opt-out stops admission and drops queued frames. Subsystem shutdown and module teardown stop the recorder, flush rendering, and join its worker before clients close.
+
+Proof-of-concept limitations:
+
+- No masking. Every frame contains everything on screen.
+- Only the `session_recording` on/off state is honoured. Endpoint override, `linkedFlag`, `sampleRate`, minimum duration, and event triggers are ignored.
+- The replay queue is in memory only. Frames are lost on exit or crash and are never spooled to disk.
+- Desktop only. Validated once on macOS arm64 (Metal) in a `-game` Development build of the example against the mock server: frames arrived at the configured 1 Hz, the decoded JPEG showed the game, and `$session_id` matched the analytics events. Measured over a 40-second run at 1280x720 scaled to 960x540: 6-9 ms on the render thread per capture (the readback map and copy, once per interval) and 8-30 ms on the worker per frame (resize and encode). Neither is optimized. Windows, Linux, consoles, mobile, D3D12/Vulkan back-buffer copies, and HDR output are unverified.
+- In the editor or PIE, frames show the whole editor window.
+- The server returns `session_recording: false` for projects with `recording_domains` unless the SDK is on its allowlist, and `posthog-unreal` is not on it yet.
+
 ## Upstream dependency
 
 The bridge pins `posthog-rs` v1 baseline `934113e63b9ad292de45d7db0af53913eb6eb117`. Required embedding additions are being ported separately on `feat/unreal-embedding-v1` in `~/dev/worktrees/posthog-rs-unreal-v1`; they have not landed in this baseline.

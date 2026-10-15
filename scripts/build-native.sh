@@ -32,7 +32,7 @@ for source in sorted([core_root / 'Cargo.toml', core_root / 'Cargo.lock', *core_
     source_hash.update(str(source.relative_to(core_root)).encode() + b'\0')
     source_hash.update(source.read_bytes() + b'\0')
 manifest = {
-    'abi_version': 1, 'bridge_version': '0.0.1', 'core_version': core['version'],
+    'abi_version': 2, 'bridge_version': '0.0.1', 'core_version': core['version'],
     'core_source': core.get('source', 'local embedding checkout'), 'target': target,
     'core_base': subprocess.check_output(['git', '-C', str(core_root), 'rev-parse', 'HEAD'], text=True).strip(),
     'core_source_sha256': source_hash.hexdigest(),

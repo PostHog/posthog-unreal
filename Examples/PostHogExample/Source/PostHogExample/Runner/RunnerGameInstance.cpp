@@ -19,6 +19,7 @@ void URunnerGameInstance::Init()
         Options.ClientName = TEXT("runner-example");
         Options.bEnableInEditor = true;
         Options.FlushIntervalMilliseconds = 1000;
+        Options.Replay.bEnabled = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_REPLAY")) == TEXT("1");
         PostHog->Setup(Options);
     }
 }

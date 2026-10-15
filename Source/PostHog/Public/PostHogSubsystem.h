@@ -14,6 +14,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FPostHogShutdownCompleted, bool, bSu
 
 struct FPostHogInitialization;
 struct FPostHogLifecycleSignals;
+class FPostHogReplayRecorder;
 
 /** One client per game instance. All UObject entry points run on the game thread. */
 UCLASS()
@@ -52,9 +53,13 @@ private:
     void HandleEngineExit();
     void Stop();
     void EnsureTicker();
+    void StopReplay();
     EPostHogSubsystemState State = EPostHogSubsystemState::Idle;
     bool bForeground = true;
     FPostHogClient::FPtr Client;
+    /** Replay options kept from setup; the recorder starts once the client is ready. */
+    FPostHogReplaySettings ReplaySettings;
+    TSharedPtr<FPostHogReplayRecorder, ESPMode::ThreadSafe> Replay;
     TSharedPtr<FPostHogInitialization, ESPMode::ThreadSafe> Initialization;
     TSharedPtr<FPostHogLifecycleSignals, ESPMode::ThreadSafe> Signals;
     TSharedFuture<bool> Closing;

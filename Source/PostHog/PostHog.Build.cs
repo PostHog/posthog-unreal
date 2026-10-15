@@ -6,6 +6,6 @@ public class PostHog : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Json", "Engine", "DeveloperSettings" });
-        PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore", "PostHogRust" });
+        PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore", "RHI", "RenderCore", "ImageWrapper", "ImageCore", "PostHogRust" });
     }
 }

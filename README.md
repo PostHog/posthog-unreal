@@ -88,6 +88,12 @@ Use `SetPersonPropertiesForFlags` / `SetGroupPropertiesForFlags` for persisted t
 
 Malformed serialized payloads currently inherit Rust's raw-string fallback. This is a known pre-release spec gap; valid decoded strings are preserved without reparsing. See [implementation status](docs/implementation-status.md) for remaining flag and release work.
 
+## Session replay (proof of concept)
+
+`Replay.bEnabled` (Project Settings → PostHog → Replay, or `FPostHogOptions::Replay`) records screenshot replay. About once per `Replay.IntervalMs`, the subsystem copies the game window's back buffer without stalling the game thread. A worker thread then scales the frame to `Replay.MaxDimension` and encodes it as a JPEG at `Replay.JpegQuality`. Each frame is one `$snapshot` event that the PostHog player shows as a mobile-style screenshot replay. Recording also requires the server's `session_recording` config, consent, and an active session. It pauses while the application is in the background.
+
+This is a proof of concept. Frames are not masked, so everything on screen is sent. It is desktop only and has been run once on macOS arm64; nothing else is validated. In the editor, frames show the whole editor window, so use `-game` builds. See [implementation status](docs/implementation-status.md) for the limitations.
+
 ## Native integration tests
 
 Use the maintained SDK mock server from the `sdk-mock-server` tooling. The test runner starts and stops an isolated server for each test. It does not use a real PostHog account.

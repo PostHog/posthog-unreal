@@ -1,8 +1,11 @@
 #include "PostHogClient.h"
 #include "PostHogJson.h"
 #include "PostHogFlagCache.h"
+#include "PostHogReplay.h"
 #include "PostHogTasks.h"
 #include "HAL/PlatformFileManager.h"
+#include "Misc/App.h"
+#include "Misc/Base64.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
@@ -23,6 +26,17 @@ template <typename T> TSharedFuture<T> Ready(T Value)
 }
 bool NonBlank(const FString& Text) { return !Text.TrimStartAndEnd().IsEmpty(); }
 phu_bytes View(const FTCHARToUTF8& Text) { return {reinterpret_cast<const uint8_t*>(Text.Get()), static_cast<size_t>(Text.Length())}; }
+EPostHogCaptureResult FromNative(phu_status Status)
+{
+    switch (Status)
+    {
+    case PHU_ACCEPTED: return EPostHogCaptureResult::Accepted;
+    case PHU_DISABLED: return EPostHogCaptureResult::Disabled;
+    case PHU_QUEUE_FULL: return EPostHogCaptureResult::QueueFull;
+    case PHU_CLOSED: return EPostHogCaptureResult::Closed;
+    default: return EPostHogCaptureResult::Invalid;
+    }
+}
 
 bool SaveAtomic(const FString& Filename, const FString& Json)
 {
@@ -125,8 +139,10 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         const TSharedPtr<FJsonObject>* Context = nullptr;
         if (!bOptedOut && State->TryGetObjectField(TEXT("flag_context"), Context) &&
             SameProperties(FPostHogProperties::FromNative(Context->ToSharedRef()), FlagContextLocked()) &&
-            State->TryGetObjectField(TEXT("cached_flags"), Object))
-        { FlagCache.Restore(FPostHogProperties::FromNative(Object->ToSharedRef())); CacheFlagGeneration = FlagGeneration; }
+            State->TryGetObjectField(TEXT("cached_flags"), Object) &&
+            FlagCache.Restore(FPostHogProperties::FromNative(Object->ToSharedRef())) &&
+            State->TryGetObjectField(TEXT("cached_session_recording"), Object))
+        { FlagCache.RestoreSessionRecording(*Object); CacheFlagGeneration = FlagGeneration; }
     }
 
     FPostHogProperties FlagContextLocked() const
@@ -159,11 +175,13 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         {
             State->SetObjectField(TEXT("flag_context"), FlagContextLocked().ToNative());
             State->SetObjectField(TEXT("cached_flags"), FlagCache.Serialize().ToNative());
+            if (FlagCache.SessionRecording.IsSet())
+            { State->SetObjectField(TEXT("cached_session_recording"), FlagCache.SessionRecording->ToNative()); }
             const FString WithCache = PostHogJson::Encode(State);
             if (PostHogJson::IsBounded(WithCache) && FTCHARToUTF8(*WithCache).Length() <= 1024 * 1024 - 1024)
             { if (CacheIncluded) { *CacheIncluded = true; } return WithCache; }
             // Optional cache data must never prevent identity/consent persistence.
-            State->RemoveField(TEXT("flag_context")); State->RemoveField(TEXT("cached_flags"));
+            State->RemoveField(TEXT("flag_context")); State->RemoveField(TEXT("cached_flags")); State->RemoveField(TEXT("cached_session_recording"));
         }
         return PostHogJson::Encode(State);
     }
@@ -249,8 +267,8 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         Event.Uuid = PostHogJson::NewUuidV7(Event.Timestamp);
         auto Merged = Registered.ToNative();
         PostHogJson::Merge(*Merged, *Config.Context.ToNative());
-        Merged->SetStringField(TEXT("$lib"), TEXT("posthog-unreal"));
-        Merged->SetStringField(TEXT("$lib_version"), TEXT("0.0.1"));
+        Merged->SetStringField(TEXT("$lib"), PostHogJson::LibName);
+        Merged->SetStringField(TEXT("$lib_version"), PostHogJson::LibVersion);
         if (!Groups.IsEmpty()) { Merged->SetObjectField(TEXT("$groups"), Groups.ToNative()); }
         TArray<TSharedPtr<FJsonValue>> ActiveFlags;
         for (const auto& Pair : FlagCache.Flags)
@@ -293,14 +311,7 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         FScopeLock Lock(&Mutex);
         if (bClosed || Handle == 0) { return EPostHogCaptureResult::Closed; }
         if (bOptedOut || ConsentGeneration != AdmissionGeneration) { return EPostHogCaptureResult::Disabled; }
-        switch (phu_capture(Handle, View(Utf8)))
-        {
-        case PHU_ACCEPTED: return EPostHogCaptureResult::Accepted;
-        case PHU_DISABLED: return EPostHogCaptureResult::Disabled;
-        case PHU_QUEUE_FULL: return EPostHogCaptureResult::QueueFull;
-        case PHU_CLOSED: return EPostHogCaptureResult::Closed;
-        default: return EPostHogCaptureResult::Invalid;
-        }
+        return FromNative(phu_capture(Handle, View(Utf8)));
     }
 
     void InvalidateFlagsLocked()
@@ -471,6 +482,8 @@ TSharedFuture<FPostHogClient::FPtr> FPostHogClient::CreateAsync(FPostHogConfig C
         Json->SetNumberField(TEXT("max_batch_size"), Options.MaxBatchSize);
         Json->SetNumberField(TEXT("request_timeout_seconds"), Options.RequestTimeoutSeconds);
         Json->SetNumberField(TEXT("shutdown_timeout_ms"), Options.ShutdownTimeoutMilliseconds);
+        // Native owns the replay queue defaults; the object's presence enables replay.
+        if (Options.Replay.bEnabled) { Json->SetObjectField(TEXT("replay"), MakeShared<FJsonObject>()); }
         const FTCHARToUTF8 Utf8(*PostHogJson::Encode(Json));
         if (phu_abi_version() != PHU_ABI_VERSION || phu_create(PHU_ABI_VERSION, View(Utf8), &State->Handle) != PHU_OK) { return nullptr; }
         // First identity must be saved before initialization becomes observable.
@@ -858,8 +871,73 @@ void FPostHogClient::OnForeground()
     }
     if (Event.IsSet()) { Impl->Emit(MoveTemp(Event.GetValue())); }
 }
+EPostHogCaptureResult FPostHogClient::SubmitReplaySnapshot(const FString& SessionId, int32 Width, int32 Height, const TArray64<uint8>& Jpeg, const FDateTime& CapturedAt)
+{
+    if (!NonBlank(SessionId) || Width <= 0 || Height <= 0 || Jpeg.IsEmpty() || Jpeg.Num() > PHU_MAX_REPLAY_INPUT) { return EPostHogCaptureResult::Invalid; }
+    FString DistinctId;
+    uint64 AdmissionGeneration = 0;
+    {
+        FScopeLock Lock(&Impl->Mutex);
+        if (Impl->bClosed || Impl->Handle == 0) { return EPostHogCaptureResult::Closed; }
+        if (!Impl->CanCaptureLocked() || !Impl->Config.Replay.bEnabled) { return EPostHogCaptureResult::Disabled; }
+        DistinctId = Impl->DistinctId; AdmissionGeneration = Impl->ConsentGeneration;
+    }
+    const double Timestamp = static_cast<double>(PostHogJson::UnixMilliseconds(CapturedAt));
+    auto Meta = MakeShared<FJsonObject>();
+    Meta->SetNumberField(TEXT("width"), Width); Meta->SetNumberField(TEXT("height"), Height);
+    Meta->SetStringField(TEXT("href"), FApp::GetProjectName());
+    auto MetaEvent = MakeShared<FJsonObject>();
+    MetaEvent->SetNumberField(TEXT("type"), 4); MetaEvent->SetNumberField(TEXT("timestamp"), Timestamp); MetaEvent->SetObjectField(TEXT("data"), Meta);
+    auto Offset = MakeShared<FJsonObject>();
+    Offset->SetNumberField(TEXT("top"), 0); Offset->SetNumberField(TEXT("left"), 0);
+    auto Wireframe = MakeShared<FJsonObject>();
+    Wireframe->SetNumberField(TEXT("id"), 1); Wireframe->SetNumberField(TEXT("x"), 0); Wireframe->SetNumberField(TEXT("y"), 0);
+    Wireframe->SetNumberField(TEXT("width"), Width); Wireframe->SetNumberField(TEXT("height"), Height);
+    Wireframe->SetStringField(TEXT("type"), TEXT("screenshot"));
+    Wireframe->SetStringField(TEXT("base64"), TEXT("data:image/jpeg;base64,") + FBase64::Encode(Jpeg.GetData(), static_cast<uint32>(Jpeg.Num())));
+    auto Full = MakeShared<FJsonObject>();
+    Full->SetObjectField(TEXT("initialOffset"), Offset);
+    TArray<TSharedPtr<FJsonValue>> Wireframes; Wireframes.Add(MakeShared<FJsonValueObject>(Wireframe));
+    Full->SetArrayField(TEXT("wireframes"), Wireframes);
+    auto FullEvent = MakeShared<FJsonObject>();
+    FullEvent->SetNumberField(TEXT("type"), 2); FullEvent->SetNumberField(TEXT("timestamp"), Timestamp); FullEvent->SetObjectField(TEXT("data"), Full);
+    auto Properties = MakeShared<FJsonObject>();
+    Properties->SetStringField(TEXT("$snapshot_source"), TEXT("mobile"));
+    Properties->SetStringField(TEXT("$session_id"), SessionId);
+    Properties->SetStringField(TEXT("$window_id"), SessionId);
+    Properties->SetStringField(TEXT("$lib"), PostHogJson::LibName);
+    Properties->SetStringField(TEXT("$lib_version"), PostHogJson::LibVersion);
+    TArray<TSharedPtr<FJsonValue>> SnapshotData;
+    SnapshotData.Add(MakeShared<FJsonValueObject>(MetaEvent)); SnapshotData.Add(MakeShared<FJsonValueObject>(FullEvent));
+    Properties->SetArrayField(TEXT("$snapshot_data"), SnapshotData);
+    auto Envelope = MakeShared<FJsonObject>();
+    Envelope->SetStringField(TEXT("event"), TEXT("$snapshot"));
+    Envelope->SetStringField(TEXT("distinct_id"), DistinctId);
+    Envelope->SetStringField(TEXT("uuid"), PostHogJson::NewUuidV7(CapturedAt));
+    Envelope->SetStringField(TEXT("timestamp"), CapturedAt.ToIso8601());
+    Envelope->SetObjectField(TEXT("properties"), Properties);
+    // Frames exceed the analytics JSON bound, so this path is limited only by the native replay input size.
+    const FTCHARToUTF8 Utf8(*PostHogJson::Encode(Envelope));
+    if (static_cast<uint64>(Utf8.Length()) > PHU_MAX_REPLAY_INPUT) { return EPostHogCaptureResult::Invalid; }
+    phu_handle NativeHandle = 0;
+    {
+        FScopeLock Lock(&Impl->Mutex);
+        if (Impl->bClosed || Impl->Handle == 0) { return EPostHogCaptureResult::Closed; }
+        if (Impl->bOptedOut || Impl->ConsentGeneration != AdmissionGeneration) { return EPostHogCaptureResult::Disabled; }
+        NativeHandle = Impl->Handle;
+    }
+    // Unlike Emit, call unlocked: native re-parses a multi-hundred-KB frame, and a closed handle (never reused) returns PHU_CLOSED.
+    return FromNative(phu_capture_replay(NativeHandle, View(Utf8)));
+}
+bool FPostHogClient::IsSessionReplayAllowed() const
+{
+    FScopeLock Lock(&Impl->Mutex);
+    return Impl->CanCaptureLocked() && Impl->Config.Replay.bEnabled && Impl->FlagCache.SessionRecording.IsSet();
+}
 void FPostHogClient::ShutdownAll()
 {
+    // Replay workers call into clients, so they must be joined before clients close.
+    FPostHogReplayRecorder::StopAll();
     TArray<TSharedPtr<FImpl, ESPMode::ThreadSafe>> Live;
     { FScopeLock Lock(&ClientsMutex); bStopping = true;
         for (const auto& Weak : Clients) { if (auto Client = Weak.Pin()) { Live.Add(Client); } } Clients.Empty(); }

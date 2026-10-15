@@ -17,6 +17,7 @@ FPostHogConfig FPostHogOptions::ToNative() const
     Config.FlushAt = FlushAt; Config.FlushIntervalMilliseconds = FlushIntervalMilliseconds;
     Config.MaxQueueSize = MaxQueueSize; Config.MaxBatchSize = MaxBatchSize;
     Config.RequestTimeoutSeconds = RequestTimeoutSeconds; Config.ShutdownTimeoutMilliseconds = ShutdownTimeoutMilliseconds;
+    Config.Replay = Replay;
     if (!AppVersion.IsEmpty()) { Config.Context.SetString(TEXT("$app_version"), AppVersion); }
     if (!AppBuild.IsEmpty()) { Config.Context.SetString(TEXT("$app_build"), AppBuild); }
     return Config;

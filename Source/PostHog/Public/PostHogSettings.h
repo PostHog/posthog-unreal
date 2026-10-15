@@ -52,6 +52,8 @@ struct POSTHOG_API FPostHogOptions
     int32 RequestTimeoutSeconds = 10;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Delivery", meta = (ClampMin = "1"))
     int32 ShutdownTimeoutMilliseconds = 3000;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay")
+    FPostHogReplaySettings Replay;
 
     FPostHogConfig ToNative() const;
 };

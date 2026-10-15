@@ -67,6 +67,19 @@ curl -X POST http://127.0.0.1:9999/__control/state \
 
 Restart PIE to fetch the new response, or reload flags through the SDK before the next run. Changing the mock response alone does not update the client's cached flags.
 
+### Session replay (proof of concept)
+
+Set `POSTHOG_REPLAY=1` to record about one screenshot per second while the game runs. Launch with `-game` so frames contain only the game window; in the editor, frames show the whole editor window. Replay records only when the server's flags response enables session recording, which the mock server does by default. Frames have no masking.
+
+```sh
+export POSTHOG_TOKEN=phc_MOCK
+export POSTHOG_HOST=http://127.0.0.1:9999
+export POSTHOG_REPLAY=1
+./scripts/run-example.sh -game
+```
+
+Open `http://127.0.0.1:9999/dashboard` to see received frames. The log category `LogPostHogReplay` reports capture and encode timings every 10 frames.
+
 ## Optional character art
 
 The built-in articulated robot makes the example runnable without a skeletal mesh or animation pack. To use your own art, derive a Blueprint from `RunnerCharacter`, assign its inherited skeletal mesh and animation class, and select that Blueprint as the game mode's default pawn. The procedural robot hides itself when a skeletal mesh is assigned. A production character should provide its own crouch/slide animation.

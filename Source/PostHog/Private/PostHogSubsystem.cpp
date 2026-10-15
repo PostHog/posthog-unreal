@@ -1,5 +1,6 @@
 #include "PostHogSubsystem.h"
 #include "PostHogJson.h"
+#include "PostHogReplay.h"
 #include "PostHogTasks.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
@@ -100,6 +101,7 @@ bool UPostHogSubsystem::SetupWithConfig(FPostHogConfig Config, bool bEnableInEdi
     for (auto It = Owners.CreateIterator(); It; ++It) { if (!It.Value().IsValid()) { It.RemoveCurrent(); } }
     auto Previous = Owners.FindRef(Key).Pin();
     if (Previous) { FScopeLock Lock(&Previous->Mutex); if (!Previous->bCancelled) { return false; } }
+    ReplaySettings = Config.Replay;
     State = EPostHogSubsystemState::Initializing;
     StartObserving(); EnsureTicker();
     auto Request = MakeShared<FPostHogInitialization, ESPMode::ThreadSafe>();
@@ -132,6 +134,7 @@ FPostHogClient::FPtr UPostHogSubsystem::GetClient() const
 void UPostHogSubsystem::Shutdown()
 {
     if (!IsInGameThread() || State == EPostHogSubsystemState::ShuttingDown || State == EPostHogSubsystemState::Deinitialized) { return; }
+    StopReplay();
     StopObserving();
     if (Initialization)
     {
@@ -169,6 +172,7 @@ bool UPostHogSubsystem::Tick(float DeltaTime)
             bForeground = bNextForeground;
             if (auto Current = Client)
             { if (bForeground) { Current->OnForeground(); } else { Current->OnBackground(); } }
+            if (Replay) { Replay->SetPaused(!bForeground); }
         }
     }
     if (State == EPostHogSubsystemState::Initializing && Initialization && Initialization->Ready.IsReady())
@@ -179,7 +183,15 @@ bool UPostHogSubsystem::Tick(float DeltaTime)
         if (State == EPostHogSubsystemState::Ready)
         {
             auto Current = Client; Current->StartApplicationLifecycle(bForeground);
-            if (State == EPostHogSubsystemState::Ready && Client == Current) { OnSetupCompleted.Broadcast(true); }
+            if (State == EPostHogSubsystemState::Ready && Client == Current)
+            {
+                if (ReplaySettings.bEnabled)
+                {
+                    Replay = FPostHogReplayRecorder::Start(Current, ReplaySettings);
+                    if (Replay) { Replay->SetPaused(!bForeground); }
+                }
+                OnSetupCompleted.Broadcast(true);
+            }
         }
         else { Initialization->Cancel(); Initialization.Reset(); StopObserving(); OnSetupCompleted.Broadcast(false); }
     }
@@ -224,9 +236,15 @@ void UPostHogSubsystem::StopObserving()
     Signals.Reset();
 }
 
+void UPostHogSubsystem::StopReplay()
+{
+    if (Replay) { Replay->Stop(); Replay.Reset(); }
+}
+
 void UPostHogSubsystem::Stop()
 {
     if (State == EPostHogSubsystemState::Deinitialized) { return; }
+    StopReplay();
     Shutdown();
     StopObserving();
     FTSTicker::RemoveTicker(TickerHandle); TickerHandle.Reset();

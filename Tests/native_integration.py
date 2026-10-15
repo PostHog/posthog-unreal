@@ -84,6 +84,7 @@ class NativeTests(MockServerTestCase):
         for name, args in {
             "phu_create": [c.c_uint32, Bytes, c.POINTER(c.c_uint64)],
             "phu_capture": [c.c_uint64, Bytes],
+            "phu_capture_replay": [c.c_uint64, Bytes],
             "phu_flags": [c.c_uint64, Bytes, c.POINTER(Buffer)],
             "phu_checkpoint": [c.c_uint64, c.POINTER(Buffer)],
             "phu_flush": [c.c_uint64], "phu_close": [c.c_uint64],
@@ -114,7 +115,7 @@ class NativeTests(MockServerTestCase):
                   "shutdown_timeout_ms": 200, **options}
         storage, data = encoded(config)
         handle = c.c_uint64()
-        self.assertEqual(self.lib.phu_create(1, data, c.byref(handle)), 0)
+        self.assertEqual(self.lib.phu_create(2, data, c.byref(handle)), 0)
         self.handles.append(handle.value)
         return handle.value
 
@@ -284,6 +285,39 @@ class NativeTests(MockServerTestCase):
         self.lib.phu_flush(handle)
         self.assertEqual(self.http("/__captured/events"), [])
 
+    def capture_replay(self, handle, session_id):
+        event = {"event": "$snapshot", "distinct_id": "玩家 🚀", "uuid": str(uuid.uuid4()),
+                 "timestamp": "2026-01-01T12:00:00Z",
+                 "properties": {"$snapshot_source": "mobile", "$session_id": session_id, "$window_id": session_id,
+                                "$lib": "posthog-unreal", "$lib_version": "0.0.1",
+                                "$snapshot_data": [
+                                    {"type": 4, "timestamp": 1767268800000, "data": {"width": 2, "height": 2, "href": "test"}},
+                                    {"type": 2, "timestamp": 1767268800000, "data": {"initialOffset": {"top": 0, "left": 0}, "wireframes": [
+                                        {"id": 1, "x": 0, "y": 0, "width": 2, "height": 2, "type": "screenshot", "base64": "data:image/jpeg;base64,AA=="}]}}]}}
+        storage, data = encoded(event)
+        return self.lib.phu_capture_replay(handle, data)
+
+    def test_replay_snapshots_post_to_snapshot_endpoint(self):
+        handle = self.create(replay={"flush_interval_ms": 100})
+        session_id = str(uuid.uuid4())
+        self.assertEqual(self.capture_replay(handle, session_id), 1)
+        self.assertEqual(self.capture_replay(handle, session_id), 1)
+        deadline = time.monotonic() + 5
+        while self.http("/__captured")["snapshots"] < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        snapshots = self.http("/__captured/snapshots")
+        self.assertEqual(len(snapshots), 2)
+        for snapshot in snapshots:
+            self.assertEqual(snapshot["session_id"], session_id)
+            self.assertEqual(snapshot["snapshot_types"], [4, 2])
+        self.assertEqual(self.http("/__captured/events"), [])
+        report = self.checkpoint(handle)
+        self.assertEqual((report["replay_pending"], report["replay_dropped"]), (0, 0))
+
+    def test_replay_is_disabled_without_replay_options(self):
+        handle = self.create()
+        self.assertEqual(self.capture_replay(handle, str(uuid.uuid4())), 7)
+
     def test_queue_bound_and_concurrent_close(self):
         handle = self.create(max_queue_size=2, max_batch_size=2, flush_at=2)
         self.http("/__control/state", {"delays": {"analytics": 1}})
@@ -357,7 +391,7 @@ class NativeTests(MockServerTestCase):
         self.assertEqual(process.returncode, 0, str(evidence / "stdout.log"))
         result = json.loads((report / "index.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["failed"], 0, result)
-        self.assertEqual(result["succeeded"], 6, result)
+        self.assertEqual(result["succeeded"], 8, result)
         wire = self.wire_events()
         wire_by_name = {event["event"]: event for event in wire}
         materialized = self.http("/__captured/events")
@@ -485,7 +519,7 @@ class NativeTests(MockServerTestCase):
                   "storage_path": str(self.directory / "spool")}
         storage, data = encoded(config)
         other = c.c_uint64()
-        self.assertEqual(self.lib.phu_create(1, data, c.byref(other)), 9)
+        self.assertEqual(self.lib.phu_create(2, data, c.byref(other)), 9)
         self.assertEqual(other.value, 0)
         self.assertEqual(self.lib.phu_close(handle), 0)
         self.assertNotEqual(self.create(), handle)
