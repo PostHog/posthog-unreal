@@ -96,7 +96,7 @@ FPostHogValue FPostHogValue::Boolean(bool Value)
 FPostHogValue FPostHogValue::Number(double Value)
 {
     FPostHogValue Result;
-    Result.Json = FMath::IsFinite(Value) ? PostHogJson::EncodeValue(MakeShared<FJsonValueNumber>(Value)) : FString();
+    Result.Json = FMath::IsFinite(Value) ? PostHogJson::EncodeValue(MakeShared<FJsonValueNumber>(Value)) : TEXT("null");
     return Result;
 }
 FPostHogValue FPostHogValue::Object(const FPostHogProperties& Value)

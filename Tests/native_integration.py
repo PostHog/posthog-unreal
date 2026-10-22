@@ -279,6 +279,18 @@ class NativeTests(unittest.TestCase):
         wire = self.http("/__captured/events")
         events = {event["event"]: event for event in wire}
         self.assertEqual(events["unreal_native_integration"]["properties"]["$lib"], "posthog-unreal")
+        for index in range(3):
+            name = f"stateful_nonfinite_{index}"
+            self.assertEqual(sum(event["event"] == name for event in wire), 1)
+            numeric = events[name]["properties"]
+            self.assertNotIn("bad", numeric)
+            self.assertEqual(numeric["nested"], {"kept": 7})
+            self.assertEqual(numeric["items"], [None, 8, False, "NaN", None, {"kept": 7}])
+            self.assertEqual(numeric["finite"], 42.5)
+            self.assertEqual(numeric["literal"], "Infinity")
+            json.dumps(numeric, allow_nan=False)
+        self.assertEqual(sum(event["event"] == "stateful_numeric_neighbor" for event in wire), 1)
+        self.assertEqual(events["stateful_numeric_neighbor"]["properties"]["finite"], 123)
         anonymous = events["stateful_anonymous"]
         identified = events["stateful_identified"]
         reset = events["stateful_reset"]

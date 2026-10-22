@@ -15,6 +15,7 @@ struct POSTHOG_API FPostHogValue
 
     static FPostHogValue String(const FString& Value);
     static FPostHogValue Boolean(bool Value);
+    /** Non-finite numbers become JSON null. */
     static FPostHogValue Number(double Value);
     static FPostHogValue Object(const FPostHogProperties& Value);
     static FPostHogValue Array(const TArray<FPostHogValue>& Values);

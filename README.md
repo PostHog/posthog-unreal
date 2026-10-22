@@ -134,6 +134,8 @@ if (Initialization.IsReady())
 
 The client supports identity, registered/person/group properties, consent, reset, sessions, and a C++ `BeforeSend` hook. Properties are value copies with typed JSON values. The subsystem handles lifecycle binding automatically. For a directly owned client, sample context yourself, call `StartApplicationLifecycle` once ready, and forward `OnBackground`/`OnForeground` from your owner.
 
+`FPostHogValue::Number` converts numeric NaN and positive/negative infinity to JSON null, and `SetNumber` accepts these assignments. Arrays retain null slots. Capture omits null-valued object members as usual, including those inside arrays, without changing caller-owned properties. Literal strings such as `"NaN"` remain strings.
+
 `FlushAsync`, `OptOutAsync`, `OptInAsync`, `ResetAsync`, and `ShutdownAsync` return completion futures. Completion can run off-thread: marshal UObject work to the game thread. Capture acceptance is not a delivery receipt. Call `ShutdownAsync` when the owner stops; module teardown also closes clients and joins their workers. Live Coding and dynamic module reloading are not supported.
 
 ## Feature flags
