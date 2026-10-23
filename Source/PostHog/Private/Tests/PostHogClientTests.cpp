@@ -31,7 +31,44 @@ bool FPostHogPropertiesTest::RunTest(const FString& Parameters)
     TestFalse(TEXT("Invalid JSON"), FPostHogValue::TryParse(TEXT("{bad"), Value));
     TestFalse(TEXT("Multiple roots"), FPostHogValue::TryParse(TEXT("1,2"), Value));
     TestFalse(TEXT("Non-object properties"), FPostHogProperties::TryParse(TEXT("[]"), Copy));
-    TestFalse(TEXT("NaN"), Properties.SetNumber(TEXT("bad"), std::numeric_limits<double>::quiet_NaN()));
+    const double NonFiniteNumbers[] = { std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity() };
+    for (double Number : NonFiniteNumbers)
+    {
+        const FPostHogValue NonFinite = FPostHogValue::Number(Number);
+        TestTrue(TEXT("Non-finite number is valid"), NonFinite.IsValid());
+        TestEqual(TEXT("Non-finite number is JSON null"), NonFinite.ToJson(), FString(TEXT("null")));
+        TestTrue(TEXT("Replace finite number with non-finite"), Properties.SetNumber(TEXT("number"), Number));
+        TestTrue(TEXT("Non-finite setter stores null"), Properties.ToNative()->HasTypedField<EJson::Null>(TEXT("number")));
+        TestTrue(TEXT("Finite setter still works"), Properties.SetNumber(TEXT("number"), 42.5));
+        TestEqual(TEXT("Finite number unchanged"), Properties.ToNative()->GetNumberField(TEXT("number")), 42.5);
+
+        FPostHogProperties Nested;
+        TestTrue(TEXT("Nested non-finite setter"), Nested.SetNumber(TEXT("bad"), Number));
+        TestTrue(TEXT("Nested finite neighbor"), Nested.SetNumber(TEXT("kept"), 7));
+        const FString NestedJson = Nested.ToJson();
+        TestTrue(TEXT("Nested object"), Properties.Set(TEXT("nested"), FPostHogValue::Object(Nested)));
+        TestTrue(TEXT("Nested non-finite is null"), Properties.ToNative()->GetObjectField(TEXT("nested"))->HasTypedField<EJson::Null>(TEXT("bad")));
+        TestEqual(TEXT("Nested neighbor survives"), Properties.ToNative()->GetObjectField(TEXT("nested"))->GetNumberField(TEXT("kept")), 7.0);
+
+        FPostHogProperties ArrayObject;
+        TestTrue(TEXT("Array object non-finite setter"), ArrayObject.SetNumber(TEXT("bad"), Number));
+        const TArray<FPostHogValue> Items = { NonFinite, FPostHogValue::Number(7), FPostHogValue::Boolean(false),
+            FPostHogValue::String(TEXT("NaN")), FPostHogValue(), FPostHogValue::Object(ArrayObject), FPostHogValue::Number(8) };
+        const FPostHogValue Array = FPostHogValue::Array(Items);
+        TestTrue(TEXT("Array with non-finite is valid"), Array.IsValid());
+        TestEqual(TEXT("Array positions and neighbors survive"), Array.ToJson(), FString(TEXT("[null,7,false,\"NaN\",null,{\"bad\":null},8]")));
+        TestTrue(TEXT("Array assignment"), Properties.Set(TEXT("items"), Array));
+        FPostHogProperties RoundTrip;
+        TestTrue(TEXT("Properties remain JSON"), FPostHogProperties::TryParse(Properties.ToJson(), RoundTrip));
+        TestEqual(TEXT("Caller array unchanged"), Items[0].ToJson(), FString(TEXT("null")));
+        TestEqual(TEXT("Caller nested object unchanged"), Nested.ToJson(), NestedJson);
+    }
+    FPostHogValue TooDeep;
+    for (int32 Index = 0; Index < 65; ++Index) { TooDeep = FPostHogValue::Array({ TooDeep }); }
+    TestFalse(TEXT("Over-depth array remains invalid"), TooDeep.IsValid());
+    TestFalse(TEXT("Invalid value assignment still rejected"), Properties.Set(TEXT("number"), TooDeep));
+    TestEqual(TEXT("Rejected assignment preserves finite value"), Properties.ToNative()->GetNumberField(TEXT("number")), 42.5);
     TestFalse(TEXT("Depth bound"), FPostHogValue::TryParse(FString::ChrN(65, TEXT('[')) + TEXT("0") + FString::ChrN(65, TEXT(']')), Value));
     TestFalse(TEXT("Size bound"), Properties.SetString(TEXT("big"), FString::ChrN(1024 * 1024, TEXT('x'))));
     return true;
@@ -83,6 +120,26 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
         FPostHogProperties Properties;
         FPostHogProperties::TryParse(TEXT("{\"precedence\":\"caller\",\"$is_identified\":true,\"$process_person_profile\":true,\"null\":null,\"array\":[null,{\"gone\":null,\"kept\":1}],\"string\":\"00123\"}"), Properties);
         Check(Client->Capture(TEXT("stateful_anonymous"), Properties) == EPostHogCaptureResult::Accepted, TEXT("capture anonymous"));
+        const double NonFiniteNumbers[] = { std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity() };
+        for (int32 Index = 0; Index < 3; ++Index)
+        {
+            FPostHogProperties Numeric, Nested;
+            Check(Numeric.SetNumber(TEXT("bad"), NonFiniteNumbers[Index]), TEXT("non-finite direct setter accepted"));
+            Check(Nested.SetNumber(TEXT("bad"), NonFiniteNumbers[Index]), TEXT("non-finite nested setter accepted"));
+            Nested.SetNumber(TEXT("kept"), 7);
+            Numeric.Set(TEXT("nested"), FPostHogValue::Object(Nested));
+            Check(Numeric.Set(TEXT("items"), FPostHogValue::Array({ FPostHogValue::Number(NonFiniteNumbers[Index]),
+                FPostHogValue::Number(8), FPostHogValue::Boolean(false), FPostHogValue::String(TEXT("NaN")),
+                FPostHogValue(), FPostHogValue::Object(Nested) })), TEXT("non-finite array setter accepted"));
+            Numeric.SetNumber(TEXT("finite"), 42.5);
+            Numeric.SetString(TEXT("literal"), TEXT("Infinity"));
+            const FString BeforeCapture = Numeric.ToJson();
+            Check(Client->Capture(FString::Printf(TEXT("stateful_nonfinite_%d"), Index), Numeric) == EPostHogCaptureResult::Accepted, TEXT("capture non-finite properties"));
+            Check(Numeric.ToJson() == BeforeCapture, TEXT("capture preserves caller properties"));
+        }
+        FPostHogProperties Neighbor; Neighbor.SetNumber(TEXT("finite"), 123);
+        Check(Client->Capture(TEXT("stateful_numeric_neighbor"), Neighbor) == EPostHogCaptureResult::Accepted, TEXT("capture finite neighbor"));
         Check(Client->Identify(TEXT("user-one")), TEXT("identify anonymous"));
         Check(!Client->Identify(TEXT("user-one")), TEXT("duplicate identify suppressed"));
         Check(!Client->Identify(TEXT("user-two")), TEXT("account switch requires reset"));
@@ -119,9 +176,24 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
 
         Config.ClientName = TEXT("hook");
         auto Weak = MakeShared<TWeakPtr<FPostHogClient, ESPMode::ThreadSafe>, ESPMode::ThreadSafe>();
-        Config.BeforeSend = [Weak](FPostHogEvent& Event)
+        auto HookNumber = MakeShared<double, ESPMode::ThreadSafe>(0.0);
+        Config.BeforeSend = [Weak, HookNumber](FPostHogEvent& Event)
         {
             Event.Properties.Remove(TEXT("secret")); Event.Properties.Remove(TEXT("$lib"));
+            if (Event.Event.StartsWith(TEXT("stateful_hook_numeric_")))
+            {
+                Event.Properties.SetNumber(TEXT("computed"), *HookNumber);
+                Event.Properties.Set(TEXT("explicit_null"), FPostHogValue());
+                FPostHogProperties Nested;
+                Nested.SetNumber(TEXT("computed"), *HookNumber);
+                Nested.SetNumber(TEXT("kept"), 7);
+                Event.Properties.Set(TEXT("nested"), FPostHogValue::Object(Nested));
+                Event.Properties.Set(TEXT("items"), FPostHogValue::Array({ FPostHogValue::Number(*HookNumber),
+                    FPostHogValue::Number(8), FPostHogValue::Boolean(false), FPostHogValue::String(TEXT("NaN")),
+                    FPostHogValue(), FPostHogValue::Object(Nested) }));
+                Event.Properties.SetNumber(TEXT("finite"), 42.5);
+                Event.Properties.SetString(TEXT("literal"), TEXT("Infinity"));
+            }
             if (Event.Event == TEXT("hook_withdraw")) { if (auto Current = Weak->Pin()) { Current->OptOutAsync(); } }
             if (Event.Event == TEXT("hook_withdraw_resume"))
             { if (auto Current = Weak->Pin()) { Current->OptOutAsync().Get(); Current->OptInAsync().Get(); } }
@@ -134,6 +206,13 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
         Check(Client->OptInAsync().Get(), TEXT("opt back in"));
         Check(Client->Capture(TEXT("hook_withdraw_resume"), Secret) == EPostHogCaptureResult::Disabled, TEXT("opt-in does not revive pre-opt-out snapshots"));
         Check(Client->Capture(TEXT("stateful_redacted"), Secret) == EPostHogCaptureResult::Accepted, TEXT("capture redacted"));
+        const FString BeforeHookCapture = Secret.ToJson();
+        for (int32 Index = 0; Index < 4; ++Index)
+        {
+            *HookNumber = Index < 3 ? NonFiniteNumbers[Index] : 42.5;
+            Check(Client->Capture(FString::Printf(TEXT("stateful_hook_numeric_%d"), Index), Secret) == EPostHogCaptureResult::Accepted, TEXT("capture hook numeric properties"));
+            Check(Secret.ToJson() == BeforeHookCapture, TEXT("hook capture preserves caller properties"));
+        }
         Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush redacted"));
         Check(Client->ShutdownAsync().Get(), TEXT("close hook client")); Client.Reset();
 

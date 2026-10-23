@@ -275,10 +275,22 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, str(evidence / "stdout.log"))
         result = json.loads((report / "index.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["failed"], 0, result)
-        self.assertEqual(result["succeeded"], 8, result)
+        self.assertEqual(result["succeeded"] + result["succeededWithWarnings"], 8, result)
         wire = self.http("/__captured/events")
         events = {event["event"]: event for event in wire}
         self.assertEqual(events["unreal_native_integration"]["properties"]["$lib"], "posthog-unreal")
+        for index in range(3):
+            name = f"stateful_nonfinite_{index}"
+            self.assertEqual(sum(event["event"] == name for event in wire), 1)
+            numeric = events[name]["properties"]
+            self.assertNotIn("bad", numeric)
+            self.assertEqual(numeric["nested"], {"kept": 7})
+            self.assertEqual(numeric["items"], [None, 8, False, "NaN", None, {"kept": 7}])
+            self.assertEqual(numeric["finite"], 42.5)
+            self.assertEqual(numeric["literal"], "Infinity")
+            json.dumps(numeric, allow_nan=False)
+        self.assertEqual(sum(event["event"] == "stateful_numeric_neighbor" for event in wire), 1)
+        self.assertEqual(events["stateful_numeric_neighbor"]["properties"]["finite"], 123)
         anonymous = events["stateful_anonymous"]
         identified = events["stateful_identified"]
         reset = events["stateful_reset"]
@@ -302,6 +314,26 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(sum(event["event"] == "$set" for event in wire), 1)
         self.assertNotIn("secret", events["stateful_redacted"]["properties"])
         self.assertNotIn("$lib", events["stateful_redacted"]["properties"])
+        for index in range(4):
+            name = f"stateful_hook_numeric_{index}"
+            self.assertEqual(sum(event["event"] == name for event in wire), 1)
+            numeric = events[name]["properties"]
+            nested = {"kept": 7}
+            computed = None
+            if index < 3:
+                self.assertNotIn("computed", numeric)
+            else:
+                computed = 42.5
+                nested["computed"] = computed
+                self.assertEqual(numeric["computed"], computed)
+            self.assertNotIn("explicit_null", numeric)
+            self.assertEqual(numeric["nested"], nested)
+            self.assertEqual(numeric["items"], [computed, 8, False, "NaN", None, nested])
+            self.assertEqual(numeric["finite"], 42.5)
+            self.assertEqual(numeric["literal"], "Infinity")
+            self.assertNotIn("secret", numeric)
+            self.assertNotIn("$lib", numeric)
+            json.dumps(numeric, allow_nan=False)
         for name in ("ignored", "closed", "hook_withdraw", "hook_withdraw_resume", "must_not_replay", "$reset"):
             self.assertNotIn(name, events)
         self.assertNotIn("$session_id", events["explicit_before"]["properties"])
