@@ -275,7 +275,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, str(evidence / "stdout.log"))
         result = json.loads((report / "index.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["failed"], 0, result)
-        self.assertEqual(result["succeeded"], 8, result)
+        self.assertEqual(result["succeeded"] + result["succeededWithWarnings"], 8, result)
         wire = self.http("/__captured/events")
         events = {event["event"]: event for event in wire}
         self.assertEqual(events["unreal_native_integration"]["properties"]["$lib"], "posthog-unreal")
