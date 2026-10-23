@@ -314,6 +314,26 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(sum(event["event"] == "$set" for event in wire), 1)
         self.assertNotIn("secret", events["stateful_redacted"]["properties"])
         self.assertNotIn("$lib", events["stateful_redacted"]["properties"])
+        for index in range(4):
+            name = f"stateful_hook_numeric_{index}"
+            self.assertEqual(sum(event["event"] == name for event in wire), 1)
+            numeric = events[name]["properties"]
+            nested = {"kept": 7}
+            computed = None
+            if index < 3:
+                self.assertNotIn("computed", numeric)
+            else:
+                computed = 42.5
+                nested["computed"] = computed
+                self.assertEqual(numeric["computed"], computed)
+            self.assertNotIn("explicit_null", numeric)
+            self.assertEqual(numeric["nested"], nested)
+            self.assertEqual(numeric["items"], [computed, 8, False, "NaN", None, nested])
+            self.assertEqual(numeric["finite"], 42.5)
+            self.assertEqual(numeric["literal"], "Infinity")
+            self.assertNotIn("secret", numeric)
+            self.assertNotIn("$lib", numeric)
+            json.dumps(numeric, allow_nan=False)
         for name in ("ignored", "closed", "hook_withdraw", "hook_withdraw_resume", "must_not_replay", "$reset"):
             self.assertNotIn(name, events)
         self.assertNotIn("$session_id", events["explicit_before"]["properties"])

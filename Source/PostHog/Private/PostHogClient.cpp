@@ -287,7 +287,9 @@ struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe
         Envelope->SetStringField(TEXT("distinct_id"), Event.DistinctId);
         Envelope->SetStringField(TEXT("uuid"), Event.Uuid);
         Envelope->SetStringField(TEXT("timestamp"), Event.Timestamp.ToIso8601());
-        Envelope->SetObjectField(TEXT("properties"), Event.Properties.ToNative());
+        auto Properties = Event.Properties.ToNative();
+        PostHogJson::RemoveNullObjectProperties(MakeShared<FJsonValueObject>(Properties));
+        Envelope->SetObjectField(TEXT("properties"), Properties);
         const FString Json = PostHogJson::Encode(Envelope);
         if (!PostHogJson::IsBounded(Json)) { return EPostHogCaptureResult::Invalid; }
         const FTCHARToUTF8 Utf8(*Json);

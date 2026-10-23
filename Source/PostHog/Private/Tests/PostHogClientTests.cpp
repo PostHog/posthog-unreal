@@ -176,9 +176,24 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
 
         Config.ClientName = TEXT("hook");
         auto Weak = MakeShared<TWeakPtr<FPostHogClient, ESPMode::ThreadSafe>, ESPMode::ThreadSafe>();
-        Config.BeforeSend = [Weak](FPostHogEvent& Event)
+        auto HookNumber = MakeShared<double, ESPMode::ThreadSafe>(0.0);
+        Config.BeforeSend = [Weak, HookNumber](FPostHogEvent& Event)
         {
             Event.Properties.Remove(TEXT("secret")); Event.Properties.Remove(TEXT("$lib"));
+            if (Event.Event.StartsWith(TEXT("stateful_hook_numeric_")))
+            {
+                Event.Properties.SetNumber(TEXT("computed"), *HookNumber);
+                Event.Properties.Set(TEXT("explicit_null"), FPostHogValue());
+                FPostHogProperties Nested;
+                Nested.SetNumber(TEXT("computed"), *HookNumber);
+                Nested.SetNumber(TEXT("kept"), 7);
+                Event.Properties.Set(TEXT("nested"), FPostHogValue::Object(Nested));
+                Event.Properties.Set(TEXT("items"), FPostHogValue::Array({ FPostHogValue::Number(*HookNumber),
+                    FPostHogValue::Number(8), FPostHogValue::Boolean(false), FPostHogValue::String(TEXT("NaN")),
+                    FPostHogValue(), FPostHogValue::Object(Nested) }));
+                Event.Properties.SetNumber(TEXT("finite"), 42.5);
+                Event.Properties.SetString(TEXT("literal"), TEXT("Infinity"));
+            }
             if (Event.Event == TEXT("hook_withdraw")) { if (auto Current = Weak->Pin()) { Current->OptOutAsync(); } }
             if (Event.Event == TEXT("hook_withdraw_resume"))
             { if (auto Current = Weak->Pin()) { Current->OptOutAsync().Get(); Current->OptInAsync().Get(); } }
@@ -191,6 +206,13 @@ bool FPostHogClientTest::RunTest(const FString& Parameters)
         Check(Client->OptInAsync().Get(), TEXT("opt back in"));
         Check(Client->Capture(TEXT("hook_withdraw_resume"), Secret) == EPostHogCaptureResult::Disabled, TEXT("opt-in does not revive pre-opt-out snapshots"));
         Check(Client->Capture(TEXT("stateful_redacted"), Secret) == EPostHogCaptureResult::Accepted, TEXT("capture redacted"));
+        const FString BeforeHookCapture = Secret.ToJson();
+        for (int32 Index = 0; Index < 4; ++Index)
+        {
+            *HookNumber = Index < 3 ? NonFiniteNumbers[Index] : 42.5;
+            Check(Client->Capture(FString::Printf(TEXT("stateful_hook_numeric_%d"), Index), Secret) == EPostHogCaptureResult::Accepted, TEXT("capture hook numeric properties"));
+            Check(Secret.ToJson() == BeforeHookCapture, TEXT("hook capture preserves caller properties"));
+        }
         Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush redacted"));
         Check(Client->ShutdownAsync().Get(), TEXT("close hook client")); Client.Reset();
 
