@@ -39,6 +39,12 @@ public:
     UFUNCTION(BlueprintPure, Category = "PostHog")
     EPostHogSubsystemState GetState() const { return State; }
 
+    /** Starts the recorder after setup; requires Replay.bEnabled. Already started returns true.
+     * True means the recorder is running, not that frames are being captured or delivered:
+     * consent, foreground/session state, and remote replay configuration still gate capture. */
+    UFUNCTION(BlueprintCallable, Category = "PostHog|Session Replay")
+    bool StartSessionReplay();
+
     /** Native callers may retain the shared pointer, but teardown still closes it. */
     FPostHogClient::FPtr GetClient() const;
     UPROPERTY(BlueprintAssignable, Category = "PostHog")
@@ -57,7 +63,7 @@ private:
     EPostHogSubsystemState State = EPostHogSubsystemState::Idle;
     bool bForeground = true;
     FPostHogClient::FPtr Client;
-    /** Replay options kept from setup; the recorder starts once the client is ready. */
+    /** Replay options kept from setup for automatic or explicit recorder startup. */
     FPostHogReplaySettings ReplaySettings;
     TSharedPtr<FPostHogReplayRecorder, ESPMode::ThreadSafe> Replay;
     TSharedPtr<FPostHogInitialization, ESPMode::ThreadSafe> Initialization;

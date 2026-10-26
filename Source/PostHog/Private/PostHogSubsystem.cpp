@@ -185,11 +185,7 @@ bool UPostHogSubsystem::Tick(float DeltaTime)
             auto Current = Client; Current->StartApplicationLifecycle(bForeground);
             if (State == EPostHogSubsystemState::Ready && Client == Current)
             {
-                if (ReplaySettings.bEnabled)
-                {
-                    Replay = FPostHogReplayRecorder::Start(Current, ReplaySettings);
-                    if (Replay) { Replay->SetPaused(!bForeground); }
-                }
+                if (ReplaySettings.bAutoStart) { StartSessionReplay(); }
                 OnSetupCompleted.Broadcast(true);
             }
         }
@@ -234,6 +230,16 @@ void UPostHogSubsystem::StopObserving()
     FCoreDelegates::OnEnginePreExit.Remove(ExitHandle);
     BackgroundHandle.Reset(); ForegroundHandle.Reset(); DeactivateHandle.Reset(); ReactivateHandle.Reset(); SlateHandle.Reset(); ExitHandle.Reset();
     Signals.Reset();
+}
+
+bool UPostHogSubsystem::StartSessionReplay()
+{
+    auto Current = GetClient();
+    if (!Current || !ReplaySettings.bEnabled) { return false; }
+    if (Replay) { return true; }
+    Replay = FPostHogReplayRecorder::Start(Current, ReplaySettings);
+    if (Replay) { Replay->SetPaused(!bForeground); }
+    return Replay.IsValid();
 }
 
 void UPostHogSubsystem::StopReplay()

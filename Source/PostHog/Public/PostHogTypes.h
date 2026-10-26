@@ -25,4 +25,7 @@ struct POSTHOG_API FPostHogReplaySettings
     int32 MaxDimension = 960;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay", meta = (ClampMin = "1", ClampMax = "100"))
     int32 JpegQuality = 65;
+    /** Start recording when setup completes. Disable to call StartSessionReplay later. Requires bEnabled. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay")
+    bool bAutoStart = true;
 };
