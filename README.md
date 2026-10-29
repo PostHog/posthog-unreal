@@ -90,6 +90,13 @@ Malformed serialized payloads currently inherit Rust's raw-string fallback. This
 
 ## Session replay (proof of concept)
 
+When enabled, replay starts automatically after setup by default. To start after a gameplay milestone,
+set `Options.Replay.bEnabled = true` and `Options.Replay.bAutoStart = false` before setup.
+After setup completes, call `UPostHogSubsystem::StartSessionReplay()` or the **Start Session Replay**
+Blueprint node. Repeated calls are safe. A `true` result means the recorder is running,
+not that frames have been captured or delivered; consent, foreground/session state,
+and remote replay configuration still gate capture. Shutdown stops the recorder.
+
 `Replay.bEnabled` (Project Settings → PostHog → Replay, or `FPostHogOptions::Replay`) records screenshot replay. About once per `Replay.IntervalMs`, the subsystem copies the game window's back buffer without stalling the game thread. A worker thread then scales the frame to `Replay.MaxDimension` and encodes it as a JPEG at `Replay.JpegQuality`. Each frame is one `$snapshot` event that the PostHog player shows as a mobile-style screenshot replay. Recording also requires the server's `session_recording` config, consent, and an active session. It pauses while the application is in the background.
 
 This is a proof of concept. Frames are not masked, so everything on screen is sent. It is desktop only and has been run once on macOS arm64; nothing else is validated. In the editor, frames show the whole editor window, so use `-game` builds. See [implementation status](docs/implementation-status.md) for the limitations.

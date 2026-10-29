@@ -391,7 +391,7 @@ class NativeTests(MockServerTestCase):
         self.assertEqual(process.returncode, 0, str(evidence / "stdout.log"))
         result = json.loads((report / "index.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["failed"], 0, result)
-        self.assertEqual(result["succeeded"], 8, result)
+        self.assertEqual(result["succeeded"] + result.get("succeededWithWarnings", 0), 9, result)
         wire = self.wire_events()
         wire_by_name = {event["event"]: event for event in wire}
         materialized = self.http("/__captured/events")

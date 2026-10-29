@@ -2,6 +2,7 @@
 #include "PostHogClient.h"
 #include "PostHogFlagCache.h"
 #include "PostHogJson.h"
+#include "PostHogSettings.h"
 #include "Async/Async.h"
 #include "HAL/PlatformMisc.h"
 #include "Misc/AutomationTest.h"
@@ -11,6 +12,11 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogReplayConfigTest, "PostHog.ReplayConfig
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FPostHogReplayConfigTest::RunTest(const FString& Parameters)
 {
+    TestTrue(TEXT("replay defaults to automatic start"), FPostHogReplaySettings().bAutoStart);
+    TestFalse(TEXT("replay requires explicit opt-in"), FPostHogReplaySettings().bEnabled);
+    FPostHogOptions Options;
+    Options.Replay.bAutoStart = false;
+    TestFalse(TEXT("options preserve manual start"), Options.ToNative().Replay.bAutoStart);
     FPostHogFlagCache Cache;
     auto Enabled = PostHogJson::Decode(TEXT(R"({"flags":{},"errors_while_computing":false,"quota_limited":false,"session_recording":{"endpoint":"/s/"}})"));
     TestEqual(TEXT("enabled response"), Cache.Apply(Enabled.ToSharedRef()), EPostHogFlagReloadStatus::Success);
