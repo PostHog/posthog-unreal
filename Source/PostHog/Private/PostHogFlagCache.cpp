@@ -9,6 +9,8 @@ bool ParseRecords(const FJsonObject& Records, TMap<FString, FPostHogFeatureFlagR
     {
         if (Pair.Value->Type != EJson::Object) { return false; }
         const auto Record = Pair.Value->AsObject();
+        bool bFailed = false;
+        if (Record->TryGetBoolField(TEXT("failed"), bFailed) && bFailed) { continue; }
         const auto Value = Record->TryGetField(TEXT("value"));
         if (!Value || (Value->Type != EJson::Boolean && Value->Type != EJson::String)) { return false; }
         FPostHogFeatureFlagResult Flag;
