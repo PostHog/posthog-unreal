@@ -5,5 +5,6 @@ public class PostHogExample : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "PostHog" });
+        PrivateDependencyModuleNames.Add("Json");
     }
 }

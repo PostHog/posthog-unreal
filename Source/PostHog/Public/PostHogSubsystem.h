@@ -1,24 +1,23 @@
 #pragma once
-
 #include "CoreMinimal.h"
 #include "Containers/Ticker.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "PostHogSettings.h"
+#include "PostHogReplayFrame.h"
 #include "PostHogSubsystem.generated.h"
 
 UENUM(BlueprintType)
 enum class EPostHogSubsystemState : uint8 { Idle, Initializing, Ready, ShuttingDown, Failed, Deinitialized };
-
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FPostHogSetupCompleted, bool, bSuccess);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FPostHogShutdownCompleted, bool, bSuccess);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FPostHogFeatureFlagsReloaded, const FPostHogFlagReloadResult&, Result);
-
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FPostHogShutdownCompleted, const FPostHogDrainResult&, Result);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FPostHogFeatureFlagsChanged, const FPostHogFeatureFlagsUpdate&, Update);
 struct FPostHogInitialization;
 struct FPostHogLifecycleSignals;
+class FPostHogReplayRecorder;
 class FPostHogAnalyticsProvider;
 class IAnalyticsProvider;
 
-/** One client per game instance. All UObject entry points run on the game thread. */
+/** One native client per game instance. All UObject entry points run on the game thread. */
 UCLASS()
 class POSTHOG_API UPostHogSubsystem : public UGameInstanceSubsystem
 {
@@ -26,59 +25,71 @@ class POSTHOG_API UPostHogSubsystem : public UGameInstanceSubsystem
 public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
-
-    /** Begins asynchronous setup. False means rejected; completion is a separate event.
-     * Active/initializing/stopping clients must finish shutdown before setup again. */
+    /** Starts asynchronous local initialization, not a network readiness check.
+     * OnSetupCompleted means a native instance exists; inspect IsDisabled separately. */
     UFUNCTION(BlueprintCallable, Category = "PostHog")
     bool Setup(const FPostHogOptions& Options);
-    /** C++ setup supports BeforeSend and custom plain-data context. Storage defaults
-     * to Saved/PostHog; environment/PIE namespacing applies even with a custom root. */
+    /** Uses Saved/PostHogStateful by default and adds runtime/editor/PIE namespace inputs. */
     bool SetupWithConfig(FPostHogConfig Config, bool bEnableInEditor = false, bool bEnableOnDedicatedServer = false);
     UFUNCTION(BlueprintCallable, Category = "PostHog")
     void Shutdown();
     UFUNCTION(BlueprintPure, Category = "PostHog")
     bool IsInitialized() const;
     UFUNCTION(BlueprintPure, Category = "PostHog")
+    bool IsDisabled() const;
+    UFUNCTION(BlueprintPure, Category = "PostHog")
     EPostHogSubsystemState GetState() const { return State; }
-
-    /** Returns queue admission, not a delivery receipt. Not-ready instances return Closed. */
     UFUNCTION(BlueprintCallable, Category = "PostHog", meta = (AutoCreateRefTerm = "Properties"))
-    EPostHogCaptureResult Capture(const FString& Event, const FPostHogProperties& Properties);
-    /** Updates local identity without waiting for the resulting flag refresh.
-     * False includes rejected calls and duplicate identifies with no changes. */
+    EPostHogResult Capture(const FString& Event, const FPostHogProperties& Properties);
+    /** Ok means SDK invocation, including SDK no-op cases such as duplicate identify. */
     UFUNCTION(BlueprintCallable, Category = "PostHog", meta = (AutoCreateRefTerm = "Set,SetOnce"))
-    bool Identify(const FString& DistinctId, const FPostHogProperties& Set, const FPostHogProperties& SetOnce);
-    /** Reads the cache only. Missing differs from false; optionally records an exposure. */
+    EPostHogResult Identify(const FString& DistinctId, const FPostHogProperties& Set, const FPostHogProperties& SetOnce);
+    UFUNCTION(BlueprintCallable, Category = "PostHog")
+    EPostHogResult Reset();
+    UFUNCTION(BlueprintCallable, Category = "PostHog")
+    EPostHogResult OptIn();
+    UFUNCTION(BlueprintCallable, Category = "PostHog")
+    EPostHogResult OptOut();
     UFUNCTION(BlueprintCallable, Category = "PostHog|Feature Flags")
-    FPostHogFeatureFlagResult GetFeatureFlag(const FString& Key, bool bSendEvent = true);
-    /** Starts a refresh; bind OnFeatureFlagsReloaded first. False means not ready.
-     * Calls while a refresh is pending share one completion. Shutdown cancels notification. */
+    FPostHogFeatureFlagResult GetFeatureFlag(const FString& Key, EPostHogFlagReporting Reporting = EPostHogFlagReporting::Default);
     UFUNCTION(BlueprintCallable, Category = "PostHog|Feature Flags")
-    bool ReloadFeatureFlags();
-
-    /** Explicit reload completion on the game thread, not an automatic flag-change event. */
+    FPostHogFeatureFlags GetFeatureFlags() const;
+    /** Requests a refresh without returning a request-correlated future. */
+    UFUNCTION(BlueprintCallable, Category = "PostHog|Feature Flags")
+    EPostHogResult ReloadFeatureFlags();
+    /** Automatic/restored/manual SDK updates, coalesced and delivered on the game thread. */
     UPROPERTY(BlueprintAssignable, Category = "PostHog|Feature Flags")
-    FPostHogFeatureFlagsReloaded OnFeatureFlagsReloaded;
+    FPostHogFeatureFlagsChanged OnFeatureFlagsChanged;
+    UFUNCTION(BlueprintCallable, Category = "PostHog|Session Replay")
+    EPostHogResult StartSessionReplay();
+    UFUNCTION(BlueprintCallable, Category = "PostHog|Session Replay")
+    EPostHogResult StopSessionReplay();
+    UFUNCTION(BlueprintPure, Category = "PostHog|Session Replay")
+    bool IsSessionReplayActive() const;
+    /** Reserve immediately before acquiring prepared pixels; inactive includes SDK capacity/policy refusal. */
+    UFUNCTION(BlueprintCallable, Category = "PostHog|Session Replay")
+    EPostHogResult BeginReplayFrame(int32 Width, int32 Height, int32 RowStrideBytes, UPostHogReplayFrame*& Frame);
 
-    /** Same adapter for this initialized client; null while not ready. Game thread only. */
+    /** Stable adapter for this initialized client. World lookup and binding are game-thread-only. */
     TSharedPtr<IAnalyticsProvider> GetAnalyticsProvider();
-
-    /** Designates this initialized instance for Unreal's world-less Analytics API.
-     * Returns false if another live instance is bound. Does not change engine INI configuration. */
     UFUNCTION(BlueprintCallable, Category = "PostHog|Analytics")
     bool BindAnalyticsProvider();
-    /** Releases only this instance's designation; existing adapter pointers remain instance-bound. */
     UFUNCTION(BlueprintCallable, Category = "PostHog|Analytics")
     void UnbindAnalyticsProvider();
-
-    /** Native callers may retain the shared pointer, but teardown still closes it. */
     FPostHogClient::FPtr GetClient() const;
+#if WITH_DEV_AUTOMATION_TESTS
+    bool IsWaitingForPredecessorForTests() const;
+    TWeakPtr<FPostHogInitialization, ESPMode::ThreadSafe> GetInitializationForTests() const;
+    static void RetireClosedInitializationOwnersForTests();
+#endif
     UPROPERTY(BlueprintAssignable, Category = "PostHog")
     FPostHogSetupCompleted OnSetupCompleted;
     UPROPERTY(BlueprintAssignable, Category = "PostHog")
     FPostHogShutdownCompleted OnShutdownCompleted;
-
 private:
+    friend class FPostHogModule;
+    /** Module teardown, after all tracked initialization/native/host work has joined. */
+    static void RetireInitializationOwners();
     bool Tick(float DeltaTime);
     void StartObserving();
     void StopObserving();
@@ -87,12 +98,14 @@ private:
     void EnsureTicker();
     EPostHogSubsystemState State = EPostHogSubsystemState::Idle;
     bool bForeground = true;
+    bool bCaptureApplicationLifecycleEvents = true;
+    FPostHogReplaySettings ReplaySettings;
+    TSharedPtr<FPostHogReplayRecorder, ESPMode::ThreadSafe> Recorder;
     FPostHogClient::FPtr Client;
     TSharedPtr<FPostHogAnalyticsProvider> AnalyticsProvider;
     TSharedPtr<FPostHogInitialization, ESPMode::ThreadSafe> Initialization;
     TSharedPtr<FPostHogLifecycleSignals, ESPMode::ThreadSafe> Signals;
-    TSharedFuture<bool> Closing;
-    TSharedFuture<FPostHogFlagReloadResult> FlagReload;
+    TSharedFuture<FPostHogDrainResult> Closing;
     FTSTicker::FDelegateHandle TickerHandle;
     FDelegateHandle BackgroundHandle, ForegroundHandle, DeactivateHandle, ReactivateHandle, SlateHandle, ExitHandle;
 };

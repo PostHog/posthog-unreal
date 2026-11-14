@@ -1,0 +1,146 @@
+name: SDK tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      unreal:
+        description: Build the Unreal fixture and validate prepared-pixel replay (requires engine archives)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tooling:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r Tests/requirements.txt
+      - run: python -m unittest discover -s Tests -p "test_*.py" -v
+      - name: Report native CI prerequisites
+        shell: bash
+        env:
+          MOCK_SHA: ${{ vars.SDK_MOCK_ARCHIVE_SHA256 }}
+        run: |
+          if [[ -z "$MOCK_SHA" ]]; then
+            echo 'Native/Unreal validation is pending: configure the maintained mock artifact.' >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            echo 'Native/Unreal validation uses protected artifacts; run it on a trusted ref with workflow_dispatch.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  native:
+    # Protected engine/mock assets are never exposed to pull-request code.
+    if: github.event_name != 'pull_request' && vars.SDK_MOCK_ARCHIVE_SHA256 != ''
+    environment: sdk-ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            library: libposthog_unreal_ffi.so
+            editor: Engine/Binaries/Linux/UnrealEditor
+            engine_url: UE_LINUX_ARCHIVE_URL
+            engine_sha: UE_LINUX_ARCHIVE_SHA256
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            library: posthog_unreal_ffi.dll
+            editor: Engine/Binaries/Win64/UnrealEditor.exe
+            engine_url: UE_WINDOWS_ARCHIVE_URL
+            engine_sha: UE_WINDOWS_ARCHIVE_SHA256
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: 1.96.1
+      UE_ROOT: ${{ github.workspace }}/.ci/UnrealEngine
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: Configure read-only SSH access for the pinned Rust dependency
+        shell: bash
+        env:
+          SDK_GIT_SSH_KEY: ${{ secrets.SDK_GIT_SSH_KEY }}
+          SDK_GIT_KNOWN_HOSTS: ${{ vars.SDK_GIT_KNOWN_HOSTS }}
+        run: |
+          test -n "$SDK_GIT_SSH_KEY" && test -n "$SDK_GIT_KNOWN_HOSTS"
+          umask 077
+          printf '%s\n' "$SDK_GIT_SSH_KEY" > "$RUNNER_TEMP/sdk-git-key"
+          printf '%s\n' "$SDK_GIT_KNOWN_HOSTS" > "$RUNNER_TEMP/sdk-git-known-hosts"
+          printf "GIT_SSH_COMMAND=ssh -i '%s' -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='%s'\n" "$RUNNER_TEMP/sdk-git-key" "$RUNNER_TEMP/sdk-git-known-hosts" >> "$GITHUB_ENV"
+      - name: Restore maintained mock server
+        env:
+          CI_ARCHIVE_URL: ${{ secrets.SDK_MOCK_ARCHIVE_URL }}
+          CI_ARCHIVE_SHA256: ${{ vars.SDK_MOCK_ARCHIVE_SHA256 }}
+        run: python scripts/restore-ci-archive.py "${{ runner.temp }}/sdk-mock-server"
+      - run: rustup toolchain install 1.96.1 --profile minimal
+      - run: python -m pip install -r Tests/requirements.txt
+      - name: Build native library and run bridge tests
+        run: python scripts/build-native.py ${{ matrix.target }} --test
+      - name: Native wire and lifecycle tests
+        run: >-
+          python Tests/native_integration.py
+          --library "${{ github.workspace }}/rust/target/${{ matrix.target }}/release/${{ matrix.library }}"
+          --mock-server "${{ runner.temp }}/sdk-mock-server/server.py"
+      - name: Restore authorized UE 5.8 installed build
+        if: inputs.unreal
+        env:
+          CI_ARCHIVE_URL: ${{ secrets[matrix.engine_url] }}
+          CI_ARCHIVE_SHA256: ${{ vars[matrix.engine_sha] }}
+        run: python scripts/restore-ci-archive.py "${{ env.UE_ROOT }}"
+      - name: Install software-rendering prerequisites
+        if: inputs.unreal && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth mesa-vulkan-drivers vulkan-tools libxkbcommon-x11-0 libxcb-cursor0
+          icd=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)
+          test -n "$icd"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+      - name: Compile Unreal runtime and Blueprint automation
+        if: inputs.unreal
+        run: python scripts/build-test-host.py
+      - name: Unreal headless automation and wire assertions
+        if: inputs.unreal
+        run: >-
+          python Tests/native_integration.py
+          --library "${{ github.workspace }}/rust/target/${{ matrix.target }}/release/${{ matrix.library }}"
+          --mock-server "${{ runner.temp }}/sdk-mock-server/server.py"
+          --editor "${{ env.UE_ROOT }}/${{ matrix.editor }}"
+      - name: Validate synthetic prepared screenshots in the engine fixture
+        if: inputs.unreal
+        run: >-
+          python Tests/replay_smoke.py
+          --editor "${{ env.UE_ROOT }}/${{ matrix.editor }}"
+          --mock-server "${{ runner.temp }}/sdk-mock-server/server.py"
+          --renderer software
+      - name: Upload test evidence (not engine files)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-evidence-${{ matrix.os }}
+          path: |
+            artifacts/editor-integration/
+            artifacts/replay-smoke/
+            Source/ThirdParty/PostHogRust/lib/*/manifest.json
+          retention-days: 7
+          if-no-files-found: ignore
