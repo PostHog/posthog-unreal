@@ -1,0 +1,25 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.8",
+  "Category": "Tests",
+  "Description": "PostHog SDK automation and rendered replay smoke fixture",
+  "Modules": [
+    {
+      "Name": "PostHogTestHost",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    { "Name": "AnalyticsBlueprintLibrary", "Enabled": true },
+    { "Name": "AnalyticsMulticast", "Enabled": true },
+    {
+      "Name": "PostHog",
+      "Enabled": true
+    },
+    {
+      "Name": "AndroidFileServer",
+      "Enabled": false
+    }
+  ]
+}

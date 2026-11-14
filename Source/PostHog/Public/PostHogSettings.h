@@ -29,6 +29,9 @@ struct POSTHOG_API FPostHogOptions
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Lifecycle")
     EPostHogSessionMode SessionMode = EPostHogSessionMode::Automatic;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Lifecycle")
+    bool bPersistSessions = false;
+    /** Capture Application Opened and Application Backgrounded from engine lifecycle signals. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Lifecycle")
     bool bCaptureApplicationLifecycleEvents = true;
     /** Empty uses Project Settings / Description / Project Version. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Application")
@@ -52,6 +55,8 @@ struct POSTHOG_API FPostHogOptions
     int32 RequestTimeoutSeconds = 10;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Delivery", meta = (ClampMin = "1"))
     int32 ShutdownTimeoutMilliseconds = 3000;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay")
+    FPostHogReplaySettings Replay;
 
     FPostHogConfig ToNative() const;
 };

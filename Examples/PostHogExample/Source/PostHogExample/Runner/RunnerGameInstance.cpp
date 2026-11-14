@@ -49,7 +49,10 @@ void URunnerGameInstance::SetupCompleted(bool bSuccess)
 bool URunnerGameInstance::UseHardMode() const
 {
     if (auto Client = PostHog->GetClient())
-        return Client->IsFeatureEnabled(TEXT("runner-hard-mode"), true, false);
+    {
+        const auto Flag = Client->GetFeatureFlagResult(TEXT("runner-hard-mode"));
+        return Flag.Status == EPostHogResult::Ok && Flag.bFound && Flag.bEnabled;
+    }
     return false;
 }
 

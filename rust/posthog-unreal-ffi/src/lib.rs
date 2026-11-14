@@ -1,575 +1,645 @@
-//! C ABI for the PostHog Unreal native integration.
-//! The upstream worker owns delivery. This bridge does not add a second queue.
+//! ABI v3: marshaling and lifetimes over the public stateful SDK.
+mod abi;
+mod flags;
+mod handles;
+mod hooks;
 
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::fmt::Write as _;
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use posthog_rs::embedding::{EmbeddingOptions, EnqueueResult, FileEventStore};
-use posthog_rs::{Client, ClientOptionsBuilder, EvaluateFlagsOptions, Event};
+use posthog_rs::stateful::{
+    self, CaptureOutcome, DeliveryOutcome, DrainReport, PersistenceOutcome, SubmitOutcome,
+};
 use serde::Deserialize;
-#[cfg(test)]
-use serde_json::json;
-use serde_json::{Map, Value};
+use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
 use uuid::Uuid;
 
-const ABI_VERSION: u32 = 1;
-const MAX_INPUT: usize = 1024 * 1024;
-const MAX_OUTPUT: usize = 4 * 1024 * 1024;
-
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Status {
-    Ok = 0,
-    /// Accepted into the bounded memory queue. Checkpoint reports disk errors.
-    Accepted = 1,
-    InvalidInput = 2,
-    Closed = 3,
-    RequestFailed = 4,
-    InternalError = 5,
-    UnsupportedAbi = 6,
-    Disabled = 7,
-    QueueFull = 8,
-    StorageError = 9,
-}
-
-type Result<T> = std::result::Result<T, Status>;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Bytes {
-    pub data: *const u8,
-    pub len: usize,
-}
-
-#[repr(C)]
-pub struct Buffer {
-    pub data: *mut u8,
-    pub len: usize,
-}
-
-impl Buffer {
-    fn empty() -> Self {
-        Self {
-            data: std::ptr::null_mut(),
-            len: 0,
-        }
-    }
-}
+use abi::{clear, contain, output, parse, Result, ABI_VERSION};
+pub use abi::{phu_abi_version, phu_buffer_copy, phu_buffer_free, Buffer, Bytes, Status};
+pub use hooks::Hooks;
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct Options {
     project_token: String,
     host: String,
-    storage_path: String,
-    #[serde(default)]
-    opted_out: bool,
-    #[serde(default = "default_request_timeout")]
-    request_timeout_seconds: u64,
-    #[serde(default = "default_shutdown_timeout")]
-    shutdown_timeout_ms: u64,
-    #[serde(default = "default_flush_at")]
+    storage_root: Option<String>,
+    instance_name: String,
+    disabled: bool,
+    opt_out: bool,
+    person_profiles: Profiles,
+    session_mode: Sessions,
+    persist_sessions: bool,
+    preload_feature_flags: bool,
+    send_feature_flag_event: bool,
+    platform_context: HashMap<String, Value>,
     flush_at: usize,
-    #[serde(default = "default_flush_interval")]
     flush_interval_ms: u64,
-    #[serde(default = "default_queue_size")]
     max_queue_size: usize,
-    #[serde(default = "default_batch_size")]
     max_batch_size: usize,
+    request_timeout_seconds: u64,
+    shutdown_timeout_ms: u64,
+    jpeg_quality: u8,
+    max_frames_in_flight: usize,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Profiles {
+    Never,
+    #[default]
+    IdentifiedOnly,
+    Always,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Sessions {
+    #[default]
+    Automatic,
+    Manual,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            project_token: String::new(),
+            host: posthog_rs::DEFAULT_HOST.into(),
+            storage_root: None,
+            instance_name: "default".into(),
+            disabled: false,
+            opt_out: false,
+            person_profiles: Profiles::default(),
+            session_mode: Sessions::default(),
+            persist_sessions: false,
+            preload_feature_flags: true,
+            send_feature_flag_event: true,
+            platform_context: HashMap::new(),
+            flush_at: 20,
+            flush_interval_ms: 30000,
+            max_queue_size: 1000,
+            max_batch_size: 50,
+            request_timeout_seconds: 10,
+            shutdown_timeout_ms: 3000,
+            jpeg_quality: 65,
+            max_frames_in_flight: 2,
+        }
+    }
+}
+impl Options {
+    fn config(self) -> stateful::Config {
+        let mut config = stateful::Config::new(self.project_token);
+        config.host = self.host;
+        config.persistence = self
+            .storage_root
+            .map_or(stateful::Persistence::Memory, |root| {
+                stateful::Persistence::Directory(root.into())
+            });
+        config.instance_name = self.instance_name;
+        config.disabled = self.disabled;
+        config.opt_out = self.opt_out;
+        config.person_profiles = match self.person_profiles {
+            Profiles::Never => stateful::PersonProfiles::Never,
+            Profiles::IdentifiedOnly => stateful::PersonProfiles::IdentifiedOnly,
+            Profiles::Always => stateful::PersonProfiles::Always,
+        };
+        config.session_mode = match self.session_mode {
+            Sessions::Automatic => stateful::SessionMode::Automatic,
+            Sessions::Manual => stateful::SessionMode::Manual,
+        };
+        config.session_persistence = if self.persist_sessions {
+            stateful::SessionPersistence::Persistent
+        } else {
+            stateful::SessionPersistence::Memory
+        };
+        config.preload_feature_flags = self.preload_feature_flags;
+        config.send_feature_flag_event = self.send_feature_flag_event;
+        config.platform_context = self.platform_context;
+        config.flush_at = self.flush_at;
+        config.flush_interval = Duration::from_millis(self.flush_interval_ms);
+        config.max_queue_size = self.max_queue_size;
+        config.max_batch_size = self.max_batch_size;
+        config.request_timeout_seconds = self.request_timeout_seconds;
+        config.shutdown_timeout = Duration::from_millis(self.shutdown_timeout_ms);
+        config.session_replay.jpeg_quality = self.jpeg_quality;
+        config.session_replay.max_frames_in_flight = self.max_frames_in_flight;
+        config.sdk_name = "posthog-unreal".into();
+        config.sdk_version = env!("CARGO_PKG_VERSION").into();
+        config
+    }
 }
 
-fn default_request_timeout() -> u64 {
-    10
+/// # Safety
+/// Input readable, output writable/disjoint. Pure coordination lookup: no client or I/O.
+#[no_mangle]
+pub unsafe extern "C" fn phu_coordination_key(input: Bytes, out: *mut Buffer) -> Status {
+    contain(|| {
+        unsafe {
+            clear(out)?;
+        }
+        let options: Options = unsafe { parse(input)? };
+        // Match Config's input normalization; endpoint aliases remain SDK-owned.
+        let host = options.host.trim();
+        let host = posthog_rs::EndpointManager::determine_server_host(if host.is_empty() {
+            posthog_rs::DEFAULT_HOST
+        } else {
+            host
+        });
+        // An unambiguous opaque host/token/instance key, not a storage namespace/path.
+        let fields = [
+            host.as_str(),
+            options.project_token.trim(),
+            options.instance_name.as_str(),
+        ];
+        let mut key = String::with_capacity(40);
+        for byte in Sha1::digest(abi::encode(&fields, abi::MAX_INPUT)?).iter() {
+            write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        unsafe {
+            output(out, &key)?;
+        }
+        Ok(Status::Ok)
+    })
 }
-fn default_shutdown_timeout() -> u64 {
-    3000
-}
-fn default_flush_at() -> usize {
-    20
-}
-fn default_flush_interval() -> u64 {
-    30_000
-}
-fn default_queue_size() -> usize {
-    1000
-}
-fn default_batch_size() -> usize {
-    50
+
+/// # Safety
+/// All bytes are readable, outputs writable/disjoint, and hooks follow the header lifetime contract.
+#[no_mangle]
+pub unsafe extern "C" fn phu_create(
+    version: u32,
+    options: Bytes,
+    hooks: Hooks,
+    out: *mut u64,
+) -> Status {
+    contain(|| {
+        if out.is_null() {
+            return Err(Status::InvalidInput);
+        }
+        unsafe {
+            *out = 0;
+        }
+        if version != ABI_VERSION {
+            return Err(Status::UnsupportedAbi);
+        }
+        let options: Options = unsafe { parse(options)? };
+        let mut config = options.config();
+        let timeout = config.shutdown_timeout.min(Duration::from_secs(86400));
+        let scope = Arc::new(hooks::CallbackScope);
+        hooks::install(&mut config, hooks, scope.clone());
+        let mailbox = Arc::new(flags::Mailbox::default());
+        let entry = Arc::new(handles::Entry::new(
+            stateful::Client::init_blocking(config),
+            mailbox,
+            scope,
+            timeout,
+        ));
+        let id = {
+            let mut registry = handles::registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let id = registry.next()?;
+            registry.clients.insert(id, entry);
+            id
+        };
+        unsafe {
+            *out = id;
+        }
+        Ok(Status::Ok)
+    })
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Capture {
     event: String,
-    distinct_id: String,
-    uuid: Uuid,
-    timestamp: DateTime<Utc>,
     #[serde(default)]
-    properties: Map<String, Value>,
+    fallback_properties: HashMap<String, Value>,
+    #[serde(default)]
+    properties: HashMap<String, Value>,
+    #[serde(default)]
+    options: HashMap<String, Value>,
+    #[serde(default)]
+    groups: HashMap<String, String>,
+    timestamp: Option<DateTime<Utc>>,
+    uuid: Option<Uuid>,
+}
+fn captured(result: CaptureOutcome, out: *mut Buffer) -> Result<Status> {
+    use CaptureOutcome::*;
+    Ok(match result {
+        Accepted { uuid } => {
+            unsafe {
+                output(out, &json!({"uuid":uuid}))?;
+            }
+            Status::Accepted
+        }
+        Disabled => Status::Disabled,
+        OptedOut => Status::OptedOut,
+        Closed => Status::Closed,
+        Invalid => Status::InvalidInput,
+        Dropped => Status::Dropped,
+        Reentrant => Status::Reentrant,
+        Full => Status::Full,
+        _ => Status::InternalError,
+    })
+}
+/// # Safety
+/// Input readable and output writable/disjoint. Returned receipt is owned by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn phu_capture(handle: u64, input: Bytes, out: *mut Buffer) -> Status {
+    contain(|| {
+        unsafe {
+            clear(out)?;
+        }
+        let call = handles::acquire(handle)?;
+        let input: Capture = unsafe { parse(input)? };
+        let mut capture = stateful::Capture::new(input.event);
+        capture.properties = input.properties;
+        capture.fallback_properties = input.fallback_properties;
+        capture.options = input.options;
+        capture.groups = input.groups;
+        capture.timestamp = input.timestamp;
+        capture.uuid = input.uuid;
+        captured(call.0.client.capture(capture), out)
+    })
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Screen {
+    name: String,
+    #[serde(default)]
+    properties: HashMap<String, Value>,
+}
+/// # Safety
+/// Same pointer/ownership contract as phu_capture.
+#[no_mangle]
+pub unsafe extern "C" fn phu_screen(handle: u64, input: Bytes, out: *mut Buffer) -> Status {
+    contain(|| {
+        unsafe {
+            clear(out)?;
+        }
+        let call = handles::acquire(handle)?;
+        let input: Screen = unsafe { parse(input)? };
+        captured(call.0.client.screen(input.name, input.properties), out)
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum Command {
+    Identify {
+        distinct_id: String,
+        #[serde(default)]
+        set: HashMap<String, Value>,
+        #[serde(default)]
+        set_once: HashMap<String, Value>,
+    },
+    Reset {},
+    Alias {
+        alias: String,
+    },
+    Register {
+        properties: HashMap<String, Value>,
+    },
+    Unregister {
+        key: String,
+    },
+    SetPersonProperties {
+        set: HashMap<String, Value>,
+        #[serde(default)]
+        set_once: HashMap<String, Value>,
+    },
+    Group {
+        group_type: String,
+        group_key: String,
+        properties: Option<HashMap<String, Value>>,
+    },
+    GroupIdentify {
+        group_type: String,
+        group_key: String,
+        properties: HashMap<String, Value>,
+    },
+    RemoveGroup {
+        group_type: String,
+    },
+    OptIn {},
+    OptOut {},
+    StartSession {},
+    EndSession {},
+    ResetSession {},
+    SessionActivity {},
+    SetAppInBackground {
+        background: bool,
+    },
+    ReloadFeatureFlags {},
+    SetPersonPropertiesForFlags {
+        properties: HashMap<String, Value>,
+        reload: Option<bool>,
+    },
+    ResetPersonPropertiesForFlags {
+        reload: Option<bool>,
+    },
+    SetGroupPropertiesForFlags {
+        group_type: String,
+        properties: HashMap<String, Value>,
+        reload: Option<bool>,
+    },
+    ResetGroupPropertiesForFlags {
+        group_type: Option<String>,
+        reload: Option<bool>,
+    },
+    ReplayStart {},
+    ReplayStop {},
+}
+/// # Safety
+/// Input readable for its length. OK means invocation, not mutation/admission/durability confirmation.
+#[no_mangle]
+pub unsafe extern "C" fn phu_command(handle: u64, input: Bytes) -> Status {
+    contain(|| {
+        let call = handles::acquire(handle)?;
+        let command: Command = unsafe { parse(input)? };
+        let client = &call.0.client;
+        use Command::*;
+        match command {
+            Identify {
+                distinct_id,
+                set,
+                set_once,
+            } => {
+                let mut id = stateful::Identify::new(distinct_id);
+                id.set = set;
+                id.set_once = set_once;
+                client.identify(id);
+            }
+            Reset {} => client.reset(),
+            Alias { alias } => client.alias(alias),
+            Register { properties } => client.register(properties),
+            Unregister { key } => client.unregister(&key),
+            SetPersonProperties { set, set_once } => client.set_person_properties(set, set_once),
+            Group {
+                group_type,
+                group_key,
+                properties,
+            } => client.group(group_type, group_key, properties),
+            GroupIdentify {
+                group_type,
+                group_key,
+                properties,
+            } => client.group_identify(group_type, group_key, properties),
+            RemoveGroup { group_type } => client.remove_group(&group_type),
+            OptIn {} => client.opt_in(),
+            OptOut {} => client.opt_out(),
+            StartSession {} => client.start_session(),
+            EndSession {} => client.end_session(),
+            ResetSession {} => client.reset_session(),
+            SessionActivity {} => client.session_activity(),
+            SetAppInBackground { background } => client.set_app_in_background(background),
+            ReloadFeatureFlags {} => client.reload_feature_flags(),
+            SetPersonPropertiesForFlags { properties, reload } => {
+                client.set_person_properties_for_flags(properties, reload)
+            }
+            ResetPersonPropertiesForFlags { reload } => {
+                client.reset_person_properties_for_flags(reload)
+            }
+            SetGroupPropertiesForFlags {
+                group_type,
+                properties,
+                reload,
+            } => client.set_group_properties_for_flags(group_type, properties, reload),
+            ResetGroupPropertiesForFlags { group_type, reload } => {
+                client.reset_group_properties_for_flags(group_type.as_deref(), reload)
+            }
+            ReplayStart {} => client.session_replay().start(),
+            ReplayStop {} => client.session_replay().stop(),
+        }
+        Ok(Status::Ok)
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum Read {
+    State {},
+    SessionId {},
+    PeekSessionId {},
+    FeatureFlag {
+        key: String,
+        send_event: Option<bool>,
+    },
+    FeatureFlags {},
+    ReplayActive {},
+}
+/// # Safety
+/// Input readable and output writable/disjoint. JSON null denotes an unavailable result.
+#[no_mangle]
+pub unsafe extern "C" fn phu_read(handle: u64, input: Bytes, out: *mut Buffer) -> Status {
+    contain(|| {
+        unsafe {
+            clear(out)?;
+        }
+        let call = handles::acquire(handle)?;
+        let query: Read = unsafe { parse(input)? };
+        let client = &call.0.client;
+        let value = match query {
+            Read::State {} => {
+                json!({"disabled":client.is_disabled(),"identified":client.is_identified(),
+                "opt_out":client.is_opt_out(),"anonymous_id":client.get_anonymous_id(),"distinct_id":client.get_distinct_id()})
+            }
+            Read::SessionId {} => json!(client.session_id()),
+            Read::PeekSessionId {} => json!(client.peek_session_id()),
+            Read::FeatureFlag { key, send_event } => {
+                let lookup = client.feature_flag(&key);
+                let lookup = if let Some(send) = send_event {
+                    lookup.send_event(send)
+                } else {
+                    lookup
+                };
+                unsafe {
+                    output(out, &lookup.get().as_ref().map(flags::flag))?;
+                }
+                return Ok(Status::Ok);
+            }
+            Read::FeatureFlags {} => {
+                unsafe {
+                    output(
+                        out,
+                        &client.get_feature_flags().as_ref().map(flags::FlagMap),
+                    )?;
+                }
+                return Ok(Status::Ok);
+            }
+            Read::ReplayActive {} => json!(client.session_replay().is_active()),
+        };
+        unsafe {
+            output(out, &value)?;
+        }
+        Ok(Status::Ok)
+    })
+}
+/// # Safety
+/// Output writable. Takes the latest coalesced notification; Inactive means no unread update.
+#[no_mangle]
+pub unsafe extern "C" fn phu_poll_flags(handle: u64, out: *mut Buffer) -> Status {
+    contain(|| {
+        unsafe {
+            clear(out)?;
+        }
+        let call = handles::acquire(handle)?;
+        match call.0.mailbox.take() {
+            Some(bytes) => {
+                unsafe {
+                    *out = Buffer::new(bytes?);
+                }
+                Ok(Status::Ok)
+            }
+            None => Ok(Status::Inactive),
+        }
+    })
+}
+fn drain(report: DrainReport) -> Value {
+    use DeliveryOutcome as D;
+    use PersistenceOutcome as P;
+    let state = match report.state {
+        P::Persisted => "persisted",
+        P::MemoryOnly => "memory_only",
+        P::Unavailable => "unavailable",
+        P::WriteFailed => "write_failed",
+        P::TimedOut => "timed_out",
+        P::Deferred => "deferred",
+        P::Disabled => "disabled",
+        P::NotRequested => "not_requested",
+        _ => "unknown",
+    };
+    let delivery = match report.delivery {
+        D::Attempted => "attempted",
+        D::Stopped => "stopped",
+        D::Unavailable => "unavailable",
+        D::Closed => "closed",
+        D::Deferred => "deferred",
+        D::Disabled => "disabled",
+        _ => "unknown",
+    };
+    json!({"state":state,"delivery":delivery})
+}
+/// # Safety
+/// Output writable. Blocking, except SDK callback-origin calls return a Deferred report.
+#[no_mangle]
+pub unsafe extern "C" fn phu_flush(handle: u64, out: *mut Buffer) -> Status {
+    contain(|| {
+        unsafe {
+            clear(out)?;
+        }
+        let call = handles::acquire(handle)?;
+        unsafe {
+            output(out, &drain(call.0.client.flush_blocking()))?;
+        }
+        Ok(Status::Ok)
+    })
+}
+#[no_mangle]
+pub extern "C" fn phu_begin_shutdown(handle: u64) -> Status {
+    contain(|| {
+        handles::begin(handle)?;
+        Ok(Status::Ok)
+    })
+}
+/// # Safety
+/// Output writable. Deferred means callback-origin: finish from outside the callback before unload.
+#[no_mangle]
+pub unsafe extern "C" fn phu_close(handle: u64, out: *mut Buffer) -> Status {
+    contain(|| {
+        unsafe {
+            clear(out)?;
+        }
+        let entry = handles::begin(handle)?;
+        let report = entry.finish()?;
+        // Core joins and admitted ABI calls have finished. Release the registry's ownership.
+        let removed = handles::registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clients
+            .remove(&handle);
+        drop(removed);
+        unsafe {
+            output(out, &drain(report))?;
+        }
+        Ok(Status::Ok)
+    })
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FlagContext {
-    distinct_id: String,
-    groups: Option<HashMap<String, String>>,
-    person_properties: Option<HashMap<String, Value>>,
-    group_properties: Option<HashMap<String, HashMap<String, Value>>>,
+struct Layout {
+    width: u32,
+    height: u32,
+    row_stride_bytes: usize,
 }
-
-#[derive(Default)]
-struct Calls {
-    active: usize,
-    closed: bool,
-    opted_out: bool,
-    generation: u64,
-}
-
-struct Entry {
-    client: Client,
-    calls: Mutex<Calls>,
-    idle: Condvar,
-}
-
-#[derive(Default)]
-struct Registry {
-    next: u64,
-    clients: HashMap<u64, Arc<Entry>>,
-}
-
-fn registry() -> &'static Mutex<Registry> {
-    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
-}
-
-struct Call(Arc<Entry>);
-
-impl Drop for Call {
-    fn drop(&mut self) {
-        // Drop must not panic while an operation is already unwinding.
-        let mut calls = self.0.calls.lock().unwrap_or_else(|e| e.into_inner());
-        calls.active -= 1;
-        self.0.idle.notify_all();
-    }
-}
-
-fn acquire(handle: u64) -> Result<Call> {
-    let entry = registry()
-        .lock()
-        .map_err(|_| Status::InternalError)?
-        .clients
-        .get(&handle)
-        .cloned()
-        .ok_or(Status::Closed)?;
-    let mut calls = entry.calls.lock().map_err(|_| Status::InternalError)?;
-    if calls.closed {
-        return Err(Status::Closed);
-    }
-    calls.active += 1;
-    drop(calls);
-    Ok(Call(entry))
-}
-
-fn contain(f: impl FnOnce() -> Result<Status>) -> Status {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(Ok(status)) => status,
-        Ok(Err(status)) => status,
-        Err(_) => Status::InternalError,
-    }
-}
-
-// SAFETY: the caller supplies readable bytes for the duration of the call.
-unsafe fn parse<T: serde::de::DeserializeOwned>(bytes: Bytes) -> Result<T> {
-    if bytes.data.is_null() || bytes.len == 0 || bytes.len > MAX_INPUT {
-        return Err(Status::InvalidInput);
-    }
-    let input = unsafe { std::slice::from_raw_parts(bytes.data, bytes.len) };
-    serde_json::from_slice(input).map_err(|_| Status::InvalidInput)
-}
-
-fn buffer(value: Value) -> Result<Buffer> {
-    let bytes = serde_json::to_vec(&value).map_err(|_| Status::InternalError)?;
-    if bytes.len() > MAX_OUTPUT {
-        return Err(Status::RequestFailed);
-    }
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let data = Box::into_raw(boxed) as *mut u8;
-    Ok(Buffer { data, len })
-}
-
-#[no_mangle]
-pub extern "C" fn phu_abi_version() -> u32 {
-    ABI_VERSION
-}
-
 /// # Safety
-/// `options` must reference readable memory; `out_handle` must be writable.
+/// Input readable, out writable. Layout is composited, downscaled, masked, top-down BGRA8888.
 #[no_mangle]
-pub unsafe extern "C" fn phu_create(version: u32, options: Bytes, out_handle: *mut u64) -> Status {
+pub unsafe extern "C" fn phu_begin_frame(handle: u64, layout: Bytes, out: *mut u64) -> Status {
     contain(|| {
-        if out_handle.is_null() {
+        if out.is_null() {
             return Err(Status::InvalidInput);
         }
         unsafe {
-            *out_handle = 0;
+            *out = 0;
         }
-        if version != ABI_VERSION {
-            return Err(Status::UnsupportedAbi);
-        }
-        let options: Options = unsafe { parse(options)? };
-        if options.project_token.trim().is_empty()
-            || options.host.trim().is_empty()
-            || options.request_timeout_seconds == 0
-            || options.request_timeout_seconds > 60
-            || options.shutdown_timeout_ms == 0
-            || options.shutdown_timeout_ms > 60_000
-            || options.flush_at == 0
-            || options.storage_path.trim().is_empty()
-            || options.max_batch_size == 0
-            || options.max_queue_size == 0
-            || options.max_queue_size > 100_000
-            || options.max_batch_size > options.max_queue_size
-            || options.flush_at > options.max_queue_size
-            || options.flush_interval_ms == 0
-            || options.flush_interval_ms > 86_400_000
-        {
-            return Err(Status::InvalidInput);
-        }
-        let opted_out = options.opted_out;
-        let store = Arc::new(
-            FileEventStore::open(&options.storage_path).map_err(|_| Status::StorageError)?,
-        );
-        let options = ClientOptionsBuilder::default()
-            .embedding(EmbeddingOptions {
-                store,
-                sdk_name: "posthog-unreal".into(),
-                sdk_version: env!("CARGO_PKG_VERSION").into(),
-                enabled: !opted_out,
-            })
-            .api_key(options.project_token)
-            .host(options.host)
-            .is_server(false)
-            .request_timeout_seconds(options.request_timeout_seconds)
-            .feature_flags_request_timeout_seconds(options.request_timeout_seconds)
-            .feature_flags_request_max_retries(0u32)
-            .shutdown_timeout_ms(options.shutdown_timeout_ms)
-            .flush_at(options.flush_at)
-            .flush_interval_ms(options.flush_interval_ms)
-            .max_queue_size(options.max_queue_size)
-            .max_batch_size(options.max_batch_size)
-            .build()
-            .map_err(|_| Status::InvalidInput)?;
-        let entry = Arc::new(Entry {
-            client: posthog_rs::client(options),
-            calls: Mutex::new(Calls {
-                opted_out,
-                ..Calls::default()
-            }),
-            idle: Condvar::new(),
-        });
-        let mut registry = registry().lock().map_err(|_| Status::InternalError)?;
-        let handle = registry.next.checked_add(1).ok_or(Status::InternalError)?;
-        registry.next = handle;
-        registry.clients.insert(handle, entry);
-        unsafe {
-            *out_handle = handle;
-        }
-        Ok(Status::Ok)
-    })
-}
-
-/// # Safety
-/// `event` must reference readable memory for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn phu_capture(handle: u64, event: Bytes) -> Status {
-    contain(|| {
-        let call = acquire(handle)?;
-        {
-            let calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-            if calls.closed {
-                return Err(Status::Closed);
-            }
-            if calls.opted_out {
-                return Err(Status::Disabled);
-            }
-        }
-        let input: Capture = unsafe { parse(event)? };
-        if input.event.trim().is_empty() || input.distinct_id.trim().is_empty() {
-            return Err(Status::InvalidInput);
-        }
-        let event = Event::from_prepared(
-            input.event,
-            input.distinct_id,
-            input.properties.into_iter().collect(),
-            input.timestamp,
-            input.uuid,
-        );
-        Ok(match call.0.client.capture_prepared(event) {
-            EnqueueResult::Accepted => Status::Accepted,
-            EnqueueResult::Disabled => Status::Disabled,
-            EnqueueResult::Closed => Status::Closed,
-            EnqueueResult::QueueFull => Status::QueueFull,
-        })
-    })
-}
-
-/// Blocks until the upstream worker finishes one flush attempt. Not a receipt.
-#[no_mangle]
-pub extern "C" fn phu_flush(handle: u64) -> Status {
-    contain(|| {
-        let call = acquire(handle)?;
-        call.0.client.flush();
-        Ok(Status::Ok)
-    })
-}
-
-/// Fetches values, payloads, and evaluation metadata without recording exposure.
-/// # Safety
-/// `context` must reference readable memory; `out_buffer` must be writable.
-#[no_mangle]
-pub unsafe extern "C" fn phu_flags(handle: u64, context: Bytes, out_buffer: *mut Buffer) -> Status {
-    contain(|| {
-        if out_buffer.is_null() {
-            return Err(Status::InvalidInput);
-        }
-        unsafe {
-            *out_buffer = Buffer::empty();
-        }
-        let call = acquire(handle)?;
-        let context: FlagContext = unsafe { parse(context)? };
-        if context.distinct_id.trim().is_empty() {
-            return Err(Status::InvalidInput);
-        }
-        let generation = {
-            let calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-            if calls.opted_out {
-                return Err(Status::Disabled);
-            }
-            calls.generation
+        let call = handles::acquire(handle)?;
+        let layout: Layout = unsafe { parse(layout)? };
+        let layout = stateful::FrameLayout {
+            width: layout.width,
+            height: layout.height,
+            row_stride_bytes: layout.row_stride_bytes,
+            format: stateful::PixelFormat::Bgra8888,
         };
-        let flags = call
+        let frame = call
             .0
             .client
-            .evaluate_flags(
-                context.distinct_id,
-                EvaluateFlagsOptions {
-                    groups: context.groups,
-                    person_properties: context.person_properties,
-                    group_properties: context.group_properties,
-                    ..Default::default()
-                },
-            )
-            .map_err(|_| Status::RequestFailed)?;
-        let calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-        if calls.closed {
-            return Err(Status::Closed);
-        }
-        if calls.opted_out || calls.generation != generation {
-            return Err(Status::Disabled);
-        }
-        let result =
-            buffer(serde_json::to_value(flags.export()).map_err(|_| Status::InternalError)?)?;
+            .session_replay()
+            .begin_frame(layout)
+            .ok_or(Status::Inactive)?;
+        let id = call.0.insert_frame(handle, frame)?;
         unsafe {
-            *out_buffer = result;
+            *out = id;
         }
         Ok(Status::Ok)
     })
 }
-
-/// Immediately stops event/flag admission and queues a durable purge. Persist
-/// consent in the host state store before calling. Checkpoint waits for purge.
-#[no_mangle]
-pub extern "C" fn phu_opt_out(handle: u64) -> Status {
-    contain(|| {
-        let call = acquire(handle)?;
-        let mut calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-        if calls.closed {
-            return Err(Status::Closed);
-        }
-        calls.opted_out = true;
-        calls.generation = calls.generation.wrapping_add(1);
-        call.0.client.pause_and_purge();
-        Ok(Status::Ok)
-    })
-}
-
-/// Waits for purge, then resumes admission. Never call on the game thread.
-#[no_mangle]
-pub extern "C" fn phu_opt_in(handle: u64) -> Status {
-    contain(|| {
-        let call = acquire(handle)?;
-        let (generation, delivery_generation) = {
-            let calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-            if calls.closed {
-                return Err(Status::Closed);
-            }
-            (calls.generation, call.0.client.delivery_generation())
-        };
-        let resumed = call.0.client.resume_delivery(delivery_generation);
-        let mut calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-        if calls.closed {
-            return Err(Status::Closed);
-        }
-        if calls.generation != generation {
-            return Err(Status::Disabled);
-        }
-        if !resumed {
-            return Err(Status::StorageError);
-        }
-        calls.opted_out = false;
-        Ok(Status::Ok)
-    })
-}
-
-/// Waits for earlier worker commands and returns delivery/storage counters.
 /// # Safety
-/// `out_buffer` must be writable. Free the returned buffer with phu_buffer_free.
+/// Pixels readable for their exact acquired length; token is consumed on every submission attempt.
 #[no_mangle]
-pub unsafe extern "C" fn phu_checkpoint(handle: u64, out_buffer: *mut Buffer) -> Status {
+pub unsafe extern "C" fn phu_submit_frame(handle: u64, frame: u64, pixels: Bytes) -> Status {
     contain(|| {
-        if out_buffer.is_null() {
+        let mut frame = handles::take_frame(frame)?;
+        let call = handles::acquire(handle)?;
+        if frame.owner != handle {
+            return Err(Status::WrongRecorder);
+        }
+        let target = frame.frame.pixels_mut();
+        if pixels.len != target.len() {
             return Err(Status::InvalidInput);
         }
-        unsafe {
-            *out_buffer = Buffer::empty();
-        }
-        let call = acquire(handle)?;
-        let report = call.0.client.checkpoint_delivery();
-        let result = buffer(serde_json::to_value(report).map_err(|_| Status::InternalError)?)?;
-        unsafe {
-            *out_buffer = result;
-        }
-        Ok(Status::Ok)
+        target.copy_from_slice(unsafe { pixels.slice(target.len())? });
+        Ok(
+            match call.0.client.session_replay().submit_frame(frame.frame) {
+                SubmitOutcome::Accepted => Status::Accepted,
+                SubmitOutcome::WrongRecorder => Status::WrongRecorder,
+                SubmitOutcome::Reentrant => Status::Reentrant,
+                SubmitOutcome::Stale => Status::Stale,
+                SubmitOutcome::Closed => Status::Closed,
+                _ => Status::InternalError,
+            },
+        )
     })
 }
-
-/// Stops admission and starts the shutdown budget without waiting. The handle
-/// retains its storage lock until phu_close joins calls and releases it.
 #[no_mangle]
-pub extern "C" fn phu_begin_shutdown(handle: u64) -> Status {
+pub extern "C" fn phu_abandon_frame(frame: u64) -> Status {
     contain(|| {
-        let call = acquire(handle)?;
-        let mut calls = call.0.calls.lock().map_err(|_| Status::InternalError)?;
-        if calls.closed {
-            return Err(Status::Closed);
-        }
-        calls.closed = true;
-        call.0.client.begin_shutdown();
+        drop(handles::take_frame(frame)?);
         Ok(Status::Ok)
     })
-}
-
-/// Stops admission, waits for admitted calls, drains and joins upstream workers.
-/// Requests and starting new worker disk operations respect the shutdown budget.
-/// An already-running filesystem operation and OS scheduling are not preempted.
-#[no_mangle]
-pub extern "C" fn phu_close(handle: u64) -> Status {
-    contain(|| {
-        let entry = registry()
-            .lock()
-            .map_err(|_| Status::InternalError)?
-            .clients
-            .remove(&handle)
-            .ok_or(Status::Closed)?;
-        let mut calls = entry.calls.lock().map_err(|_| Status::InternalError)?;
-        calls.closed = true;
-        entry.client.begin_shutdown();
-        while calls.active != 0 {
-            calls = entry.idle.wait(calls).map_err(|_| Status::InternalError)?;
-        }
-        drop(calls);
-        entry.client.shutdown();
-        Ok(Status::Ok)
-    })
-}
-
-/// # Safety
-/// Pass a buffer returned by this ABI, unchanged, exactly once. A zeroed buffer
-/// is also valid. Do not pass pointers allocated by Unreal or a different CRT.
-#[no_mangle]
-pub unsafe extern "C" fn phu_buffer_free(value: Buffer) {
-    if !value.data.is_null() {
-        let slice = std::ptr::slice_from_raw_parts_mut(value.data, value.len);
-        unsafe {
-            drop(Box::from_raw(slice));
-        }
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn bytes(s: &str) -> Bytes {
-        Bytes {
-            data: s.as_ptr(),
-            len: s.len(),
-        }
-    }
-
-    #[test]
-    fn input_validation() {
-        assert_eq!(
-            unsafe {
-                parse::<Value>(Bytes {
-                    data: std::ptr::null(),
-                    len: 2,
-                })
-            }
-            .unwrap_err(),
-            Status::InvalidInput
-        );
-        assert_eq!(
-            unsafe {
-                parse::<Value>(Bytes {
-                    data: 1usize as *const u8,
-                    len: MAX_INPUT + 1,
-                })
-            }
-            .unwrap_err(),
-            Status::InvalidInput
-        );
-        assert!(unsafe { parse::<Value>(bytes("not JSON")) }.is_err());
-        assert!(unsafe { parse::<Capture>(bytes("{}")) }.is_err());
-    }
-
-    #[test]
-    fn abi_mismatch_zeroes_handle() {
-        let mut handle = 123;
-        assert_eq!(
-            unsafe { phu_create(99, bytes("{}"), &mut handle) },
-            Status::UnsupportedAbi
-        );
-        assert_eq!(handle, 0);
-    }
-
-    #[test]
-    fn closed_handles_are_harmless() {
-        assert_eq!(phu_flush(0), Status::Closed);
-        assert_eq!(phu_close(u64::MAX), Status::Closed);
-    }
-
-    #[test]
-    fn panics_are_contained() {
-        assert_eq!(contain(|| panic!("test panic")), Status::InternalError);
-    }
-
-    #[test]
-    fn owned_buffer_round_trip() {
-        let output = buffer(json!({"text": "玩家 🚀"})).unwrap();
-        let value: Value = unsafe {
-            parse(Bytes {
-                data: output.data,
-                len: output.len,
-            })
-        }
-        .unwrap();
-        assert_eq!(value["text"], "玩家 🚀");
-        unsafe {
-            phu_buffer_free(output);
-        }
-    }
-}
+mod tests;

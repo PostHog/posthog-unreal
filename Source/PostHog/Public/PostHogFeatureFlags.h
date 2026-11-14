@@ -1,49 +1,63 @@
 #pragma once
-
 #include "CoreMinimal.h"
 #include "PostHogProperties.h"
+#include "PostHogTypes.h"
 #include "PostHogFeatureFlags.generated.h"
 
-UENUM(BlueprintType)
-enum class EPostHogFlagReloadStatus : uint8
-{
-    Failed, Success, Partial, QuotaLimited, Disabled, Closed, Stale
-};
-
-/** Missing flags differ from known false flags; JSON null payloads remain present. */
+/** Owned SDK evaluation snapshot. Missing differs from known false; null payloads stay present. */
 USTRUCT(BlueprintType)
 struct POSTHOG_API FPostHogFeatureFlagResult
 {
     GENERATED_BODY()
-
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    EPostHogResult Status = EPostHogResult::Closed;
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     bool bFound = false;
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bEnabled = false;
+    /** Boolean or variant string, including an empty variant. */
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     FPostHogValue Value;
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     bool bHasPayload = false;
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     FPostHogValue Payload;
-    /** Evaluation metadata from the response that supplied this flag. */
+    /** Complete SDK record, including producing context and optional evaluation metadata. */
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    FPostHogProperties Metadata;
+    FPostHogProperties Record;
 };
 
 USTRUCT(BlueprintType)
-struct POSTHOG_API FPostHogFlagReloadResult
+struct POSTHOG_API FPostHogFeatureFlags
 {
     GENERATED_BODY()
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    EPostHogResult Status = EPostHogResult::Closed;
+    /** False is unavailable; true with an empty map is a known empty snapshot. */
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bAvailable = false;
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    TMap<FString, FPostHogFeatureFlagResult> Flags;
+};
 
+/** Last received, coalesced SDK notification, not request-correlated reload completion.
+ * Context describes its evaluation, not necessarily current targeting when delivered. */
+USTRUCT(BlueprintType)
+struct POSTHOG_API FPostHogFeatureFlagsUpdate
+{
+    GENERATED_BODY()
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    EPostHogFlagReloadStatus Status = EPostHogFlagReloadStatus::Failed;
-    /** Cache is usable in memory even when its optional disk snapshot cannot fit. */
+    FPostHogFeatureFlags Snapshot;
+    /** Notifications include enabled flags only; GetFeatureFlags includes known false. */
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    bool bPersisted = false;
-    /** Completion-time values, including known false. Failures retain only
-     * values for the same context; disabled/closed/stale results are empty. */
+    FPostHogProperties Context;
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    FPostHogProperties Flags;
-
-    /** Native context stamp used to reject stale deferred notifications. */
-    uint64 ContextGeneration = 0;
+    bool bErrorsLoading = false;
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bPartial = false;
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bInvalidPayloads = false;
+    /** JSON null or the SDK's sanitized {kind,status?} load error. */
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    FPostHogValue Error;
 };

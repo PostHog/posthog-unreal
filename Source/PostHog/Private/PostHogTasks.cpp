@@ -30,17 +30,24 @@ TArray<TUniquePtr<FPostHogTask>> Tasks;
 
 bool PostHogTasks::Launch(TFunction<void()>&& Work)
 {
-    FScopeLock Lock(&TasksMutex);
-    for (int32 Index = Tasks.Num() - 1; Index >= 0; --Index)
-    {
-        if (Tasks[Index]->Complete.load(std::memory_order_acquire)) { Tasks.RemoveAtSwap(Index); }
-    }
+    TArray<TUniquePtr<FPostHogTask>> Reaped;
     auto Task = MakeUnique<FPostHogTask>();
     Task->Work = MoveTemp(Work);
-    Task->Thread = FRunnableThread::Create(Task.Get(), TEXT("PostHogClient"));
-    if (!Task->Thread) { return false; }
-    Tasks.Add(MoveTemp(Task));
-    return true;
+    bool bStarted = false;
+    {
+        FScopeLock Lock(&TasksMutex);
+        for (int32 Index = Tasks.Num() - 1; Index >= 0; --Index)
+        {
+            if (Tasks[Index]->Complete.load(std::memory_order_acquire))
+            { Reaped.Add(MoveTemp(Tasks[Index])); Tasks.RemoveAtSwap(Index); }
+        }
+        Task->Thread = FRunnableThread::Create(Task.Get(), TEXT("PostHogClient"));
+        bStarted = Task->Thread != nullptr;
+        if (bStarted) { Tasks.Add(MoveTemp(Task)); }
+    }
+    // Failed work can own application captures with reentrant destructors.
+    // Release those captures, and join completed threads, outside TasksMutex.
+    return bStarted;
 }
 
 void PostHogTasks::Drain()

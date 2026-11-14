@@ -1,99 +1,50 @@
-# Integration implementation status
+# Implementation status
 
-The integration is in development. Native delivery, the stateful C++ client, cached feature flags, game-instance ownership, Project Settings, and application lifecycle capture are implemented. Core Blueprint nodes and the Unreal Analytics adapter/provider are implemented. The remaining Blueprint function/async nodes and automatic flag-change notifications remain incomplete. This is not a release candidate.
+The plugin is in development and is not production-ready. Source targets UE 5.8 on macOS arm64, Windows x64 and Linux x64; configured targets are not a declaration of completed platform validation.
 
-## Implemented
+## Implemented source
 
-- Runtime plugin module and private external-library build module.
-- `UPostHogSubsystem` owns a native client per game instance, with asynchronous setup/close, game-thread completion delegates, explicit editor/server guards, and runtime/editor/PIE namespace separation. Weak native-only ownership records serialize namespace reuse during cancelled initialization and close.
-- Blueprint subsystem nodes for Capture, Identify, Get Feature Flag, and Reload Feature Flags, plus typed property builders and value inspection. Explicit reloads publish game-thread completion events, reject stale deferred snapshots, coalesce pending calls, and cancel notifications on owner shutdown/destruction.
-- `FPostHogAnalyticsProvider` forwards Unreal Analytics calls to the game-instance client. World-aware lookup returns that instance's adapter; the `PostHogAnalytics` module resolves an explicitly bound adapter for stock Analytics nodes. Binding is weak, game-thread-only, rejects competing owners, and clears on shutdown. No second client or process-owned lifecycle is introduced.
-- Typed Analytics attribute conversion, adapter-local defaults beneath registered/context/caller properties, asynchronous flush/immediate delivery, native identity/session sharing, and deduplicated `SessionStart`/`SessionEnd` events. Retained adapters close with their owner and never retarget a new setup.
-- Project Settings with reflected runtime options, optional automatic setup, and explicit-configuration precedence. Game-thread context sampling includes OS, engine version, locale, and application metadata.
-- Core lifecycle and Slate activation observers feed bounded plain-data notifications to the game-thread ticker. Install/update/open/background events follow normal capture, hooks, and consent; persisted version/build markers survive identity reset.
-- Versioned C ABI with per-client handles, UTF-8 JSON inputs, explicit buffer ownership, panic containment, and concurrent-close protection.
-- Fully prepared event submission through the existing Rust worker, without a second queue or Rust property enrichment.
-- Upstream embedding options, durable event-store interface and desktop file spool, memory-admission outcomes, delivery/storage counters, consent epochs, purge/resume, and a shared shutdown deadline.
-- Side-effect-free feature-flag snapshot export with values, payloads, and evaluation metadata.
-- Typed, local feature-flag getters with caller defaults, asynchronous preloading/reload, completion-time value snapshots, context generations, and persisted targeting overrides. One load runs at a time; context changes queue the latest context.
-- Same-context cache retention on failed/partial/quota-limited loads, context-matched restart restoration, bounded optional cache persistence, and per-cache exposure deduplication. Server-gated minimal events are filtered after hooks without restoring removed properties.
-- Native artifact build script, lockfile, checksums, source fingerprint, and macOS deployment-target configuration.
-- Stateful `FPostHogClient` with asynchronous creation/close, capture/screen, identity, alias, registered/person/group properties, consent, and reset. Rust remains the only event delivery queue.
-- JSON-backed reflected property/value types with copy semantics, typed scalars/objects/arrays/null, and size/depth validation. Complete persisted-state bounds include identity and consent metadata.
-- Host/token/client-name storage namespaces, coalesced off-thread state writes, temporary-file replacement, and restored identity/consent. Successful opt-in requires native purge and state persistence before local admission opens.
-- UUIDv7 event and session IDs, automatic inactivity/maximum-duration expiration, explicit sessionless mode, and host-callable foreground/background transitions.
-- Snapshot enrichment and a reentrant C++ `BeforeSend` hook outside state locks. Consent generations invalidate pre-withdrawal snapshots even after opt-in.
-- Tracked native tasks, creation/teardown admission locking, and module shutdown that closes clients and joins work. Dynamic module reloading is disabled.
-- C ABI/mock-server integration tests and Unreal automation covering native delivery, property values, and the stateful client.
+- Immutable stateful Rust dependency: package `posthog`, revision `b717aef23d4869bdf94e75ce36bbd383d3575c6f`, `tls` and `session-replay`, default features disabled.
+- ABI v3 marshaling, owned outputs, complete before-send callbacks, flag mailbox, single-use screenshot acquisitions and tracked shutdown.
+- Thin C++ delegation for identity, consent, registered/person/group properties, sessions and flags.
+- Native lifetime registry, callback-origin deferred close, host-call accounting and final module teardown, including joined initialization-owner retirement before engine event-pool teardown.
+- Game-instance setup/cancellation, namespace reuse, sampled engine context, environment/PIE isolation and game-thread flag notifications.
+- Default-on host lifecycle capture: Application Opened (`from_background=false` at foreground setup, `true` on return) and Application Backgrounded; deduplicated engine signals continue to drive sessions/replay when analytics are disabled.
+- Blueprint typed values, analytics/identity/consent, flag reads/reload, manual replay start/stop and owned prepared-pixel frame objects.
+- Automatic owning-viewport source: same-paint window association/cropping, two host staging permits, GPU readbacks, worker conversion/downscale and joined retirement; Rust still owns JPEG/envelope/delivery and manual stopped-by-default recording.
+- Instance-bound Unreal Analytics provider/factory, stock Analytics Blueprint and Multicast routing, SDK-merged per-capture fallback defaults and SDK-session annotations. Custom Analytics session IDs are unsupported.
+- Consolidated native test driver, Unreal adapter/Blueprint/mechanism tests, asset-free automatic rendered fixture and provenance tooling.
 
-## Upstream dependency
+## Current integration evidence
 
-The bridge pins `posthog-rs` mainline `b0038bde4f8ea39b6440ddc9fde376ac602c5b65` as its baseline. Required embedding additions are being implemented separately on `feat/unreal-embedding` in `~/dev/worktrees/posthog-rs-unreal`.
+The Analytics module and retained example callers use Rust revision `b717aef23d4869bdf94e75ce36bbd383d3575c6f`, including its public per-capture fallback-properties API. Matching ABI v3 release artifacts, header and manifest have been installed and linked into the UE 5.8 macOS arm64 consumers. Seven Rust bridge tests, twenty-seven tooling tests and the twenty-test consolidated driver pass, including all thirteen in-engine automation tests. Formatting, bridge Clippy and both consumers' UHT/syntax checks pass (thirty-three authored and eighteen generated translation units). Known test/CI failures are recorded separately below.
 
-During development, `POSTHOG_RS_PATH` supplies that checkout as a Cargo patch. The bridge cannot build against unmodified mainline yet. The Cargo lockfile currently records the patched dependency. Before distribution, review and land the Rust additions, replace the pin, regenerate the lockfile without the local patch, and remove the local-build requirement. Do not copy the upstream implementation into this repository.
+The engine tests cover C++/Blueprint operations, callback close, game-instance ownership/replacement, large-property round trips, prepared-pixel replay, bounded staging, readback-allocation reuse, host retirement and lifecycle capture. Analytics coverage includes defaults/precedence, stock Blueprint/Multicast routing, callback lifetime and preservation of newer reentrant sessions. A real persistent automatic-session fixture restores an SDK-created ID before expiry, waits past its age boundary and verifies SessionEnd attributes the expired ID while safely cleaning up the SDK-current session. Pending/replacement coordination and retirement of joined initialization-owner holders are also covered.
 
-The Rust additions are opt-in. The plugin selects legacy batch ingestion, disables default features including error interception, and attributes transport requests to `posthog-unreal`.
+The real Metal fixture on Apple M4 Pro passes in three UE 5.8 macOS arm64 consumer configurations: Development Editor, locally cooked/packaged Development, and locally cooked/packaged Shipping. Each current-pin run decodes three initial 320×240 JPEGs and three resized 320×180 JPEGs, verifies quadrant colors/orientation and unrelated-window exclusion, explicit-start gating, analytics/replay identity/session linkage, UUID uniqueness, halt/stable outstanding delivery/resume, and clean exit with recording active (exit code 0). Independent verification decoded all eighteen JPEGs and checked raw canonical v1 attribution plus analytics/replay session, window and identity linkage. Raw analytics `session_id` and `distinct_id` are top-level event fields; event properties identify `posthog-unreal/0.0.1`, while the transport header identifies `posthog-rs/0.31.3`. The packaged runs exercise monolithic module teardown and explicit retirement of registry-held initialization futures after tracked initialization/native/host work joins.
 
-## Behavioral sources
+Editor and packaged Development engine/stdout logs are available for inspection. Shipping produced no engine log; its evidence is the decoded images, control protocol and exit result, not a claim that no ensure was logged. These are local non-distribution packages: UBT/UAT/Xcode use a per-process no-sign/manual override, and both source and archived apps are explicitly ad-hoc sealed with `codesign --sign -`. Final archived apps pass strict/deep signature verification. This is not a wholly unsigned package, developer-identity/provisioning, notarization or distribution validation. See [CI commands](ci.md) for the PostBuildSync and staging/signature boundary. The three configurations share one Mac/backend; they are not a platform or backend matrix.
 
-- `sdk-specs`: `513d94cf9ab8fac7ec5fc1c8e8e21fd88f72f231`.
-- Unity: `216d4c162d0d37e2b5216b4a3bcd3a5abdcec3a5`.
-- Unreal: installed UE 5.8 headers and toolchain.
+The lifecycle test completes all nine cases within its 60-second deadline: buffered startup, duplicate notifications, the reflected host option, consent, hook drops and reentrant owner shutdown/destruction. Wire assertions verify event sequences and SDK-owned session attribution. The automatic Metal regression also passes with lifecycle capture enabled.
 
-Specs take precedence over divergent Unity behavior. Reset clears persisted opt-out as specified while preserving queued event identity and emitting no reset event. Automatic sessions use Unity's 30-minute inactivity and 24-hour maximum, with UUIDv7 IDs; expiration occurs strictly after each boundary. Initial delivery settings follow Unity: threshold 20, interval 30 seconds, queue capacity 1,000, batch size 50, request timeout 10 seconds, and shutdown budget 3 seconds. Embedding caps individual requests by the shutdown budget so already-running requests cannot consume a longer request timeout during close.
+Tests use the maintained SDK mock server. Automatic pixels are unredacted. These results do not establish live ingestion, backend playback or screenshot privacy.
 
-## Validation so far
+## Retained example and known failures
 
-On macOS arm64:
+The retained example's actual Editor link and Analytics automation pass, including defaults, stock Blueprint/Multicast, expired-session attribution and lifetime cases. Offline, normal and hard gameplay smoke each pass 34 checks. The full legacy gameplay gate is **not green**: the delayed case fails its first-run cached-flag expectation on both attempts, and the timeout case fails a low-obstacle jump after passing its flag/input checks. No pristine-base runtime comparison was run, so these are not established as pre-existing failures. These gameplay failures remain unresolved.
 
-- All 5 Rust bridge unit tests pass.
-- Upstream blocking legacy unit suite passes, including consent ordering, shutdown disk-write cutoff, failed-purge recovery, restored queue bounds, exclusive spool locking, and corrupt-record recovery.
-- Upstream default-feature Capture v1 unit suite passes; embedding itself rejects Capture v1 configuration.
-- All 9 Python integration tests pass, covering exact native event preservation, offline replay, consent purge/restore, queue overflow, concurrent close, stale flags, stalled requests, and two-phase shutdown storage ownership. One of these tests runs the Unreal suite and verifies received wire events.
-- UE 5.8 Editor Development builds; all 8 Unreal automation tests pass. Stateful assertions cover identity linking/deduplication, property precedence and null handling, reset/consent restart, hook redaction/reentrancy, consent-generation invalidation, exact session boundaries, person-profile guards, parallel-client isolation, and size/depth persistence boundaries.
-- Flag tests cover typed/null/string payloads, partial-response metadata, cache restoration and context mismatch, local-only reads, concurrent reload/exposure deduplication, caller defaults, completion snapshots, targeting setters, failure retention, opt-out/shutdown, and cache-pressure consent persistence. Wire assertions cover automatic flag enrichment and minimal/full exposures through public getters and `BeforeSend`. Rich-response metadata is exercised with normalized export/cache fixtures; the maintained mock server supplies legacy flags responses.
-- Subsystem automation uses real standalone game instances with separate client names. It verifies policy guards, independent identity/session state, world replacement without client replacement, deduplicated lifecycle signals, update detection after identity reset/restart, Project Settings setup, and closure of retained native pointers. A controlled native-initialization barrier allows destruction and garbage collection of the old game instance before a new owner reuses the same namespace.
-- Blueprint automation invokes the four reflected subsystem methods through `ProcessEvent`, binds a dynamic completion delegate, and checks typed properties, missing/false/variant flags, coalesced and reentrant reloads, stale deferred snapshots, opted-out calls, and shutdown/destruction cancellation. Python assertions verify capture/identify wire data and exposure deduplication. This reflected coverage is supplemented by the real graph and packaged-consumer checks below.
-- Analytics automation exercises world lookup, two independent game instances, explicit binding and conflicting-owner rejection, the configured factory, stock Blueprint calls through reflection, and AnalyticsMulticast. Wire assertions cover typed attributes and precedence, registered-property preservation, identity linking, session events and UUIDv7 overrides, consent, hook redaction, world replacement, rebinding, shutdown, and replacement setup. The first run in the isolated worktree hit disk exhaustion and native storage errors; the asset-free test runner now disables asset-registry disk caching, and the complete rerun passed.
-- A generated Blueprint actor graph compiles without warnings and executes PostHog subsystem and stock Analytics nodes in the editor. Actual single-instance and two-instance PIE runs cover designated-owner binding, competing-owner rejection, isolated native clients/adapters, level travel, explicit unbind/rebind, and three Play/Stop cycles. Retained adapters close with their owners; shutdown completes and clears the binding. There are 42 editor checks and 20 wire assertions over 18 captured events.
-- A separate Blueprint-only project, with no hand-authored game C++ or verification module, packages and runs in Development and Shipping on UE 5.8 macOS arm64. Both archived apps pass eight runtime/wire checks: provider binding, stock/direct capture, shared identity/session, enrichment, attributes, and clean Blueprint-driven exit. The source plugin links the existing native archive; this does not test installation from a distributed prebuilt plugin.
-- Sandboxed macOS Shipping delivery requires the outgoing-network entitlement. Unreal's default Shipping template omitted it: the app exited cleanly but delivered no events. Selecting `Sandbox.Client.entitlements` in the consumer project preserved sandboxing and made the Shipping wire checks pass. No SDK source change was required.
-- Filesystem failure injection confirms failed native purge cannot persist opt-in; restarting with the original spool remains opted out and does not replay those events.
-- One full run stopped before editor launch because the mock server exited during startup; the previous runner discarded its startup diagnostics. Startup diagnostic preservation was added, and the next complete run passed. The original startup cause is unconfirmed.
-- Read-only review identified persistence bounds, creation/teardown admission, and opt-in acknowledgement defects. The fixes and final purge-before-opt-in ordering received focused rechecks with no remaining findings.
+The pinned Rust SDK's PR #360 CI remains red on unchanged replay-policy lint and `analytics_deadline_applies_while_encoder_is_blocked` deadline/order cases. The standalone bridge release run also initially hit a timing-sensitive hook-close `Accepted` versus `Closed` assertion; an unchanged full rerun and ten targeted repeats pass. Passing reruns do not establish that the hook-close timing issue is fixed.
 
-The feature-flag review found missing reload handling for unchanged targeting properties, caller-default support, and completion snapshots. All three were corrected and regression-tested; the focused read-only recheck found no remaining issues.
+The full main-aware independent review and focused expired-session recheck completed without remaining findings. Release/platform review remains separate.
 
-The subsystem/settings/lifecycle slice received an independent read-only review with no issues found. Setup/shutdown dynamic delegates compile through UHT. The consumer graph uses configured automatic setup and polls readiness; manual node placement, setup/shutdown delegate graphs, and the interactive Project Settings panel remain unverified.
+## Required next milestones
 
-These checks cover UE 5.8 macOS arm64 only. They do not establish Windows, Linux, macOS x64, other UE versions, networked multiplayer, Live Coding, signed/notarized distribution, or prebuilt-plugin installation support. The Unreal build currently permits only Mac arm64.
+1. Stress embedded/multiple-PIE surface isolation, foreground/window/screen transitions, resize races and GPU/worker teardown.
+2. Validate actual HDR/backend formats, resource bounds and sustained renderer operation beyond the current Metal fixture.
+3. Validate Windows/Linux engine and packaged runtime, protected native/engine CI, Blueprint-only packaged consumers and the wider desktop configuration matrix.
+4. Validate storage failures, offline/retry/resource behavior and realistic capture/frame-time/shutdown budgets across the supported matrix.
+5. Complete release/platform review and artifact/license/toolchain evidence across the intended release matrix.
 
-## Delivery and shutdown limits
+Full Blueprint convenience/async coverage remains separate development work. No release readiness is implied by source completion or tooling-only CI.
 
-`ACCEPTED` means bounded memory admission, not disk or server acknowledgement. Checkpoint waits for earlier worker operations and reports storage errors. A flush is one delivery attempt; pending, delivered, terminally dropped, and storage-error counters describe the outcome.
-
-Shutdown closes admission and sets a total work deadline before waiting for admitted calls. Requests use the remaining budget; the worker does not start another event persistence write after expiry. An event accepted only into memory can be lost at the deadline. Previously durable unsent events remain for restart. An already-running filesystem operation and OS scheduling cannot be preempted; shutdown still joins workers rather than abandoning code that could outlive the module.
-
-Opt-out closes local and native admission immediately, schedules state persistence and purge, and acknowledges both asynchronously. Requests already admitted may reach the server. Opt-in keeps the local gate closed until native purge succeeds and the new consent state is written. Coalesced property writes preserve that desired consent. State writes use flushed temporary files and replacement; they do not establish cross-platform power-loss guarantees.
-
-The native shutdown deadline starts before waiting for Unreal state writes, while the handle retains the exclusive spool lock until final close. Background state I/O remains subject to filesystem scheduling. Future completion can run off-thread; UObject consumers must marshal to the game thread.
-
-## Feature-flag limitations
-
-- Spec #211: the C++ cache defensively omits normalized records with explicit `failed: true`, including their payloads, before reading a value. Complete nonerrored refreshes replace state after filtering; response-wide errored refreshes merge healthy records and retain prior successful values and metadata. Restore uses the same filter. Missing direct reads already return no result, honor existing caller defaults, and emit no exposure event; this patch does not add missing-read tracking.
-- This defensive filter does **not** establish end-to-end failed-record support. `phu_flags` serializes `flags.export()` from the external embedding checkout. The inspected `posthog-rs` embedding branch (`b1973b06c50911d7cb2a2db8ef92a8d88a5e3e4c`) decodes no `failed` field in `FlagDetail`, and neither `EvaluatedFlagRecord` nor `ExportedFeatureFlag` retains it. Failed wire records can therefore still arrive as indistinguishable successful bool/string values. Mainline does not provide the bridge's required embedding/export APIs. Before claiming support, land failed-aware decoding/filtering in that exporter and verify detailed responses (including false/absent response-wide error bits) through the actual ABI and public getters. No new dependency version or ABI is selected here.
-- The focused `PostHog.FailedFlagCache` regression exercises the C++ cache with normalized fixtures; it is not an exporter or wire-delivery conformance test. Failed-read error diagnostics cannot be reconstructed after the exporter discards failure identity. Any future emitted failed-read events must preserve that identity and use the existing missing-response convention without substituting caller defaults.
-
-- Rust currently returns malformed serialized payloads as raw strings, indistinguishable from valid decoded string payloads. Strict malformed-payload rejection is deferred. Fix the upstream export's parse-validity information before stable release; previously persisted ambiguous caches may need invalidation. Unreal does not reparse exported strings.
-- The mock server's quota-only array response is rejected by the current Rust parser, so it surfaces as a generic load failure with same-context cache retention. Recognized normalized quota responses preserve the cache and return `QuotaLimited`.
-- Targeting overrides are explicit; analytics person/group properties are not automatically mirrored. The mock records identity/group membership but not targeting property bodies; targeting serialization is checked through the persisted request context and ABI/source mapping.
-- Explicit Blueprint reloads have game-thread completion events. Automatic flag-change notifications (including preload and identity-triggered refresh) remain unimplemented.
-
-## Next work
-
-1. Complete the remaining Blueprint function/async surface and automatic flag-change notifications.
-2. Add maintained C++/Blueprint consumer examples and manual node-placement, setup/shutdown delegate, and Project Settings UI validation.
-3. Complete spec acceptance coverage, including simultaneous feature-flag activity across real PIE instances.
-4. Extend editor and packaged-consumer validation beyond UE 5.8 macOS arm64, and test installation from distributed prebuilt artifacts.
-5. Finish upstream API review, full-suite/MSRV checks, API snapshot, dependency/license evidence, and an immutable released dependency pin.
-6. Produce and verify prebuilt artifacts across the declared desktop matrix before release.
+See [architecture](integration-plan.md), [core boundary](stateful-rust-core-plan.md) and [CI commands](ci.md).

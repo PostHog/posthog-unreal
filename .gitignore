@@ -44,3 +44,11 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Asset-free SDK validation host
+.ci/
+Tests/Unreal/Plugins/
+Tests/Unreal/Config/User*.ini
+Tests/Unreal/Config/DefaultInput.ini
+Tests/Unreal/Build/Mac/Resources/Info.Template.plist
+Tests/Unreal/Build/Mac/Unreal.PackageVersionCounter

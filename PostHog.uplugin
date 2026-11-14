@@ -10,9 +10,31 @@
   "CanContainContent": false,
   "IsBetaVersion": true,
   "Installed": false,
-  "SupportedTargetPlatforms": ["Mac"],
+  "SupportedTargetPlatforms": [
+    "Mac",
+    "Win64",
+    "Linux"
+  ],
   "Modules": [
-    {"Name": "PostHog", "Type": "Runtime", "LoadingPhase": "Default", "PlatformAllowList": ["Mac"]},
-    {"Name": "PostHogAnalytics", "Type": "Runtime", "LoadingPhase": "None", "PlatformAllowList": ["Mac"]}
+    {
+      "Name": "PostHog",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": [
+        "Mac",
+        "Win64",
+        "Linux"
+      ]
+    },
+    {
+      "Name": "PostHogAnalytics",
+      "Type": "Runtime",
+      "LoadingPhase": "None",
+      "PlatformAllowList": [
+        "Mac",
+        "Win64",
+        "Linux"
+      ]
+    }
   ]
 }

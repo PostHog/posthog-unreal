@@ -7,7 +7,8 @@
 /** Unreal Analytics adapter over a game-instance-owned client.
  * Releasing an adapter does not shut down the client. Retained adapters close with
  * their owner and never retarget a replacement client. Event methods are thread-safe;
- * world lookup and default-provider binding are game-thread-only.
+ * world lookup and default-provider binding are game-thread-only. Release retained
+ * adapter references before module unload, along with native clients and frames.
  */
 class POSTHOG_API FPostHogAnalyticsProvider final : public IAnalyticsProvider
 {
@@ -23,6 +24,7 @@ public:
     virtual bool StartSession(const TArray<FAnalyticsEventAttribute>& Attributes) override;
     virtual void EndSession() override;
     virtual FString GetSessionID() const override;
+    /** Custom session IDs are unsupported by the canonical SDK; returns false. */
     virtual bool SetSessionID(const FString& InSessionID) override;
     virtual void FlushEvents() override;
     virtual void SetUserID(const FString& InUserID) override;
@@ -45,5 +47,13 @@ private:
     FPostHogClient::FPtr Client;
     mutable FCriticalSection DefaultsMutex;
     TArray<FAnalyticsEventAttribute> DefaultAttributes;
-    FPostHogProperties DefaultProperties;
+    /** Annotation admission only; native session state and IDs belong to Rust. */
+    struct FAnnotations
+    {
+        FCriticalSection Mutex;
+        FString Started;
+        bool bStarting = false;
+        bool bEnding = false;
+    };
+    TSharedRef<FAnnotations, ESPMode::ThreadSafe> Annotations = MakeShared<FAnnotations, ESPMode::ThreadSafe>();
 };

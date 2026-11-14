@@ -4,6 +4,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "Misc/ScopeLock.h"
+#include "Misc/ScopeExit.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogPostHogAnalytics, Log, All);
 
@@ -66,36 +67,75 @@ FPostHogProperties FPostHogAnalyticsProvider::ConvertAttributes(const TArray<FAn
 
 FPostHogProperties FPostHogAnalyticsProvider::GetDefaults() const
 {
-    FScopeLock Lock(&DefaultsMutex);
-    return DefaultProperties;
+    return ConvertAttributes(GetDefaultEventAttributesSafe());
 }
 
 bool FPostHogAnalyticsProvider::StartSession(const TArray<FAnalyticsEventAttribute>& Attributes)
-{ return Client->StartAnalyticsSession(ConvertAttributes(Attributes), GetDefaults()); }
-void FPostHogAnalyticsProvider::EndSession() { Client->EndAnalyticsSession(GetDefaults()); }
+{
+    auto Current = Client; auto State = Annotations;
+    const auto Properties = ConvertAttributes(Attributes), Defaults = GetDefaults();
+    if (!Current->IsInitialized() || Current->IsOptedOut()) { return false; }
+    bool bEnding;
+    { FScopeLock Lock(&State->Mutex); bEnding = State->bEnding; }
+    // A callback may start a new native session while its previous end annotation is in flight.
+    if (bEnding && Current->EndSession() != EPostHogResult::Ok) { return false; }
+    if (Current->StartSession() != EPostHogResult::Ok) { return false; }
+    const FString Session = Current->GetSessionId(); if (Session.IsEmpty()) { return false; }
+    {
+        FScopeLock Lock(&State->Mutex);
+        if (State->Started == Session) { return !State->bStarting; }
+        State->Started = Session; State->bStarting = true;
+    }
+    const auto Status = Current->CaptureWithFallback(TEXT("SessionStart"), Properties, Defaults);
+    const bool bAccepted = Status == EPostHogResult::Accepted && Current->IsInitialized() && Current->PeekSessionId() == Session;
+    {
+        FScopeLock Lock(&State->Mutex);
+        if (State->Started == Session)
+        { State->bStarting = false; if (!bAccepted) { State->Started.Empty(); } }
+    }
+    return bAccepted;
+}
+void FPostHogAnalyticsProvider::EndSession()
+{
+    auto Current = Client; auto State = Annotations; const auto Defaults = GetDefaults();
+    {
+        FScopeLock Lock(&State->Mutex); if (State->bEnding) { return; }
+        State->bEnding = true; State->Started.Empty(); State->bStarting = false;
+    }
+    ON_SCOPE_EXIT { FScopeLock Lock(&State->Mutex); State->bEnding = false; };
+    // Annotate the observed session even if SDK maintenance expires it before capture.
+    const FString EndingId = Current->PeekSessionId();
+    const FString CurrentId = EndingId.IsEmpty() ? FString() : Current->GetSessionId();
+    if (!EndingId.IsEmpty())
+    {
+        FPostHogProperties Properties; Properties.SetString(TEXT("$session_id"), EndingId);
+        Current->CaptureWithFallback(TEXT("SessionEnd"), Properties, Defaults);
+    }
+    if (Current->IsInitialized() && Current->PeekSessionId() == CurrentId) { Current->EndSession(); }
+    if (Current->IsInitialized()) { Current->FlushAsync(); }
+}
 FString FPostHogAnalyticsProvider::GetSessionID() const { return Client->GetSessionId(); }
-bool FPostHogAnalyticsProvider::SetSessionID(const FString& InSessionID) { return Client->SetSessionId(InSessionID); }
-void FPostHogAnalyticsProvider::FlushEvents() { Client->FlushAsync(); }
-void FPostHogAnalyticsProvider::SetUserID(const FString& InUserID) { Client->Identify(InUserID); }
+bool FPostHogAnalyticsProvider::SetSessionID(const FString&) { return false; }
+void FPostHogAnalyticsProvider::FlushEvents() { auto Current = Client; Current->FlushAsync(); }
+void FPostHogAnalyticsProvider::SetUserID(const FString& InUserID) { auto Current = Client; Current->Identify(InUserID); }
 FString FPostHogAnalyticsProvider::GetUserID() const { return Client->IsInitialized() ? Client->GetDistinctId() : FString(); }
 
 void FPostHogAnalyticsProvider::RecordEvent(const FString& EventName, const TArray<FAnalyticsEventAttribute>& Attributes)
 {
-    const auto Defaults = GetDefaults();
-    Client->CaptureWithDefaults(EventName, ConvertAttributes(Attributes), &Defaults);
+    auto Current = Client; const auto Defaults = GetDefaults();
+    Current->CaptureWithFallback(EventName, ConvertAttributes(Attributes), Defaults);
 }
 void FPostHogAnalyticsProvider::RecordEvent(const FString& EventName, const TArray<FAnalyticsEventAttribute>& Attributes, EAnalyticsRecordEventMode Mode)
 {
-    RecordEvent(EventName, Attributes);
-    if (Mode == EAnalyticsRecordEventMode::Immediate) { FlushEvents(); }
+    auto Current = Client; const auto Defaults = GetDefaults();
+    Current->CaptureWithFallback(EventName, ConvertAttributes(Attributes), Defaults);
+    if (Mode == EAnalyticsRecordEventMode::Immediate && Current->IsInitialized()) { Current->FlushAsync(); }
 }
 
 void FPostHogAnalyticsProvider::SetDefaultEventAttributes(TArray<FAnalyticsEventAttribute>&& Attributes)
 {
-    auto Properties = ConvertAttributes(Attributes);
     FScopeLock Lock(&DefaultsMutex);
     DefaultAttributes = MoveTemp(Attributes);
-    DefaultProperties = MoveTemp(Properties);
 }
 TArray<FAnalyticsEventAttribute> FPostHogAnalyticsProvider::GetDefaultEventAttributesSafe() const
 { FScopeLock Lock(&DefaultsMutex); return DefaultAttributes; }

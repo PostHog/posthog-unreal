@@ -1,914 +1,441 @@
 #include "PostHogClient.h"
+#include "PostHogNative.h"
 #include "PostHogJson.h"
-#include "PostHogFlagCache.h"
 #include "PostHogTasks.h"
-#include "HAL/PlatformFileManager.h"
-#include "Misc/FileHelper.h"
-#include "Misc/Paths.h"
+#include "HAL/Event.h"
+#include "HAL/PlatformProcess.h"
 #include "Misc/ScopeLock.h"
-#include "Misc/SecureHash.h"
-#include "posthog_unreal.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogPostHogClient, Log, All);
-
 FCriticalSection FPostHogClient::ClientsMutex;
-TArray<TWeakPtr<FPostHogClient::FImpl, ESPMode::ThreadSafe>> FPostHogClient::Clients;
+TArray<TSharedPtr<FPostHogClient::FImpl, ESPMode::ThreadSafe>> FPostHogClient::Clients;
 bool FPostHogClient::bStopping = false;
 
 namespace
 {
 template <typename T> TSharedFuture<T> Ready(T Value)
-{
-    TPromise<T> Promise; auto Future = Promise.GetFuture().Share(); Promise.SetValue(MoveTemp(Value)); return Future;
-}
-bool NonBlank(const FString& Text) { return !Text.TrimStartAndEnd().IsEmpty(); }
-phu_bytes View(const FTCHARToUTF8& Text) { return {reinterpret_cast<const uint8_t*>(Text.Get()), static_cast<size_t>(Text.Length())}; }
-
-bool SaveAtomic(const FString& Filename, const FString& Json)
-{
-    auto& Files = FPlatformFileManager::Get().GetPlatformFile();
-    if (!Files.CreateDirectoryTree(*FPaths::GetPath(Filename))) { return false; }
-    const FString Temporary = Filename + TEXT(".tmp");
-    const FTCHARToUTF8 Text(*Json);
-    TUniquePtr<IFileHandle> File(Files.OpenWrite(*Temporary));
-    if (!File || !File->Write(reinterpret_cast<const uint8*>(Text.Get()), Text.Length()) || !File->Flush(true)) { return false; }
-    File.Reset();
-    return Files.MoveFile(*Filename, *Temporary);
+{ TPromise<T> Promise; auto Future = Promise.GetFuture().Share(); Promise.SetValue(MoveTemp(Value)); return Future; }
+FPostHogDrainResult Failure(EPostHogResult Status)
+{ FPostHogDrainResult Out; Out.Status = Status; return Out; }
 }
 
-bool SameProperties(const FPostHogProperties& Left, const FPostHogProperties& Right)
-{
-    return FJsonValue::CompareEqual(FJsonValueObject(Left.ToNative()), FJsonValueObject(Right.ToNative()));
-}
-}
-
-struct FPostHogClient::FImpl : public TSharedFromThis<FImpl, ESPMode::ThreadSafe>
+struct FPostHogClient::FImpl : TSharedFromThis<FImpl, ESPMode::ThreadSafe>
 {
     FCriticalSection Mutex;
-    FPostHogConfig Config;
-    FString StateFile;
     phu_handle Handle = 0;
+    bool bClosing = false;
     bool bClosed = false;
-    bool bOptedOut = false;
-    TOptional<bool> DesiredOptOut;
-    bool bIdentified = false;
-    bool bPersonProcessing = false;
-    uint64 ConsentGeneration = 0;
-    uint64 IdentityGeneration = 0;
-    FString AnonymousId;
-    FString DistinctId;
-    FPostHogProperties Registered;
-    FPostHogProperties Groups;
-    FPostHogProperties LastSet;
-    FPostHogProperties LastSetOnce;
-    bool bHasPersonProperties = false;
-    FString SessionId;
-    FString AnalyticsSessionId;
-    FDateTime SessionStarted;
-    FDateTime LastActivity;
+    bool bCloseScheduled = false;
     bool bForeground = true;
-    bool bLifecycleStarted = false;
-    FString LastAppVersion;
-    FString LastAppBuild;
-    bool bWriting = false;
-    FString PendingState;
-    TOptional<uint64> PendingCacheRevision;
-    TOptional<uint64> SavedCacheRevision;
-    TSharedFuture<bool> WriteFuture;
-    TSharedFuture<bool> CloseFuture;
-    int64 StateWriteErrors = 0;
-    FPostHogProperties PersonFlagProperties;
-    FPostHogProperties GroupFlagProperties;
-    FPostHogFlagCache FlagCache;
-    uint64 FlagGeneration = 0;
-    uint64 LoadingFlagGeneration = 0;
-    bool bLoadingFlags = false;
-    bool bReloadFlagsRequested = false;
-    TSharedFuture<FPostHogFlagReloadResult> FlagFuture;
+    int32 ActiveCalls = 0;
+    FEvent* Idle = FPlatformProcess::GetSynchEventFromPool(true);
+    TFunction<bool(FJsonObject&)> BeforeSend;
+    TFunction<void()> CancelHost;
+    TFunction<FHostClose()> RetireHost;
+    TSharedFuture<FPostHogDrainResult> CloseFuture;
+    FPostHogDrainResult LastClose;
+    static thread_local TArray<FImpl*> HookClients;
 
-    FImpl(FPostHogConfig InConfig, FString InStateFile) : Config(MoveTemp(InConfig)), StateFile(MoveTemp(InStateFile))
-    {
-        bOptedOut = Config.bInitiallyOptedOut;
-        AnonymousId = PostHogJson::NewUuidV7(Config.Now());
-        DistinctId = AnonymousId;
-    }
+    explicit FImpl(TFunction<bool(FJsonObject&)>&& Hook) : BeforeSend(MoveTemp(Hook)) { Idle->Trigger(); }
+    ~FImpl() { FPlatformProcess::ReturnSynchEventToPool(Idle); }
 
-    void Restore()
+    /** Hold the callback context through host conversion AND the native call. Never hold Mutex in the SDK. */
+    struct FCall
     {
-        auto& Files = FPlatformFileManager::Get().GetPlatformFile();
-        if (!Files.FileExists(*StateFile)) { return; }
-        FString Json;
-        if (Files.FileSize(*StateFile) > 1024 * 1024 || !FFileHelper::LoadFileToString(Json, *StateFile))
+        TSharedPtr<FImpl, ESPMode::ThreadSafe> Owner;
+        phu_handle Handle = 0;
+        explicit FCall(TSharedPtr<FImpl, ESPMode::ThreadSafe> InOwner) : Owner(MoveTemp(InOwner))
         {
-            UE_LOG(LogPostHogClient, Warning, TEXT("Could not read PostHog client state.")); return;
+            FScopeLock Lock(&Owner->Mutex);
+            if (!Owner->bClosing && Owner->Handle)
+            { if (Owner->ActiveCalls++ == 0) { Owner->Idle->Reset(); } Handle = Owner->Handle; }
         }
-        auto State = PostHogJson::Decode(Json);
-        double Version = 0;
-        FString Anonymous, Distinct;
-        bool OptedOut = false, Identified = false;
-        if (!State || !State->TryGetNumberField(TEXT("version"), Version) || Version != 1 ||
-            !State->TryGetStringField(TEXT("anonymous_id"), Anonymous) || !NonBlank(Anonymous) ||
-            !State->TryGetStringField(TEXT("distinct_id"), Distinct) || !NonBlank(Distinct) ||
-            !State->TryGetBoolField(TEXT("opted_out"), OptedOut) || !State->TryGetBoolField(TEXT("identified"), Identified))
+        ~FCall()
         {
-            UE_LOG(LogPostHogClient, Warning, TEXT("Ignoring invalid PostHog client state.")); return;
+            if (!Handle) { return; }
+            FScopeLock Lock(&Owner->Mutex);
+            if (--Owner->ActiveCalls == 0) { Owner->Idle->Trigger(); }
         }
-        AnonymousId = Anonymous; DistinctId = Distinct; bOptedOut = OptedOut; bIdentified = Identified;
-        State->TryGetBoolField(TEXT("person_processing"), bPersonProcessing);
-        State->TryGetStringField(TEXT("app_version"), LastAppVersion);
-        State->TryGetStringField(TEXT("app_build"), LastAppBuild);
-        const TSharedPtr<FJsonObject>* Object = nullptr;
-        if (State->TryGetObjectField(TEXT("registered"), Object)) { Registered = FPostHogProperties::FromNative(Object->ToSharedRef()); }
-        if (State->TryGetObjectField(TEXT("groups"), Object)) { Groups = FPostHogProperties::FromNative(Object->ToSharedRef()); }
-        if (State->TryGetObjectField(TEXT("person_flag_properties"), Object)) { PersonFlagProperties = FPostHogProperties::FromNative(Object->ToSharedRef()); }
-        if (State->TryGetObjectField(TEXT("group_flag_properties"), Object)) { GroupFlagProperties = FPostHogProperties::FromNative(Object->ToSharedRef()); }
-        const TSharedPtr<FJsonObject>* Context = nullptr;
-        if (!bOptedOut && State->TryGetObjectField(TEXT("flag_context"), Context) &&
-            SameProperties(FPostHogProperties::FromNative(Context->ToSharedRef()), FlagContextLocked()) &&
-            State->TryGetObjectField(TEXT("cached_flags"), Object))
-        { FlagCache.Restore(FPostHogProperties::FromNative(Object->ToSharedRef())); }
-    }
+    };
 
-    FPostHogProperties FlagContextLocked() const
+    static phu_status Hook(void* UserData, phu_bytes Input, phu_buffer* Output)
     {
-        auto Context = MakeShared<FJsonObject>();
-        Context->SetStringField(TEXT("distinct_id"), DistinctId);
-        Context->SetObjectField(TEXT("groups"), Groups.ToNative());
-        Context->SetObjectField(TEXT("person_properties"), PersonFlagProperties.ToNative());
-        Context->SetObjectField(TEXT("group_properties"), GroupFlagProperties.ToNative());
-        return FPostHogProperties::FromNative(Context);
-    }
-
-    FString StateJsonLocked(TOptional<bool> ConsentOverride = {}, bool bIncludeFlags = true, bool* CacheIncluded = nullptr) const
-    {
-        auto State = MakeShared<FJsonObject>();
-        State->SetNumberField(TEXT("version"), 1);
-        State->SetStringField(TEXT("anonymous_id"), AnonymousId);
-        State->SetStringField(TEXT("distinct_id"), DistinctId);
-        State->SetBoolField(TEXT("identified"), bIdentified);
-        State->SetBoolField(TEXT("person_processing"), bPersonProcessing);
-        State->SetStringField(TEXT("app_version"), LastAppVersion);
-        State->SetStringField(TEXT("app_build"), LastAppBuild);
-        State->SetBoolField(TEXT("opted_out"), ConsentOverride.IsSet() ? ConsentOverride.GetValue() : DesiredOptOut.Get(bOptedOut));
-        State->SetObjectField(TEXT("registered"), Registered.ToNative());
-        State->SetObjectField(TEXT("groups"), Groups.ToNative());
-        State->SetObjectField(TEXT("person_flag_properties"), PersonFlagProperties.ToNative());
-        State->SetObjectField(TEXT("group_flag_properties"), GroupFlagProperties.ToNative());
-        if (CacheIncluded) { *CacheIncluded = false; }
-        if (bIncludeFlags && FlagCache.bLoaded && !bOptedOut)
+        *Output = {nullptr, 0};
+        auto& Self = *static_cast<FImpl*>(UserData);
+        struct FHookScope
         {
-            State->SetObjectField(TEXT("flag_context"), FlagContextLocked().ToNative());
-            State->SetObjectField(TEXT("cached_flags"), FlagCache.Serialize().ToNative());
-            const FString WithCache = PostHogJson::Encode(State);
-            if (PostHogJson::IsBounded(WithCache) && FTCHARToUTF8(*WithCache).Length() <= 1024 * 1024 - 1024)
-            { if (CacheIncluded) { *CacheIncluded = true; } return WithCache; }
-            // Optional cache data must never prevent identity/consent persistence.
-            State->RemoveField(TEXT("flag_context")); State->RemoveField(TEXT("cached_flags"));
-        }
-        return PostHogJson::Encode(State);
-    }
-
-    bool CanPersistLocked(TOptional<FString> ProposedDistinctId = {}) const
-    {
-        auto State = PostHogJson::Decode(StateJsonLocked(false, false));
-        if (!State) { return false; }
-        // Reserve space for a subsequent anonymous reset and boolean changes.
-        State->SetBoolField(TEXT("identified"), false);
-        State->SetBoolField(TEXT("person_processing"), false);
-        const FString Id = ProposedDistinctId.Get(DistinctId);
-        State->SetStringField(TEXT("distinct_id"), Id.Len() < 36 ? FString::ChrN(36, TEXT('0')) : Id);
-        const FString Json = PostHogJson::Encode(State.ToSharedRef());
-        return PostHogJson::IsBounded(Json) && FTCHARToUTF8(*Json).Length() <= 1024 * 1024 - 1024;
-    }
-
-    TSharedFuture<bool> PersistLocked()
-    {
-        if (!CanPersistLocked()) { ++StateWriteErrors; return Ready(false); }
-        bool bCacheIncluded = false;
-        PendingState = StateJsonLocked({}, true, &bCacheIncluded);
-        PendingCacheRevision = bCacheIncluded ? TOptional<uint64>(FlagCache.Revision) : TOptional<uint64>();
-        if (bWriting) { return WriteFuture; }
-        bWriting = true;
-        auto Promise = MakeShared<TPromise<bool>, ESPMode::ThreadSafe>();
-        WriteFuture = Promise->GetFuture().Share();
-        auto Self = AsShared();
-        if (!PostHogTasks::Launch([Self, Promise]
-        {
-            bool bSuccess = true;
-            for (;;)
-            {
-                FString Json;
-                TOptional<uint64> CacheRevision;
-                { FScopeLock Lock(&Self->Mutex); Json = MoveTemp(Self->PendingState); Self->PendingState.Empty(); CacheRevision = Self->PendingCacheRevision; }
-                const bool bSaved = SaveAtomic(Self->StateFile, Json);
-                bSuccess &= bSaved;
-                bool bDone;
-                {
-                    FScopeLock Lock(&Self->Mutex);
-                    if (!bSaved) { ++Self->StateWriteErrors; }
-                    else { Self->SavedCacheRevision = CacheRevision; }
-                    bDone = Self->PendingState.IsEmpty();
-                    if (bDone) { Self->bWriting = false; }
-                }
-                if (!bSaved) { UE_LOG(LogPostHogClient, Warning, TEXT("Could not persist PostHog client state.")); }
-                if (bDone) { break; }
-            }
-            Promise->SetValue(bSuccess);
-        }))
-        {
-            bWriting = false; ++StateWriteErrors; Promise->SetValue(false);
-        }
-        return WriteFuture;
-    }
-
-    void StartSessionLocked(const FDateTime& Now)
-    {
-        SessionId = PostHogJson::NewUuidV7(Now); SessionStarted = Now; LastActivity = Now;
-    }
-    FString SessionLocked(const FDateTime& Now, bool bActivity)
-    {
-        if (Config.SessionMode == EPostHogSessionMode::Automatic)
-        {
-            if (!SessionId.IsEmpty() && (Now - LastActivity > FTimespan::FromMinutes(30) || Now - SessionStarted > FTimespan::FromHours(24)))
-            {
-                SessionId.Empty();
-            }
-            if (SessionId.IsEmpty() && bForeground) { StartSessionLocked(Now); }
-        }
-        if (bActivity && !SessionId.IsEmpty()) { LastActivity = Now; }
-        return SessionId;
-    }
-    bool CanCaptureLocked() const { return !bClosed && Handle != 0 && !bOptedOut; }
-    bool CanProcessPeopleLocked() const { return CanCaptureLocked() && Config.PersonProfiles != EPostHogPersonProfiles::Never; }
-
-    FPostHogEvent SnapshotLocked(const FString& Name, const FPostHogProperties& Properties, const FPostHogProperties* Defaults = nullptr)
-    {
-        FPostHogEvent Event;
-        Event.Event = Name; Event.DistinctId = DistinctId; Event.Timestamp = Config.Now();
-        Event.ConsentGeneration = ConsentGeneration;
-        Event.Uuid = PostHogJson::NewUuidV7(Event.Timestamp);
-        auto Merged = Defaults ? Defaults->ToNative() : Registered.ToNative();
-        if (Defaults) { PostHogJson::Merge(*Merged, *Registered.ToNative()); }
-        PostHogJson::Merge(*Merged, *Config.Context.ToNative());
-        Merged->SetStringField(TEXT("$lib"), TEXT("posthog-unreal"));
-        Merged->SetStringField(TEXT("$lib_version"), TEXT("0.0.1"));
-        if (!Groups.IsEmpty()) { Merged->SetObjectField(TEXT("$groups"), Groups.ToNative()); }
-        TArray<TSharedPtr<FJsonValue>> ActiveFlags;
-        for (const auto& Pair : FlagCache.Flags)
-        {
-            const auto Value = Pair.Value.Value.ToNative();
-            Merged->SetField(TEXT("$feature/") + Pair.Key, Value);
-            if (Value->Type == EJson::String || (Value->Type == EJson::Boolean && Value->AsBool()))
-            { ActiveFlags.Add(MakeShared<FJsonValueString>(Pair.Key)); }
-        }
-        if (FlagCache.bLoaded) { Merged->SetArrayField(TEXT("$active_feature_flags"), ActiveFlags); }
-        PostHogJson::Merge(*Merged, *Properties.ToNative());
-        const bool bProcess = Config.PersonProfiles != EPostHogPersonProfiles::Never &&
-            (Config.PersonProfiles == EPostHogPersonProfiles::Always || bIdentified || bPersonProcessing);
-        Merged->SetBoolField(TEXT("$process_person_profile"), bProcess);
-        Merged->SetBoolField(TEXT("$is_identified"), bIdentified);
-        const FString Session = SessionLocked(Event.Timestamp, true);
-        if (!Session.IsEmpty()) { Merged->SetStringField(TEXT("$session_id"), Session); }
-        else { Merged->RemoveField(TEXT("$session_id")); }
-        PostHogJson::RemoveNullObjectProperties(MakeShared<FJsonValueObject>(Merged));
-        Event.Properties = FPostHogProperties::FromNative(Merged);
-        return Event;
-    }
-
-    EPostHogCaptureResult Emit(FPostHogEvent Event, bool bMinimal = false)
-    {
-        const uint64 AdmissionGeneration = Event.ConsentGeneration;
-        // Config is immutable after creation. Hooks can safely reenter this client.
-        if (Config.BeforeSend && !Config.BeforeSend(Event)) { return EPostHogCaptureResult::Disabled; }
-        if (!NonBlank(Event.Event) || !NonBlank(Event.DistinctId) || !Event.Properties.IsValid()) { return EPostHogCaptureResult::Invalid; }
-        if (bMinimal) { FPostHogFlagCache::Minimize(Event.Properties); }
-        auto Envelope = MakeShared<FJsonObject>();
-        Envelope->SetStringField(TEXT("event"), Event.Event);
-        Envelope->SetStringField(TEXT("distinct_id"), Event.DistinctId);
-        Envelope->SetStringField(TEXT("uuid"), Event.Uuid);
-        Envelope->SetStringField(TEXT("timestamp"), Event.Timestamp.ToIso8601());
-        auto Properties = Event.Properties.ToNative();
-        PostHogJson::RemoveNullObjectProperties(MakeShared<FJsonValueObject>(Properties));
-        Envelope->SetObjectField(TEXT("properties"), Properties);
-        const FString Json = PostHogJson::Encode(Envelope);
-        if (!PostHogJson::IsBounded(Json)) { return EPostHogCaptureResult::Invalid; }
+            explicit FHookScope(FImpl* Current) { HookClients.Add(Current); }
+            ~FHookScope() { HookClients.Pop(EAllowShrinking::No); }
+        } Scope(&Self);
+        if (!Input.data || Input.len > PHU_MAX_HOOK) { return PHU_DROPPED; }
+        const FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(Input.data), static_cast<int32>(Input.len));
+        auto Event = PostHogJson::Decode(FString(Text.Length(), Text.Get()), PHU_MAX_HOOK);
+        if (!Event || !Self.BeforeSend) { return PHU_DROPPED; }
+#if PLATFORM_EXCEPTIONS_DISABLED
+        if (!Self.BeforeSend(*Event)) { return PHU_DROPPED; }
+#else
+        try { if (!Self.BeforeSend(*Event)) { return PHU_DROPPED; } }
+        catch (...) { return PHU_DROPPED; }
+#endif
+        const FString Json = PostHogJson::Encode(Event.ToSharedRef());
+        if (!PostHogJson::IsBounded(Json, PHU_MAX_HOOK)) { return PHU_DROPPED; }
         const FTCHARToUTF8 Utf8(*Json);
-        FScopeLock Lock(&Mutex);
-        if (bClosed || Handle == 0) { return EPostHogCaptureResult::Closed; }
-        if (bOptedOut || ConsentGeneration != AdmissionGeneration) { return EPostHogCaptureResult::Disabled; }
-        switch (phu_capture(Handle, View(Utf8)))
+        return phu_buffer_copy(PostHogNative::View(Utf8), Output);
+    }
+    bool Open()
+    { FScopeLock Lock(&Mutex); return Handle && !bClosing; }
+    EPostHogResult Command(const TSharedRef<FJsonObject>& Object)
+    {
+        const FString Json = PostHogJson::Encode(Object);
+        if (!PostHogJson::IsBounded(Json)) { return EPostHogResult::InvalidInput; }
+        FCall Call(AsShared()); if (!Call.Handle) { return EPostHogResult::Closed; }
+        const FTCHARToUTF8 Utf8(*Json);
+        return PostHogNative::Result(phu_command(Call.Handle, PostHogNative::View(Utf8)));
+    }
+    EPostHogResult Read(const TSharedRef<FJsonObject>& Query, TSharedPtr<FJsonValue>& Value)
+    {
+        FCall Call(AsShared()); if (!Call.Handle) { return EPostHogResult::Closed; }
+        const FString Json = PostHogJson::Encode(Query);
+        if (!PostHogJson::IsBounded(Json)) { return EPostHogResult::InvalidInput; }
+        const FTCHARToUTF8 Utf8(*Json); PostHogNative::FBuffer Buffer;
+        const auto Status = phu_read(Call.Handle, PostHogNative::View(Utf8), &Buffer.Value);
+        if (Status != PHU_OK) { return PostHogNative::Result(Status); }
+        Value = Buffer.Read(); return Value ? EPostHogResult::Ok : EPostHogResult::InvalidResponse;
+    }
+    TSharedPtr<FJsonObject> State()
+    {
+        TSharedPtr<FJsonValue> Value;
+        return Read(PostHogNative::Operation(TEXT("state")), Value) == EPostHogResult::Ok && Value->Type == EJson::Object
+            ? Value->AsObject() : nullptr;
+    }
+    void BeginClose()
+    {
+        phu_handle NativeHandle; TFunction<void()> Cancel;
+        { FScopeLock Lock(&Mutex); bClosing = true; NativeHandle = Handle; Cancel = CancelHost; }
+        // Cancel synchronizes renderer SDK calls before native admission closes. No GPU wait here.
+        if (Cancel) { Cancel(); }
+        if (NativeHandle) { phu_begin_shutdown(NativeHandle); }
+    }
+    FPostHogDrainResult FinishClose()
+    {
+        phu_handle NativeHandle;
+        { FScopeLock Lock(&Mutex); if (bClosed) { return LastClose; } NativeHandle = Handle; }
+        TFunction<FHostClose()> Retire;
+        { FScopeLock Lock(&Mutex); Retire = RetireHost; }
+        if (Retire)
         {
-        case PHU_ACCEPTED: return EPostHogCaptureResult::Accepted;
-        case PHU_DISABLED: return EPostHogCaptureResult::Disabled;
-        case PHU_QUEUE_FULL: return EPostHogCaptureResult::QueueFull;
-        case PHU_CLOSED: return EPostHogCaptureResult::Closed;
-        default: return EPostHogCaptureResult::Invalid;
+            const auto Host = Retire();
+            if (!Host.Key.IsValid() || !Host.Key.Get()) { return Failure(EPostHogResult::TaskUnavailable); }
         }
-    }
-
-    void InvalidateFlagsLocked()
-    {
-        ++FlagGeneration;
-        FlagCache.Clear();
-    }
-
-    TSharedFuture<FPostHogFlagReloadResult> ReloadFlagsLocked()
-    {
-        if (!CanCaptureLocked())
-        { return Ready(FPostHogFlagReloadResult{bClosed ? EPostHogFlagReloadStatus::Closed : EPostHogFlagReloadStatus::Disabled, false}); }
-        if (bLoadingFlags)
+        PostHogNative::FBuffer Buffer;
+        const auto Status = phu_close(NativeHandle, &Buffer.Value);
+        auto Result = PostHogNative::Drain(Status, Buffer);
+        if (Status != PHU_OK) { return Result; } // CLOSED/DEFERRED/error do not certify teardown.
+        Idle->Wait();
+        TFunction<bool(FJsonObject&)> ReleasedHook;
+        TFunction<void()> ReleasedCancel; TFunction<FHostClose()> ReleasedRetire;
         {
-            bReloadFlagsRequested |= LoadingFlagGeneration != FlagGeneration;
-            return FlagFuture;
+            FScopeLock Lock(&Mutex);
+            Handle = 0; bClosed = true; Result.bJoined = true; LastClose = Result;
+            ReleasedHook = MoveTemp(BeforeSend);
+            ReleasedCancel = MoveTemp(CancelHost); ReleasedRetire = MoveTemp(RetireHost);
         }
-        bLoadingFlags = true;
-        LoadingFlagGeneration = FlagGeneration;
-        auto Self = AsShared();
-        FlagFuture = PostHogTasks::Run([Self]
         {
-            for (;;)
-            {
-                FString Context;
-                uint64 Generation, Consent;
-                phu_handle NativeHandle;
-                {
-                    FScopeLock Lock(&Self->Mutex);
-                    if (!Self->CanCaptureLocked())
-                    {
-                        Self->bLoadingFlags = false;
-                        return FPostHogFlagReloadResult{Self->bClosed ? EPostHogFlagReloadStatus::Closed : EPostHogFlagReloadStatus::Disabled, false};
-                    }
-                    Generation = Self->FlagGeneration; Consent = Self->ConsentGeneration;
-                    Self->LoadingFlagGeneration = Generation; Self->bReloadFlagsRequested = false;
-                    Context = Self->FlagContextLocked().ToJson(); NativeHandle = Self->Handle;
-                }
-                const FTCHARToUTF8 Utf8(*Context);
-                phu_buffer Buffer{nullptr, 0};
-                const phu_status Status = phu_flags(NativeHandle, View(Utf8), &Buffer);
-                TSharedPtr<FJsonObject> Response;
-                if (Status == PHU_OK && Buffer.data && Buffer.len <= 1024 * 1024)
-                {
-                    const FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(Buffer.data), static_cast<int32>(Buffer.len));
-                    Response = PostHogJson::Decode(FString(Text.Length(), Text.Get()));
-                }
-                phu_buffer_free(Buffer);
-                FPostHogFlagReloadResult Result;
-                TSharedFuture<bool> Saved;
-                uint64 CacheRevision = 0;
-                {
-                    FScopeLock Lock(&Self->Mutex);
-                    if (!Self->bClosed && !Self->bOptedOut && Self->FlagGeneration == Generation && Self->ConsentGeneration == Consent && Response)
-                    {
-                        Result.Status = Self->FlagCache.Apply(Response.ToSharedRef());
-                        if (Result.Status == EPostHogFlagReloadStatus::Success || Result.Status == EPostHogFlagReloadStatus::Partial)
-                        {
-                            CacheRevision = Self->FlagCache.Revision;
-                            Saved = Self->PersistLocked();
-                        }
-                    }
-                }
-                const bool bSaved = Saved.IsValid() && Saved.Get();
-                {
-                    FScopeLock Lock(&Self->Mutex);
-                    Result.bPersisted = bSaved && Self->SavedCacheRevision.IsSet() && Self->SavedCacheRevision.GetValue() == CacheRevision;
-                    if (Self->bClosed) { Result = {EPostHogFlagReloadStatus::Closed, false}; }
-                    else if (Self->bOptedOut) { Result = {EPostHogFlagReloadStatus::Disabled, false}; }
-                    else if (Self->FlagGeneration != Generation || Self->ConsentGeneration != Consent)
-                    { Result = {EPostHogFlagReloadStatus::Stale, false}; }
-                    if (Self->CanCaptureLocked() && Self->bReloadFlagsRequested) { continue; }
-                    if (Self->CanCaptureLocked() && Self->FlagGeneration == Generation && Self->ConsentGeneration == Consent)
-                    { Result.Flags = Self->FlagCache.Values(); }
-                    Result.ContextGeneration = Generation;
-                    Self->bLoadingFlags = false;
-                    return Result;
-                }
-            }
-        });
-        // Run returns a ready default result if native thread creation failed.
-        if (FlagFuture.IsReady()) { bLoadingFlags = false; }
-        return FlagFuture;
+            FScopeLock Lock(&ClientsMutex);
+            Clients.RemoveAll([this](const auto& Entry) { return Entry.Get() == this; });
+        }
+        // Application captures can have reentrant destructors; release outside all locks.
+        ReleasedHook = nullptr;
+        return Result;
     }
-
-    TSharedFuture<bool> OptInLocked()
+    TSharedFuture<FPostHogDrainResult> Close()
     {
-        const uint64 Generation = ++ConsentGeneration;
-        ++FlagGeneration;
-        const phu_handle NativeHandle = Handle;
-        auto Self = AsShared();
-        return PostHogTasks::Run([Self, Generation, NativeHandle]
+        BeginClose();
+        TFunction<FHostClose()> Retire;
+        { FScopeLock Lock(&Mutex); Retire = RetireHost; }
+        const bool bHostDeferred = Retire && Retire().Value;
+        TSharedFuture<FPostHogDrainResult> Future;
         {
-            { FScopeLock Lock(&Self->Mutex); if (Self->bClosed || Self->ConsentGeneration != Generation) { return false; } }
-            // Keep persisted opt-out until the old spool has been purged. The
-            // local gate remains closed while native admission resumes.
-            const phu_status Status = phu_opt_in(NativeHandle);
-            TSharedFuture<bool> Saved;
+            FScopeLock Lock(&Mutex);
+            if (bClosed) { return Ready(LastClose); }
+            if (!bCloseScheduled)
             {
-                FScopeLock Lock(&Self->Mutex);
-                if (Self->bClosed || Self->ConsentGeneration != Generation || Status != PHU_OK) { return false; }
-                Self->DesiredOptOut = false;
-                Saved = Self->PersistLocked();
+                auto Promise = MakeShared<TPromise<FPostHogDrainResult>, ESPMode::ThreadSafe>();
+                CloseFuture = Promise->GetFuture().Share(); bCloseScheduled = true;
+                auto Self = AsShared();
+                if (!PostHogTasks::Launch([Self, Promise]
+                {
+                    auto Result = Self->FinishClose();
+                    { FScopeLock StateLock(&Self->Mutex); Self->bCloseScheduled = false; }
+                    Promise->SetValue(Result);
+                }))
+                { bCloseScheduled = false; Promise->SetValue(Failure(EPostHogResult::TaskUnavailable)); }
             }
-            const bool bSaved = Saved.Get();
-            FScopeLock Lock(&Self->Mutex);
-            if (Self->bClosed || Self->ConsentGeneration != Generation) { return false; }
-            if (!bSaved)
-            {
-                Self->DesiredOptOut = Self->bOptedOut;
-                if (Self->bOptedOut) { phu_opt_out(NativeHandle); }
-                Self->PersistLocked();
-                return false;
-            }
-            Self->bOptedOut = false;
-            Self->ReloadFlagsLocked();
-            return true;
-        });
-    }
-
-    TSharedFuture<bool> Close()
-    {
-        FScopeLock Lock(&Mutex);
-        if (CloseFuture.IsValid()) { return CloseFuture; }
-        bClosed = true; ++ConsentGeneration; ++FlagGeneration; FlagCache.Reported.Empty(); DesiredOptOut = bOptedOut;
-        if (Handle != 0) { phu_begin_shutdown(Handle); }
-        const auto Saved = PersistLocked();
-        const phu_handle NativeHandle = Handle;
-        Handle = 0;
-        auto Self = AsShared();
-        CloseFuture = PostHogTasks::Run([Self, Saved, NativeHandle]
-        {
-            const bool bSaved = Saved.Get();
-            const phu_status Status = NativeHandle == 0 ? PHU_OK : phu_close(NativeHandle);
-            return bSaved && (Status == PHU_OK || Status == PHU_CLOSED);
-        });
-        return CloseFuture;
+            Future = CloseFuture;
+        }
+        // Waiting on a background finisher inside the callback would wait for this very callback.
+        return HookClients.Contains(this) || bHostDeferred ? Ready(Failure(EPostHogResult::Deferred)) : Future;
     }
 };
+thread_local TArray<FPostHogClient::FImpl*> FPostHogClient::FImpl::HookClients;
+
+bool FPostHogClient::BindHostClose(TFunction<void()>&& Cancel, TFunction<FHostClose()>&& Retire)
+{
+    FScopeLock Lock(&Impl->Mutex);
+    if (Impl->bClosing || Impl->RetireHost) { return false; }
+    Impl->CancelHost = MoveTemp(Cancel); Impl->RetireHost = MoveTemp(Retire); return true;
+}
+
+EPostHogResult FPostHogClient::CoordinationKey(const FPostHogConfig& Config, FString& OutKey)
+{
+    OutKey.Empty();
+    if (phu_abi_version() != PHU_ABI_VERSION) { return EPostHogResult::UnsupportedAbi; }
+    auto Input = MakeShared<FJsonObject>();
+    Input->SetStringField(TEXT("host"), Config.Host); Input->SetStringField(TEXT("project_token"), Config.ProjectToken);
+    Input->SetStringField(TEXT("instance_name"), Config.ClientName);
+    const FString Json = PostHogJson::Encode(Input);
+    if (!PostHogJson::IsBounded(Json)) { return EPostHogResult::InvalidInput; }
+    const FTCHARToUTF8 Utf8(*Json); PostHogNative::FBuffer Buffer;
+    const auto Status = phu_coordination_key(PostHogNative::View(Utf8), &Buffer.Value);
+    if (Status != PHU_OK) { return PostHogNative::Result(Status); }
+    const auto Value = Buffer.Read();
+    if (!Value || Value->Type != EJson::String) { return EPostHogResult::InvalidResponse; }
+    OutKey = Value->AsString(); return EPostHogResult::Ok;
+}
 
 TSharedFuture<FPostHogClient::FPtr> FPostHogClient::CreateAsync(FPostHogConfig Config)
 {
-    if (!NonBlank(Config.ProjectToken) || !NonBlank(Config.Host) || Config.StorageRoot.IsEmpty() || !NonBlank(Config.ClientName) || !Config.Now)
-    { return Ready(FPtr()); }
-    FScopeLock AdmissionLock(&ClientsMutex);
+    FScopeLock Admission(&ClientsMutex);
     if (bStopping) { return Ready(FPtr()); }
     return PostHogTasks::Run([Config = MoveTemp(Config)]() mutable -> FPtr
     {
-        Config.ProjectToken.TrimStartAndEndInline(); Config.Host.TrimStartAndEndInline();
-        while (Config.Host.EndsWith(TEXT("/"))) { Config.Host.LeftChopInline(1); }
-        const FString Namespace = FMD5::HashAnsiString(*(Config.Host + TEXT("\n") + Config.ProjectToken + TEXT("\n") + Config.ClientName));
-        const FString Directory = FPaths::ConvertRelativePathToFull(Config.StorageRoot / Namespace);
-        auto State = MakeShared<FImpl, ESPMode::ThreadSafe>(MoveTemp(Config), Directory / TEXT("state.json"));
-        State->Restore();
-        const auto& Options = State->Config;
-        auto Json = MakeShared<FJsonObject>();
-        Json->SetStringField(TEXT("project_token"), Options.ProjectToken);
-        Json->SetStringField(TEXT("host"), Options.Host);
-        Json->SetStringField(TEXT("storage_path"), Directory / TEXT("events"));
-        Json->SetBoolField(TEXT("opted_out"), State->bOptedOut);
-        Json->SetNumberField(TEXT("flush_at"), Options.FlushAt);
-        Json->SetNumberField(TEXT("flush_interval_ms"), Options.FlushIntervalMilliseconds);
-        Json->SetNumberField(TEXT("max_queue_size"), Options.MaxQueueSize);
-        Json->SetNumberField(TEXT("max_batch_size"), Options.MaxBatchSize);
-        Json->SetNumberField(TEXT("request_timeout_seconds"), Options.RequestTimeoutSeconds);
-        Json->SetNumberField(TEXT("shutdown_timeout_ms"), Options.ShutdownTimeoutMilliseconds);
-        const FTCHARToUTF8 Utf8(*PostHogJson::Encode(Json));
-        if (phu_abi_version() != PHU_ABI_VERSION || phu_create(PHU_ABI_VERSION, View(Utf8), &State->Handle) != PHU_OK) { return nullptr; }
-        // First identity must be saved before initialization becomes observable.
-        if (!SaveAtomic(State->StateFile, State->StateJsonLocked()))
-        { ++State->StateWriteErrors; UE_LOG(LogPostHogClient, Warning, TEXT("PostHog identity persistence is unavailable.")); }
+        if (phu_abi_version() != PHU_ABI_VERSION || !Config.Context.IsValid()) { return nullptr; }
+        auto State = MakeShared<FImpl, ESPMode::ThreadSafe>(MoveTemp(Config.BeforeSend));
+        auto Options = MakeShared<FJsonObject>();
+        Options->SetStringField(TEXT("project_token"), Config.ProjectToken);
+        Options->SetStringField(TEXT("host"), Config.Host);
+        if (!Config.StorageRoot.IsEmpty()) { Options->SetStringField(TEXT("storage_root"), Config.StorageRoot); }
+        Options->SetStringField(TEXT("instance_name"), Config.ClientName);
+        const TCHAR* Profiles = Config.PersonProfiles == EPostHogPersonProfiles::Never ? TEXT("never") :
+            Config.PersonProfiles == EPostHogPersonProfiles::Always ? TEXT("always") : TEXT("identified_only");
+        Options->SetStringField(TEXT("person_profiles"), Profiles);
+        Options->SetStringField(TEXT("session_mode"), Config.SessionMode == EPostHogSessionMode::Manual ? TEXT("manual") : TEXT("automatic"));
+        Options->SetBoolField(TEXT("persist_sessions"), Config.bPersistSessions);
+        Options->SetBoolField(TEXT("opt_out"), Config.bInitiallyOptedOut);
+        Options->SetBoolField(TEXT("preload_feature_flags"), Config.bPreloadFeatureFlags);
+        Options->SetBoolField(TEXT("send_feature_flag_event"), Config.bSendFeatureFlagEvents);
+        Options->SetObjectField(TEXT("platform_context"), Config.Context.ToNative());
+        Options->SetNumberField(TEXT("flush_at"), Config.FlushAt);
+        Options->SetNumberField(TEXT("flush_interval_ms"), Config.FlushIntervalMilliseconds);
+        Options->SetNumberField(TEXT("max_queue_size"), Config.MaxQueueSize);
+        Options->SetNumberField(TEXT("max_batch_size"), Config.MaxBatchSize);
+        Options->SetNumberField(TEXT("request_timeout_seconds"), Config.RequestTimeoutSeconds);
+        Options->SetNumberField(TEXT("shutdown_timeout_ms"), Config.ShutdownTimeoutMilliseconds);
+        Options->SetNumberField(TEXT("jpeg_quality"), Config.Replay.JpegQuality);
+        Options->SetNumberField(TEXT("max_frames_in_flight"), Config.Replay.MaxFramesInFlight);
+        const FString Json = PostHogJson::Encode(Options);
+        if (!PostHogJson::IsBounded(Json)) { return nullptr; }
+        const FTCHARToUTF8 Utf8(*Json);
+        const phu_hooks Hooks{State->BeforeSend ? &FImpl::Hook : nullptr, &State.Get()};
+        if (phu_create(PHU_ABI_VERSION, PostHogNative::View(Utf8), Hooks, &State->Handle) != PHU_OK) { return nullptr; }
+        bool bStop;
+        { FScopeLock Lock(&ClientsMutex); bStop = bStopping; Clients.Add(State); }
+        if (bStop)
         {
-            FScopeLock Lock(&ClientsMutex);
-            if (bStopping) { phu_close(State->Handle); return nullptr; }
-            Clients.RemoveAll([](const auto& Client) { return !Client.IsValid(); });
-            Clients.Add(State);
-            if (State->Config.bPreloadFeatureFlags) { FScopeLock StateLock(&State->Mutex); State->ReloadFlagsLocked(); }
+            State->BeginClose();
+            if (!State->FinishClose().bJoined) { UE_LOG(LogPostHogClient, Fatal, TEXT("PostHog initialization could not join native teardown.")); }
+            return nullptr;
         }
         return FPtr(new FPostHogClient(State));
     });
 }
-
 FPostHogClient::~FPostHogClient() { Impl->Close(); }
-bool FPostHogClient::IsInitialized() const { FScopeLock Lock(&Impl->Mutex); return !Impl->bClosed && Impl->Handle != 0; }
-FString FPostHogClient::GetDistinctId() const { FScopeLock Lock(&Impl->Mutex); return Impl->DistinctId; }
-FString FPostHogClient::GetAnonymousId() const { FScopeLock Lock(&Impl->Mutex); return Impl->AnonymousId; }
-bool FPostHogClient::IsOptedOut() const { FScopeLock Lock(&Impl->Mutex); return Impl->bOptedOut; }
+bool FPostHogClient::IsInitialized() const { return Impl->Open(); }
+bool FPostHogClient::IsDisabled() const
+{ const auto State = Impl->State(); bool Disabled = true; if (State) { State->TryGetBoolField(TEXT("disabled"), Disabled); } return Disabled; }
+bool FPostHogClient::IsOptedOut() const
+{ const auto State = Impl->State(); bool OptedOut = true; if (State) { State->TryGetBoolField(TEXT("opt_out"), OptedOut); } return OptedOut; }
+FString FPostHogClient::GetDistinctId() const
+{ const auto State = Impl->State(); FString Id; if (State) { State->TryGetStringField(TEXT("distinct_id"), Id); } return Id; }
+FString FPostHogClient::GetAnonymousId() const
+{ const auto State = Impl->State(); FString Id; if (State) { State->TryGetStringField(TEXT("anonymous_id"), Id); } return Id; }
 
-EPostHogCaptureResult FPostHogClient::Capture(const FString& Name, const FPostHogProperties& Properties)
-{ return CaptureWithDefaults(Name, Properties, nullptr); }
+EPostHogResult FPostHogClient::Capture(const FString& Name, const FPostHogProperties& Properties, const FPostHogProperties& Options)
+{ return CaptureWithFallback(Name, Properties, {}, Options); }
+EPostHogResult FPostHogClient::CaptureWithFallback(const FString& Name, const FPostHogProperties& Properties,
+    const FPostHogProperties& Fallback, const FPostHogProperties& Options)
+{
+    if (!Properties.IsValid() || !Options.IsValid() || !Fallback.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = MakeShared<FJsonObject>(); Input->SetStringField(TEXT("event"), Name);
+    Input->SetObjectField(TEXT("properties"), Properties.ToNative()); Input->SetObjectField(TEXT("options"), Options.ToNative());
+    Input->SetObjectField(TEXT("fallback_properties"), Fallback.ToNative());
+    const FString Json = PostHogJson::Encode(Input);
+    if (!PostHogJson::IsBounded(Json)) { return EPostHogResult::InvalidInput; }
+    FImpl::FCall Call(Impl); if (!Call.Handle) { return EPostHogResult::Closed; }
+    const FTCHARToUTF8 Utf8(*Json); PostHogNative::FBuffer Receipt;
+    return PostHogNative::Result(phu_capture(Call.Handle, PostHogNative::View(Utf8), &Receipt.Value));
+}
+EPostHogResult FPostHogClient::Screen(const FString& Name, const FPostHogProperties& Properties)
+{
+    if (!Properties.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = MakeShared<FJsonObject>(); Input->SetStringField(TEXT("name"), Name); Input->SetObjectField(TEXT("properties"), Properties.ToNative());
+    const FString Json = PostHogJson::Encode(Input); if (!PostHogJson::IsBounded(Json)) { return EPostHogResult::InvalidInput; }
+    FImpl::FCall Call(Impl); if (!Call.Handle) { return EPostHogResult::Closed; }
+    const FTCHARToUTF8 Utf8(*Json); PostHogNative::FBuffer Receipt;
+    return PostHogNative::Result(phu_screen(Call.Handle, PostHogNative::View(Utf8), &Receipt.Value));
+}
+EPostHogResult FPostHogClient::Identify(const FString& Id, const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
+{
+    if (!Set.IsValid() || !SetOnce.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = PostHogNative::Operation(TEXT("identify")); Input->SetStringField(TEXT("distinct_id"), Id);
+    Input->SetObjectField(TEXT("set"), Set.ToNative()); Input->SetObjectField(TEXT("set_once"), SetOnce.ToNative()); return Impl->Command(Input);
+}
+EPostHogResult FPostHogClient::Reset() { return Impl->Command(PostHogNative::Operation(TEXT("reset"))); }
+EPostHogResult FPostHogClient::Alias(const FString& Id)
+{ auto Input = PostHogNative::Operation(TEXT("alias")); Input->SetStringField(TEXT("alias"), Id); return Impl->Command(Input); }
+EPostHogResult FPostHogClient::Register(const FPostHogProperties& Properties)
+{
+    if (!Properties.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = PostHogNative::Operation(TEXT("register")); Input->SetObjectField(TEXT("properties"), Properties.ToNative()); return Impl->Command(Input);
+}
+EPostHogResult FPostHogClient::Unregister(const FString& Key)
+{ auto Input = PostHogNative::Operation(TEXT("unregister")); Input->SetStringField(TEXT("key"), Key); return Impl->Command(Input); }
+EPostHogResult FPostHogClient::SetPersonProperties(const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
+{
+    if (!Set.IsValid() || !SetOnce.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = PostHogNative::Operation(TEXT("set_person_properties"));
+    Input->SetObjectField(TEXT("set"), Set.ToNative()); Input->SetObjectField(TEXT("set_once"), SetOnce.ToNative()); return Impl->Command(Input);
+}
+EPostHogResult FPostHogClient::Group(const FString& Type, const FString& Key, const FPostHogProperties& Properties)
+{
+    if (!Properties.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = PostHogNative::Operation(TEXT("group")); Input->SetStringField(TEXT("group_type"), Type);
+    Input->SetStringField(TEXT("group_key"), Key); Input->SetObjectField(TEXT("properties"), Properties.ToNative()); return Impl->Command(Input);
+}
+EPostHogResult FPostHogClient::GroupIdentify(const FString& Type, const FString& Key, const FPostHogProperties& Properties)
+{
+    if (!Properties.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = PostHogNative::Operation(TEXT("group_identify")); Input->SetStringField(TEXT("group_type"), Type);
+    Input->SetStringField(TEXT("group_key"), Key); Input->SetObjectField(TEXT("properties"), Properties.ToNative()); return Impl->Command(Input);
+}
+EPostHogResult FPostHogClient::RemoveGroup(const FString& Type)
+{ auto Input = PostHogNative::Operation(TEXT("remove_group")); Input->SetStringField(TEXT("group_type"), Type); return Impl->Command(Input); }
+EPostHogResult FPostHogClient::OptOut() { return Impl->Command(PostHogNative::Operation(TEXT("opt_out"))); }
+EPostHogResult FPostHogClient::OptIn() { return Impl->Command(PostHogNative::Operation(TEXT("opt_in"))); }
+TSharedFuture<FPostHogDrainResult> FPostHogClient::FlushAsync()
+{
+    auto Flush = [Self = Impl]
+    {
+        FImpl::FCall Call(Self); if (!Call.Handle) { return Failure(EPostHogResult::Closed); }
+        PostHogNative::FBuffer Buffer; return PostHogNative::Drain(phu_flush(Call.Handle, &Buffer.Value), Buffer);
+    };
+    if (FImpl::HookClients.Contains(Impl.Get())) { return Ready(Flush()); }
+    auto Promise = MakeShared<TPromise<FPostHogDrainResult>, ESPMode::ThreadSafe>(); auto Future = Promise->GetFuture().Share();
+    if (!PostHogTasks::Launch([Promise, Flush = MoveTemp(Flush)] { Promise->SetValue(Flush()); }))
+    { Promise->SetValue(Failure(EPostHogResult::TaskUnavailable)); }
+    return Future;
+}
+TSharedFuture<FPostHogDrainResult> FPostHogClient::ShutdownAsync() { return Impl->Close(); }
 
-EPostHogCaptureResult FPostHogClient::CaptureWithDefaults(const FString& Name, const FPostHogProperties& Properties, const FPostHogProperties* Defaults)
+FPostHogFeatureFlagResult FPostHogClient::GetFeatureFlagResult(const FString& Key, EPostHogFlagReporting Reporting)
 {
-    if (!NonBlank(Name) || !Properties.IsValid()) { return EPostHogCaptureResult::Invalid; }
-    FPostHogEvent Event;
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->bClosed) { return EPostHogCaptureResult::Closed; }
-        if (!Impl->CanCaptureLocked()) { return EPostHogCaptureResult::Disabled; }
-        Event = Impl->SnapshotLocked(Name, Properties, Defaults);
-    }
-    return Impl->Emit(MoveTemp(Event));
+    auto Query = PostHogNative::Operation(TEXT("feature_flag")); Query->SetStringField(TEXT("key"), Key);
+    if (Reporting != EPostHogFlagReporting::Default) { Query->SetBoolField(TEXT("send_event"), Reporting == EPostHogFlagReporting::Send); }
+    TSharedPtr<FJsonValue> Value; const auto Status = Impl->Read(Query, Value);
+    if (Status == EPostHogResult::Ok) { return PostHogNative::Flag(Value); }
+    FPostHogFeatureFlagResult Out; Out.Status = Status; return Out;
 }
-EPostHogCaptureResult FPostHogClient::Screen(const FString& Name, const FPostHogProperties& Properties)
+FPostHogFeatureFlags FPostHogClient::GetFeatureFlags() const
 {
-    if (!NonBlank(Name)) { return EPostHogCaptureResult::Invalid; }
-    auto Values = Properties; Values.SetString(TEXT("$screen_name"), Name);
-    return Capture(TEXT("$screen"), Values);
+    TSharedPtr<FJsonValue> Value; const auto Status = Impl->Read(PostHogNative::Operation(TEXT("feature_flags")), Value);
+    if (Status == EPostHogResult::Ok) { return PostHogNative::Flags(Value); }
+    FPostHogFeatureFlags Out; Out.Status = Status; return Out;
 }
-
-bool FPostHogClient::Identify(const FString& Id, const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
+EPostHogResult FPostHogClient::ReloadFeatureFlags() { return Impl->Command(PostHogNative::Operation(TEXT("reload_feature_flags"))); }
+EPostHogResult FPostHogClient::PollFeatureFlags(FPostHogFeatureFlagsUpdate& Update)
 {
-    if (!NonBlank(Id) || !Set.IsValid() || !SetOnce.IsValid()) { return false; }
-    FPostHogEvent Event;
-    uint64 Generation = 0;
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (!Impl->CanProcessPeopleLocked() || (Impl->bIdentified && Impl->DistinctId != Id) || !Impl->CanPersistLocked(Id)) { return false; }
-        const bool bWasIdentified = Impl->bIdentified;
-        if (bWasIdentified && ((Set.IsEmpty() && SetOnce.IsEmpty()) || (Impl->bHasPersonProperties && SameProperties(Set, Impl->LastSet) && SameProperties(SetOnce, Impl->LastSetOnce)))) { return false; }
-        auto Properties = MakeShared<FJsonObject>();
-        const bool bLink = !bWasIdentified && Id != Impl->DistinctId;
-        if (bLink) { Properties->SetStringField(TEXT("$anon_distinct_id"), Impl->DistinctId); }
-        Properties->SetObjectField(TEXT("$set"), Set.ToNative());
-        Properties->SetObjectField(TEXT("$set_once"), SetOnce.ToNative());
-        Impl->DistinctId = Id; Impl->bIdentified = true;
-        if (!bWasIdentified) { ++Impl->IdentityGeneration; Impl->InvalidateFlagsLocked(); }
-        Generation = Impl->IdentityGeneration;
-        Event = Impl->SnapshotLocked(bLink ? TEXT("$identify") : TEXT("$set"), FPostHogProperties::FromNative(Properties));
-        Impl->PersistLocked();
-        if (!bWasIdentified) { Impl->ReloadFlagsLocked(); }
-    }
-    if (Impl->Emit(MoveTemp(Event)) == EPostHogCaptureResult::Accepted)
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->IdentityGeneration == Generation && !Impl->bClosed)
-        { Impl->LastSet = Set; Impl->LastSetOnce = SetOnce; Impl->bHasPersonProperties = true; }
-    }
-    return true;
+    Update = {}; FImpl::FCall Call(Impl);
+    if (!Call.Handle) { Update.Snapshot.Status = EPostHogResult::Closed; return EPostHogResult::Closed; }
+    PostHogNative::FBuffer Buffer; const auto Status = phu_poll_flags(Call.Handle, &Buffer.Value);
+    if (Status != PHU_OK) { Update.Snapshot.Status = PostHogNative::Result(Status); return Update.Snapshot.Status; }
+    Update = PostHogNative::Update(Buffer.Read()); return Update.Snapshot.Status;
 }
-
-TSharedFuture<bool> FPostHogClient::ResetAsync()
+EPostHogResult FPostHogClient::SetPersonPropertiesForFlags(const FPostHogProperties& Properties, bool bReload)
 {
-    FScopeLock Lock(&Impl->Mutex);
-    if (Impl->bClosed) { return Ready(false); }
-    ++Impl->IdentityGeneration;
-    Impl->AnonymousId = PostHogJson::NewUuidV7(Impl->Config.Now()); Impl->DistinctId = Impl->AnonymousId;
-    Impl->bIdentified = false; Impl->bPersonProcessing = false; Impl->bHasPersonProperties = false;
-    Impl->Registered = {}; Impl->Groups = {}; Impl->LastSet = {}; Impl->LastSetOnce = {};
-    Impl->PersonFlagProperties = {}; Impl->GroupFlagProperties = {}; Impl->InvalidateFlagsLocked();
-    if (Impl->Config.SessionMode == EPostHogSessionMode::Automatic || !Impl->SessionId.IsEmpty()) { Impl->StartSessionLocked(Impl->Config.Now()); }
-    if (Impl->bOptedOut) { return Impl->OptInLocked(); }
-    Impl->ReloadFlagsLocked();
-    return Impl->PersistLocked();
+    if (!Properties.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = PostHogNative::Operation(TEXT("set_person_properties_for_flags")); Input->SetObjectField(TEXT("properties"), Properties.ToNative());
+    Input->SetBoolField(TEXT("reload"), bReload); return Impl->Command(Input);
 }
-
-void FPostHogClient::Alias(const FString& AliasId)
+EPostHogResult FPostHogClient::SetGroupPropertiesForFlags(const FString& Type, const FPostHogProperties& Properties, bool bReload)
 {
-    if (!NonBlank(AliasId)) { return; }
-    FPostHogEvent Event;
-    { FScopeLock Lock(&Impl->Mutex); if (!Impl->CanProcessPeopleLocked()) { return; }
-        Impl->bPersonProcessing = true; Impl->PersistLocked();
-        FPostHogProperties Values; Values.SetString(TEXT("alias"), AliasId); Values.SetString(TEXT("distinct_id"), Impl->DistinctId);
-        Event = Impl->SnapshotLocked(TEXT("$create_alias"), Values); }
-    Impl->Emit(MoveTemp(Event));
+    if (!Properties.IsValid()) { return EPostHogResult::InvalidInput; }
+    auto Input = PostHogNative::Operation(TEXT("set_group_properties_for_flags")); Input->SetStringField(TEXT("group_type"), Type);
+    Input->SetObjectField(TEXT("properties"), Properties.ToNative()); Input->SetBoolField(TEXT("reload"), bReload); return Impl->Command(Input);
 }
-void FPostHogClient::Register(const FPostHogProperties& Properties)
+EPostHogResult FPostHogClient::ResetPersonPropertiesForFlags(bool bReload)
+{ auto Input = PostHogNative::Operation(TEXT("reset_person_properties_for_flags")); Input->SetBoolField(TEXT("reload"), bReload); return Impl->Command(Input); }
+EPostHogResult FPostHogClient::ResetGroupPropertiesForFlags(const FString& Type, bool bReload)
 {
-    FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return; }
-    auto Values = Impl->Registered.ToNative(); PostHogJson::Merge(*Values, *Properties.ToNative());
-    auto Candidate = FPostHogProperties::FromNative(Values);
-    if (!Candidate.IsValid()) { return; }
-    auto Previous = Impl->Registered;
-    Impl->Registered = MoveTemp(Candidate);
-    if (!Impl->CanPersistLocked()) { Impl->Registered = MoveTemp(Previous); return; }
-    Impl->PersistLocked();
-}
-void FPostHogClient::Unregister(const FString& Key)
-{
-    FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return; }
-    Impl->Registered.Remove(Key); Impl->PersistLocked();
-}
-void FPostHogClient::SetPersonProperties(const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
-{
-    if ((Set.IsEmpty() && SetOnce.IsEmpty()) || !Set.IsValid() || !SetOnce.IsValid()) { return; }
-    FPostHogEvent Event;
-    uint64 Generation = 0;
-    { FScopeLock Lock(&Impl->Mutex); if (!Impl->CanProcessPeopleLocked()) { return; }
-        if (Impl->bHasPersonProperties && SameProperties(Set, Impl->LastSet) && SameProperties(SetOnce, Impl->LastSetOnce)) { return; }
-        Impl->bPersonProcessing = true;
-        FPostHogProperties Properties; Properties.Set(TEXT("$set"), FPostHogValue::Object(Set)); Properties.Set(TEXT("$set_once"), FPostHogValue::Object(SetOnce));
-        Event = Impl->SnapshotLocked(TEXT("$set"), Properties);
-        Generation = Impl->IdentityGeneration; Impl->PersistLocked(); }
-    if (Impl->Emit(MoveTemp(Event)) == EPostHogCaptureResult::Accepted)
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->IdentityGeneration == Generation && !Impl->bClosed)
-        { Impl->LastSet = Set; Impl->LastSetOnce = SetOnce; Impl->bHasPersonProperties = true; }
-    }
-}
-void FPostHogClient::Group(const FString& Type, const FString& Key, const FPostHogProperties& Properties)
-{
-    if (!NonBlank(Type) || !NonBlank(Key)) { return; }
-    FPostHogEvent Event;
-    { FScopeLock Lock(&Impl->Mutex); if (!Impl->CanProcessPeopleLocked()) { return; }
-        auto Previous = Impl->Groups;
-        if (!Impl->Groups.SetString(Type, Key)) { return; }
-        if (!Impl->CanPersistLocked()) { Impl->Groups = MoveTemp(Previous); return; }
-        if (!SameProperties(Previous, Impl->Groups))
-        { Impl->GroupFlagProperties.Remove(Type); Impl->InvalidateFlagsLocked(); Impl->ReloadFlagsLocked(); }
-        Impl->bPersonProcessing = true; Impl->PersistLocked();
-        FPostHogProperties Values; Values.SetString(TEXT("$group_type"), Type); Values.SetString(TEXT("$group_key"), Key); Values.Set(TEXT("$group_set"), FPostHogValue::Object(Properties));
-        Event = Impl->SnapshotLocked(TEXT("$groupidentify"), Values); }
-    Impl->Emit(MoveTemp(Event));
-}
-
-TSharedFuture<bool> FPostHogClient::OptOutAsync()
-{
-    FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return Ready(false); }
-    Impl->bOptedOut = true; Impl->DesiredOptOut = true; ++Impl->ConsentGeneration;
-    Impl->InvalidateFlagsLocked();
-    phu_opt_out(Impl->Handle);
-    const auto Saved = Impl->PersistLocked();
-    const auto State = Impl; const phu_handle Handle = Impl->Handle;
-    return PostHogTasks::Run([State, Saved, Handle]
-    {
-        const bool bSaved = Saved.Get();
-        phu_buffer Report{nullptr, 0}; const phu_status Status = phu_checkpoint(Handle, &Report);
-        bool bPurged = false;
-        if (Status == PHU_OK && Report.data)
-        {
-            const FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(Report.data), static_cast<int32>(Report.len));
-            auto Json = PostHogJson::Decode(FString(Text.Length(), Text.Get())); double Errors = 0;
-            bPurged = Json && Json->TryGetNumberField(TEXT("persistence_errors"), Errors) && Errors == 0;
-        }
-        phu_buffer_free(Report);
-        return bSaved && bPurged;
-    });
-}
-TSharedFuture<bool> FPostHogClient::OptInAsync()
-{
-    FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return Ready(false); }
-    return Impl->OptInLocked();
-}
-TSharedFuture<FPostHogDeliveryResult> FPostHogClient::FlushAsync()
-{
-    FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return Ready(FPostHogDeliveryResult()); }
-    const auto State = Impl; const phu_handle Handle = Impl->Handle;
-    const auto Saved = Impl->PersistLocked();
-    return PostHogTasks::Run([State, Handle, Saved]
-    {
-        Saved.Wait(); FPostHogDeliveryResult Result;
-        if (phu_flush(Handle) != PHU_OK) { return Result; }
-        phu_buffer Report{nullptr, 0};
-        if (phu_checkpoint(Handle, &Report) == PHU_OK && Report.data)
-        {
-            const FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(Report.data), static_cast<int32>(Report.len));
-            auto Json = PostHogJson::Decode(FString(Text.Length(), Text.Get()));
-            if (Json)
-            {
-                Result.bCompleted = true;
-                Json->TryGetNumberField(TEXT("pending"), Result.Pending);
-                Json->TryGetNumberField(TEXT("delivered"), Result.Delivered);
-                Json->TryGetNumberField(TEXT("terminally_dropped"), Result.TerminallyDropped);
-                Json->TryGetNumberField(TEXT("persistence_errors"), Result.StorageErrors);
-                FScopeLock StateLock(&State->Mutex); Result.StorageErrors += State->StateWriteErrors;
-            }
-        }
-        phu_buffer_free(Report); return Result;
-    });
-}
-TSharedFuture<bool> FPostHogClient::ShutdownAsync() { return Impl->Close(); }
-FPostHogFeatureFlagResult FPostHogClient::GetFeatureFlagResult(const FString& Key, bool bSendEvent)
-{
-    FPostHogFeatureFlagResult Result;
-    FPostHogEvent Event;
-    bool bTrack = false, bMinimal = false;
-    uint64 Revision = 0;
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (!Impl->CanCaptureLocked()) { return Result; }
-        const auto* Found = Impl->FlagCache.Flags.Find(Key);
-        if (!Found) { return Result; }
-        Result = *Found;
-        if (bSendEvent && Impl->Config.bSendFeatureFlagEvents && !Impl->FlagCache.Reported.Contains(Key))
-        {
-            Impl->FlagCache.Reported.Add(Key); Revision = Impl->FlagCache.Revision;
-            Event = Impl->SnapshotLocked(TEXT("$feature_flag_called"), FPostHogFlagCache::Exposure(Key, Result));
-            bMinimal = FPostHogFlagCache::IsMinimal(Result); bTrack = true;
-        }
-    }
-    if (bTrack && Impl->Emit(MoveTemp(Event), bMinimal) != EPostHogCaptureResult::Accepted)
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->FlagCache.Revision == Revision) { Impl->FlagCache.Reported.Remove(Key); }
-    }
-    return Result;
-}
-FPostHogFlagReloadResult FPostHogClient::ValidateFlagReloadResult(FPostHogFlagReloadResult Result) const
-{
-    FScopeLock Lock(&Impl->Mutex);
-    if (Impl->bClosed) { return {EPostHogFlagReloadStatus::Closed, false}; }
-    if (Impl->bOptedOut) { return {EPostHogFlagReloadStatus::Disabled, false}; }
-    if (Result.ContextGeneration != Impl->FlagGeneration) { return {EPostHogFlagReloadStatus::Stale, false}; }
-    return Result;
-}
-
-FPostHogValue FPostHogClient::GetFeatureFlag(const FString& Key, bool bSendEvent)
-{ return GetFeatureFlagResult(Key, bSendEvent).Value; }
-bool FPostHogClient::IsFeatureEnabled(const FString& Key, bool bSendEvent, bool bDefaultValue)
-{
-    const auto Result = GetFeatureFlagResult(Key, bSendEvent);
-    if (!Result.bFound) { return bDefaultValue; }
-    const auto Value = Result.Value.ToNative();
-    return Value->Type == EJson::String || (Value->Type == EJson::Boolean && Value->AsBool());
-}
-FPostHogValue FPostHogClient::GetFeatureFlagPayload(const FString& Key)
-{ return GetFeatureFlagResult(Key, false).Payload; }
-FPostHogProperties FPostHogClient::GetFeatureFlags() const
-{
-    FScopeLock Lock(&Impl->Mutex);
-    return Impl->CanCaptureLocked() ? Impl->FlagCache.Values() : FPostHogProperties();
-}
-bool FPostHogClient::HasLoadedFeatureFlags() const
-{ FScopeLock Lock(&Impl->Mutex); return Impl->CanCaptureLocked() && Impl->FlagCache.bLoaded; }
-TSharedFuture<FPostHogFlagReloadResult> FPostHogClient::ReloadFeatureFlagsAsync()
-{ FScopeLock Lock(&Impl->Mutex); return Impl->ReloadFlagsLocked(); }
-bool FPostHogClient::SetPersonPropertiesForFlags(const FPostHogProperties& Properties, bool bReload)
-{
-    FScopeLock Lock(&Impl->Mutex);
-    if (!Impl->CanCaptureLocked() || !Properties.IsValid() || Properties.IsEmpty()) { return false; }
-    auto Object = Impl->PersonFlagProperties.ToNative(); PostHogJson::Merge(*Object, *Properties.ToNative());
-    auto Candidate = FPostHogProperties::FromNative(Object);
-    if (!Candidate.IsValid()) { return false; }
-    if (SameProperties(Candidate, Impl->PersonFlagProperties))
-    { if (bReload) { Impl->ReloadFlagsLocked(); } return true; }
-    auto Previous = Impl->PersonFlagProperties; Impl->PersonFlagProperties = MoveTemp(Candidate);
-    if (!Impl->CanPersistLocked()) { Impl->PersonFlagProperties = MoveTemp(Previous); return false; }
-    Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
-    if (bReload) { Impl->ReloadFlagsLocked(); }
-    return true;
-}
-bool FPostHogClient::SetGroupPropertiesForFlags(const FString& Type, const FPostHogProperties& Properties, bool bReload)
-{
-    FScopeLock Lock(&Impl->Mutex);
-    if (!Impl->CanCaptureLocked() || !NonBlank(Type) || !Properties.IsValid() || Properties.IsEmpty()) { return false; }
-    auto Groups = Impl->GroupFlagProperties.ToNative();
-    auto Object = MakeShared<FJsonObject>(); const TSharedPtr<FJsonObject>* Existing = nullptr;
-    if (Groups->TryGetObjectField(Type, Existing)) { PostHogJson::Merge(*Object, **Existing); }
-    PostHogJson::Merge(*Object, *Properties.ToNative()); Groups->SetObjectField(Type, Object);
-    auto Candidate = FPostHogProperties::FromNative(Groups);
-    if (!Candidate.IsValid()) { return false; }
-    if (SameProperties(Candidate, Impl->GroupFlagProperties))
-    { if (bReload) { Impl->ReloadFlagsLocked(); } return true; }
-    auto Previous = Impl->GroupFlagProperties; Impl->GroupFlagProperties = MoveTemp(Candidate);
-    if (!Impl->CanPersistLocked()) { Impl->GroupFlagProperties = MoveTemp(Previous); return false; }
-    Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
-    if (bReload) { Impl->ReloadFlagsLocked(); }
-    return true;
-}
-void FPostHogClient::ResetPersonPropertiesForFlags(bool bReload)
-{
-    FScopeLock Lock(&Impl->Mutex);
-    if (!Impl->CanCaptureLocked() || Impl->PersonFlagProperties.IsEmpty()) { return; }
-    Impl->PersonFlagProperties = {}; Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
-    if (bReload) { Impl->ReloadFlagsLocked(); }
-}
-void FPostHogClient::ResetGroupPropertiesForFlags(const FString& Type, bool bReload)
-{
-    FScopeLock Lock(&Impl->Mutex);
-    if (!Impl->CanCaptureLocked() || Impl->GroupFlagProperties.IsEmpty()) { return; }
-    auto Previous = Impl->GroupFlagProperties;
-    if (Type.IsEmpty()) { Impl->GroupFlagProperties = {}; } else { Impl->GroupFlagProperties.Remove(Type); }
-    if (SameProperties(Previous, Impl->GroupFlagProperties)) { return; }
-    Impl->InvalidateFlagsLocked(); Impl->PersistLocked();
-    if (bReload) { Impl->ReloadFlagsLocked(); }
+    auto Input = PostHogNative::Operation(TEXT("reset_group_properties_for_flags")); if (!Type.IsEmpty()) { Input->SetStringField(TEXT("group_type"), Type); }
+    Input->SetBoolField(TEXT("reload"), bReload); return Impl->Command(Input);
 }
 FString FPostHogClient::GetSessionId()
+{ TSharedPtr<FJsonValue> Value; return Impl->Read(PostHogNative::Operation(TEXT("session_id")), Value) == EPostHogResult::Ok && Value->Type == EJson::String ? Value->AsString() : FString(); }
+FString FPostHogClient::PeekSessionId() const
+{ TSharedPtr<FJsonValue> Value; return Impl->Read(PostHogNative::Operation(TEXT("peek_session_id")), Value) == EPostHogResult::Ok && Value->Type == EJson::String ? Value->AsString() : FString(); }
+EPostHogResult FPostHogClient::StartSession() { return Impl->Command(PostHogNative::Operation(TEXT("start_session"))); }
+EPostHogResult FPostHogClient::EndSession() { return Impl->Command(PostHogNative::Operation(TEXT("end_session"))); }
+EPostHogResult FPostHogClient::ResetSession() { return Impl->Command(PostHogNative::Operation(TEXT("reset_session"))); }
+EPostHogResult FPostHogClient::SessionActivity() { return Impl->Command(PostHogNative::Operation(TEXT("session_activity"))); }
+EPostHogResult FPostHogClient::SetAppInBackground(bool bBackground)
 {
-    FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return FString(); }
-    return Impl->SessionLocked(Impl->Config.Now(), false);
+    { FScopeLock Lock(&Impl->Mutex); Impl->bForeground = !bBackground; }
+    auto Input = PostHogNative::Operation(TEXT("set_app_in_background")); Input->SetBoolField(TEXT("background"), bBackground); return Impl->Command(Input);
 }
-bool FPostHogClient::StartSession()
+EPostHogResult FPostHogClient::StartSessionReplay() { return Impl->Command(PostHogNative::Operation(TEXT("replay_start"))); }
+EPostHogResult FPostHogClient::StopSessionReplay() { return Impl->Command(PostHogNative::Operation(TEXT("replay_stop"))); }
+bool FPostHogClient::IsSessionReplayActive() const
+{ TSharedPtr<FJsonValue> Value; return Impl->Read(PostHogNative::Operation(TEXT("replay_active")), Value) == EPostHogResult::Ok && Value->Type == EJson::Boolean && Value->AsBool(); }
+EPostHogResult FPostHogClient::BeginReplayFrame(int32 Width, int32 Height, int32 RowStrideBytes, TUniquePtr<FPostHogReplayFrame>& OutFrame)
 {
-    FScopeLock Lock(&Impl->Mutex); if (!Impl->CanCaptureLocked()) { return false; }
-    if (Impl->SessionId.IsEmpty()) { Impl->StartSessionLocked(Impl->Config.Now()); }
-    return true;
+    OutFrame.Reset();
+    if (Width <= 0 || Height <= 0 || RowStrideBytes < static_cast<int64>(Width) * 4) { return EPostHogResult::InvalidInput; }
+    { FScopeLock Lock(&Impl->Mutex); if (!Impl->bForeground) { return EPostHogResult::Inactive; } }
+    FImpl::FCall Call(Impl); if (!Call.Handle) { return EPostHogResult::Closed; }
+    auto Layout = MakeShared<FJsonObject>(); Layout->SetNumberField(TEXT("width"), Width); Layout->SetNumberField(TEXT("height"), Height);
+    Layout->SetNumberField(TEXT("row_stride_bytes"), RowStrideBytes); const FTCHARToUTF8 Utf8(*PostHogJson::Encode(Layout)); phu_frame Frame = 0;
+    const auto Status = phu_begin_frame(Call.Handle, PostHogNative::View(Utf8), &Frame);
+    if (Status == PHU_OK) { OutFrame.Reset(new FPostHogReplayFrame(Frame, static_cast<int64>(RowStrideBytes) * Height, Impl)); }
+    return PostHogNative::Result(Status);
 }
-void FPostHogClient::EndSession()
+FPostHogReplayFrame::~FPostHogReplayFrame() { Abandon(); }
+EPostHogResult FPostHogReplayFrame::Abandon()
 {
-    { FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed) { return; } Impl->SessionId.Empty(); Impl->AnalyticsSessionId.Empty(); }
-    FlushAsync();
+    const auto Frame = Token; Token = 0;
+    auto State = Owner.Pin(); if (!Frame || !State) { return EPostHogResult::Closed; }
+    FPostHogClient::FImpl::FCall Call(State); if (!Call.Handle) { return EPostHogResult::Closed; }
+    return PostHogNative::Result(phu_abandon_frame(Frame));
 }
-
-bool FPostHogClient::StartAnalyticsSession(const FPostHogProperties& Properties, const FPostHogProperties& Defaults)
+EPostHogResult FPostHogReplayFrame::Submit(const uint8* Pixels, int64 NumBytes)
 {
-    FPostHogEvent Event;
-    FString StartedId;
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (!Impl->CanCaptureLocked()) { return false; }
-        const FDateTime Now = Impl->Config.Now();
-        Impl->SessionLocked(Now, false);
-        if (Impl->SessionId.IsEmpty()) { Impl->StartSessionLocked(Now); }
-        if (Impl->AnalyticsSessionId == Impl->SessionId) { return true; }
-        Event = Impl->SnapshotLocked(TEXT("SessionStart"), Properties, &Defaults);
-        StartedId = Impl->SessionId;
-        Impl->AnalyticsSessionId = StartedId;
-    }
-    const bool bAccepted = Impl->Emit(MoveTemp(Event)) == EPostHogCaptureResult::Accepted;
-    if (!bAccepted)
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->AnalyticsSessionId == StartedId) { Impl->AnalyticsSessionId.Empty(); }
-    }
-    return bAccepted;
-}
-
-void FPostHogClient::EndAnalyticsSession(const FPostHogProperties& Defaults)
-{
-    TOptional<FPostHogEvent> Event;
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->bClosed) { return; }
-        if (Impl->CanCaptureLocked() && !Impl->SessionId.IsEmpty())
-        {
-            const FString EndingId = Impl->SessionId;
-            Event = Impl->SnapshotLocked(TEXT("SessionEnd"), {}, &Defaults);
-            // An expired automatic session must not change the ID of the session being ended.
-            Event->Properties.SetString(TEXT("$session_id"), EndingId);
-        }
-        Impl->SessionId.Empty(); Impl->AnalyticsSessionId.Empty();
-    }
-    if (Event) { Impl->Emit(MoveTemp(Event.GetValue())); }
-    FlushAsync();
-}
-bool FPostHogClient::SetSessionId(const FString& Id)
-{
-    FGuid Guid;
-    if (!FGuid::ParseExact(Id, EGuidFormats::DigitsWithHyphens, Guid) || Id.Len() != 36 || Id[14] != TEXT('7') ||
-        !(Id[19] == TEXT('8') || Id[19] == TEXT('9') || FChar::ToLower(Id[19]) == TEXT('a') || FChar::ToLower(Id[19]) == TEXT('b'))) { return false; }
-    FScopeLock Lock(&Impl->Mutex); if (!Impl->CanCaptureLocked()) { return false; }
-    Impl->SessionId = Id.ToLower(); Impl->SessionStarted = Impl->Config.Now(); Impl->LastActivity = Impl->SessionStarted; return true;
-}
-void FPostHogClient::StartApplicationLifecycle(bool bInForeground)
-{
-    TArray<FPostHogEvent> Events;
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->bClosed || Impl->bLifecycleStarted) { return; }
-        Impl->bLifecycleStarted = true; Impl->bForeground = bInForeground;
-        if (!Impl->Config.bCaptureApplicationLifecycleEvents) { return; }
-        FString Version, Build;
-        const auto Context = Impl->Config.Context.ToNative();
-        Context->TryGetStringField(TEXT("$app_version"), Version); Context->TryGetStringField(TEXT("$app_build"), Build);
-        if ((!Version.IsEmpty() || !Build.IsEmpty()) && (Version != Impl->LastAppVersion || Build != Impl->LastAppBuild))
-        {
-            const FString PreviousVersion = Impl->LastAppVersion, PreviousBuild = Impl->LastAppBuild;
-            Impl->LastAppVersion = Version; Impl->LastAppBuild = Build;
-            if (Impl->CanPersistLocked())
-            {
-                FPostHogProperties Properties;
-                if (!PreviousVersion.IsEmpty()) { Properties.SetString(TEXT("previous_version"), PreviousVersion); }
-                if (!PreviousBuild.IsEmpty()) { Properties.SetString(TEXT("previous_build"), PreviousBuild); }
-                if (Impl->CanCaptureLocked())
-                { Events.Add(Impl->SnapshotLocked(PreviousVersion.IsEmpty() && PreviousBuild.IsEmpty() ? TEXT("Application Installed") : TEXT("Application Updated"), Properties)); }
-                Impl->PersistLocked();
-            }
-            else { Impl->LastAppVersion = PreviousVersion; Impl->LastAppBuild = PreviousBuild; }
-        }
-        if (bInForeground && Impl->CanCaptureLocked())
-        { FPostHogProperties Properties; Properties.SetBoolean(TEXT("from_background"), false); Events.Add(Impl->SnapshotLocked(TEXT("Application Opened"), Properties)); }
-    }
-    for (auto& Event : Events) { Impl->Emit(MoveTemp(Event)); }
-}
-void FPostHogClient::OnBackground()
-{
-    TOptional<FPostHogEvent> Event;
-    {
-        FScopeLock Lock(&Impl->Mutex);
-        if (Impl->bClosed || !Impl->bForeground) { return; }
-        if (Impl->bLifecycleStarted && Impl->Config.bCaptureApplicationLifecycleEvents && Impl->CanCaptureLocked())
-        { Event = Impl->SnapshotLocked(TEXT("Application Backgrounded"), {}); }
-        Impl->bForeground = false;
-        if (!Impl->SessionId.IsEmpty()) { Impl->LastActivity = Impl->Config.Now(); }
-    }
-    if (Event.IsSet()) { Impl->Emit(MoveTemp(Event.GetValue())); }
-    FlushAsync();
-}
-void FPostHogClient::OnForeground()
-{
-    TOptional<FPostHogEvent> Event;
-    {
-        FScopeLock Lock(&Impl->Mutex); if (Impl->bClosed || Impl->bForeground) { return; }
-        Impl->bForeground = true; Impl->SessionLocked(Impl->Config.Now(), true);
-        if (Impl->bLifecycleStarted && Impl->Config.bCaptureApplicationLifecycleEvents && Impl->CanCaptureLocked())
-        { FPostHogProperties Properties; Properties.SetBoolean(TEXT("from_background"), true); Event = Impl->SnapshotLocked(TEXT("Application Opened"), Properties); }
-    }
-    if (Event.IsSet()) { Impl->Emit(MoveTemp(Event.GetValue())); }
+    const auto Frame = Token; Token = 0;
+    auto State = Owner.Pin(); if (!Frame || !State) { return EPostHogResult::Closed; }
+    FPostHogClient::FImpl::FCall Call(State); if (!Call.Handle) { return EPostHogResult::Closed; }
+    if (NumBytes < 0) { phu_abandon_frame(Frame); return EPostHogResult::InvalidInput; }
+    return PostHogNative::Result(phu_submit_frame(Call.Handle, Frame, {Pixels, static_cast<size_t>(NumBytes)}));
 }
 void FPostHogClient::ShutdownAll()
 {
     TArray<TSharedPtr<FImpl, ESPMode::ThreadSafe>> Live;
-    { FScopeLock Lock(&ClientsMutex); bStopping = true;
-        for (const auto& Weak : Clients) { if (auto Client = Weak.Pin()) { Live.Add(Client); } } Clients.Empty(); }
-    for (const auto& Client : Live) { Client->Close(); }
+    { FScopeLock Lock(&ClientsMutex); bStopping = true; Live = Clients; }
+    for (const auto& State : Live) { State->BeginClose(); }
+    for (const auto& State : Live) { State->Close(); }
     PostHogTasks::Drain();
+    { FScopeLock Lock(&ClientsMutex); Live = Clients; }
+    // If host thread creation failed, the strong registry still owns its callback context.
+    for (const auto& State : Live)
+    {
+        State->BeginClose();
+        if (!State->FinishClose().bJoined) { UE_LOG(LogPostHogClient, Fatal, TEXT("PostHog cannot unload with unfinished native work.")); }
+    }
 }

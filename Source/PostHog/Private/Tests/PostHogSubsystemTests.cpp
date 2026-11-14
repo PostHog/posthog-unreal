@@ -1,192 +1,193 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "PostHogSubsystem.h"
-#include "PostHogJson.h"
+#include "PostHogTasks.h"
+#include "Dom/JsonObject.h"
+#include "HAL/PlatformProcess.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
-#include "HAL/FileManager.h"
-#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformMisc.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/CoreDelegates.h"
 #include "Misc/Paths.h"
-#include "Misc/SecureHash.h"
 #include "UObject/StrongObjectPtr.h"
-#include <atomic>
 
 namespace
 {
-struct FSubsystemStats
-{
-    std::atomic<int32> Backgrounds{0}, Opens{0}, Installs{0}, Updates{0};
-    std::atomic<bool> OffThread{false};
-};
-struct FCreationBarrier
+struct FOwnerHookGate
 {
     FEvent* Entered = FPlatformProcess::GetSynchEventFromPool(true);
     FEvent* Release = FPlatformProcess::GetSynchEventFromPool(true);
-    ~FCreationBarrier() { FPlatformProcess::ReturnSynchEventToPool(Entered); FPlatformProcess::ReturnSynchEventToPool(Release); }
+    ~FOwnerHookGate() { FPlatformProcess::ReturnSynchEventToPool(Entered); FPlatformProcess::ReturnSynchEventToPool(Release); }
 };
-
 class FSubsystemScenario final : public IAutomationLatentCommand
 {
 public:
     explicit FSubsystemScenario(FAutomationTestBase* InTest) : Test(InTest)
     {
-        auto* Settings = GetMutableDefault<UPostHogSettings>();
-        PreviousAuto = Settings->bAutoInitialize; PreviousOptions = Settings->Options;
-        Settings->bAutoInitialize = false;
-        Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("PostHogSubsystemTests") / FGuid::NewGuid().ToString());
+        auto* Settings = GetMutableDefault<UPostHogSettings>(); PreviousAuto = Settings->bAutoInitialize; Settings->bAutoInitialize = false;
         Config.ProjectToken = TEXT("phc_MOCK"); Config.Host = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_TEST_HOST"));
-        Config.StorageRoot = Root; Config.bPreloadFeatureFlags = false; Config.FlushIntervalMilliseconds = 60000; Config.FlushAt = 100;
-        Config.Context.SetString(TEXT("test_suite"), TEXT("subsystem"));
-        Config.Context.SetString(TEXT("$app_version"), TEXT("1.0")); Config.Context.SetString(TEXT("$app_build"), TEXT("100"));
-        Stats = MakeShared<FSubsystemStats, ESPMode::ThreadSafe>();
-        Config.BeforeSend = [Counters = Stats](FPostHogEvent& Event)
-        {
-            if (Event.Event.StartsWith(TEXT("Application ")) && !IsInGameThread()) { Counters->OffThread = true; }
-            if (Event.Event == TEXT("Application Installed")) { ++Counters->Installs; }
-            if (Event.Event == TEXT("Application Updated")) { ++Counters->Updates; }
-            if (Event.Event == TEXT("Application Opened")) { ++Counters->Opens; }
-            if (Event.Event == TEXT("Application Backgrounded")) { ++Counters->Backgrounds; }
-            return true;
-        };
-        Deadline = FPlatformTime::Seconds() + 30;
+        Config.StorageRoot = FPaths::ProjectSavedDir() / TEXT("PostHogSubsystemTests") / FGuid::NewGuid().ToString();
+        Config.bPreloadFeatureFlags = false; Deadline = FPlatformTime::Seconds() + 30;
     }
     ~FSubsystemScenario()
     {
-        if (Barrier) { Barrier->Release->Trigger(); }
-        Destroy(One); Destroy(Two); Destroy(Cancelled); Destroy(Replacement); Destroy(Automatic);
-        auto* Settings = GetMutableDefault<UPostHogSettings>(); Settings->bAutoInitialize = PreviousAuto; Settings->Options = PreviousOptions;
+        if (Gate) { Gate->Release->Trigger(); }
+        Destroy(One); Destroy(Two); Destroy(Cancelled); Destroy(Replacement);
+        GetMutableDefault<UPostHogSettings>()->bAutoInitialize = PreviousAuto;
     }
     bool Update() override
     {
-        if (FPlatformTime::Seconds() > Deadline) { Test->AddError(TEXT("subsystem scenario timed out")); return true; }
+        if (FPlatformTime::Seconds() > Deadline) { Test->AddError(TEXT("subsystem ownership scenario timed out")); return true; }
         switch (Phase)
         {
         case 0:
         {
             if (Config.Host.IsEmpty()) { Test->AddError(TEXT("Set POSTHOG_TEST_HOST")); return true; }
-            One = Create(); Two = Create();
-            auto* A = One->GetSubsystem<UPostHogSubsystem>(); auto* B = Two->GetSubsystem<UPostHogSubsystem>();
-            Check(A && B, TEXT("game-instance subsystems created")); if (!A || !B) { return true; }
-            Check(!A->SetupWithConfig(Config), TEXT("editor guard defaults off"));
-            Two->GetWorldContext()->RunAsDedicated = true;
-            Check(!B->SetupWithConfig(Config, true), TEXT("dedicated-server guard defaults off"));
-            Two->GetWorldContext()->RunAsDedicated = false;
-            auto First = Config; First.ClientName = TEXT("one"); First.Context.SetString(TEXT("instance"), TEXT("one"));
-            auto Second = Config; Second.ClientName = TEXT("two"); Second.Context.SetString(TEXT("instance"), TEXT("two"));
-            Check(A->SetupWithConfig(First, true) && B->SetupWithConfig(Second, true), TEXT("start two isolated owners"));
-            Check(!A->SetupWithConfig(First, true), TEXT("repeated setup rejected while initializing"));
-            FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Broadcast();
-            ++Phase; return false;
+            Create(One); Create(Two); auto* A = One->GetSubsystem<UPostHogSubsystem>(); auto* B = Two->GetSubsystem<UPostHogSubsystem>();
+            Check(!A->SetupWithConfig(Config), TEXT("editor guard"));
+            Two->GetWorldContext()->RunAsDedicated = true; Check(!B->SetupWithConfig(Config, true), TEXT("dedicated server guard")); Two->GetWorldContext()->RunAsDedicated = false;
+            auto First = Config; First.ClientName = TEXT("one"); auto Second = Config; Second.ClientName = TEXT("two");
+            Check(A->SetupWithConfig(First, true) && B->SetupWithConfig(Second, true), TEXT("two isolated game instances"));
+            Check(!A->SetupWithConfig(First, true), TEXT("initializing setup rejected")); ++Phase; return false;
         }
         case 1:
         {
             auto* A = One->GetSubsystem<UPostHogSubsystem>(); auto* B = Two->GetSubsystem<UPostHogSubsystem>();
             if (!A->IsInitialized() || !B->IsInitialized()) { return false; }
             FirstClient = A->GetClient(); SecondClient = B->GetClient();
-            Check(FirstClient != SecondClient && FirstClient->GetDistinctId() != SecondClient->GetDistinctId(), TEXT("game-instance namespaces isolate native identity"));
-            Check(Stats->Installs == 2 && Stats->Opens == 2 && !Stats->OffThread, TEXT("initial lifecycle emitted on game thread once per owner"));
-            const FString Identity = FirstClient->GetDistinctId();
-            UWorld* PreviousWorld = One->GetWorld();
-            auto* NextWorld = UWorld::CreateWorld(EWorldType::Game, false, FName(*FGuid::NewGuid().ToString()));
-            NextWorld->SetGameInstance(One.Get()); One->GetWorldContext()->SetCurrentWorld(NextWorld);
-            PreviousWorld->SetGameInstance(nullptr); PreviousWorld->DestroyWorld(false);
-            Check(One->GetSubsystem<UPostHogSubsystem>() == A && A->GetClient()->GetDistinctId() == Identity, TEXT("world replacement keeps game-instance client"));
+            Check(FirstClient->GetDistinctId() != SecondClient->GetDistinctId(), TEXT("namespace inputs isolate identity"));
+            const FString Identity = FirstClient->GetDistinctId(); UWorld* Previous = One->GetWorld();
+            auto* Next = UWorld::CreateWorld(EWorldType::Game, false, FName(*FGuid::NewGuid().ToString()));
+            Next->SetGameInstance(One.Get()); One->GetWorldContext()->SetCurrentWorld(Next); Previous->SetGameInstance(nullptr); Previous->DestroyWorld(false);
+            Check(One->GetSubsystem<UPostHogSubsystem>() == A && A->GetClient()->GetDistinctId() == Identity, TEXT("level/world replacement keeps the instance client"));
             FirstClient->Capture(TEXT("subsystem_one")); SecondClient->Capture(TEXT("subsystem_two"));
-            FCoreDelegates::ApplicationWillDeactivateDelegate.Broadcast(); FCoreDelegates::ApplicationWillEnterBackgroundDelegate.Broadcast();
-            ++Phase; return false;
+            FCoreDelegates::ApplicationWillEnterBackgroundDelegate.Broadcast(); ++Phase; return false;
         }
         case 2:
-            if (Stats->Backgrounds != 2) { return false; }
-            FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Broadcast(); FCoreDelegates::ApplicationHasReactivatedDelegate.Broadcast();
+            FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Broadcast();
+            One->GetSubsystem<UPostHogSubsystem>()->Shutdown(); Two->GetSubsystem<UPostHogSubsystem>()->Shutdown();
+            Check(FirstClient->Capture(TEXT("after-owner-close")) == EPostHogResult::Closed, TEXT("retained pointer loses admission immediately"));
             ++Phase; return false;
         case 3:
-            if (Stats->Opens != 4) { return false; }
-            Reset = FirstClient->ResetAsync(); ++Phase; return false;
-        case 4:
-            if (!Reset.IsReady()) { return false; }
-            Check(Reset.Get(), TEXT("identity reset persists while preserving app markers"));
-            One->GetSubsystem<UPostHogSubsystem>()->Shutdown(); Two->GetSubsystem<UPostHogSubsystem>()->Shutdown();
-            Check(FirstClient->Capture(TEXT("subsystem_after_shutdown")) == EPostHogCaptureResult::Closed, TEXT("retained native pointer closes with owner"));
-            ++Phase; return false;
-        case 5:
-        {
             if (One->GetSubsystem<UPostHogSubsystem>()->GetState() != EPostHogSubsystemState::Idle || Two->GetSubsystem<UPostHogSubsystem>()->GetState() != EPostHogSubsystemState::Idle) { return false; }
-            Check(Stats->Backgrounds == 2 && Stats->Opens == 4, TEXT("duplicate platform signals suppressed"));
-            auto Updated = Config; Updated.ClientName = TEXT("one"); Updated.Context.SetString(TEXT("instance"), TEXT("one-updated"));
-            Updated.Context.SetString(TEXT("$app_version"), TEXT("1.1")); Updated.Context.SetString(TEXT("$app_build"), TEXT("110"));
-            Check(One->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Updated, true), TEXT("restart same namespace"));
-            FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Broadcast(); ++Phase; return false;
+            Destroy(One); Destroy(Two); FirstClient.Reset(); SecondClient.Reset(); Create(Cancelled);
+            Check(Cancelled->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Config, true), TEXT("start initializer"));
+            Destroy(Cancelled); CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+            Create(Replacement); Check(Replacement->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Config, true), TEXT("replacement waits cancelled namespace owner"));
+            ++Phase; return false;
+        case 4:
+            if (!Replacement->GetSubsystem<UPostHogSubsystem>()->IsInitialized()) { return false; }
+            Replacement->GetSubsystem<UPostHogSubsystem>()->GetClient()->Capture(TEXT("subsystem_replacement"));
+            Replacement->GetSubsystem<UPostHogSubsystem>()->Shutdown(); ++Phase; return false;
+        case 5:
+            if (Replacement->GetSubsystem<UPostHogSubsystem>()->GetState() != EPostHogSubsystemState::Idle) { return false; }
+        {
+            Destroy(Replacement); Create(One); Create(Two);
+            // Pure SDK key checks, followed by disabled cloud clients: never contact cloud endpoints.
+            auto Cloud = Config; Cloud.ClientName = TEXT("cloud-owner"); Cloud.ProjectToken = TEXT("phx_disabled_test");
+            FString Canonical; Cloud.Host = TEXT("https://us.i.posthog.com");
+            Check(FPostHogClient::CoordinationKey(Cloud, Canonical) == EPostHogResult::Ok, TEXT("SDK coordination key"));
+            for (const FString& Host : {FString(), FString(TEXT(" https://app.posthog.com/// ")), FString(TEXT("https://us.posthog.com/")), FString(TEXT("\thttps://us.i.posthog.com///\n"))})
+            {
+                Cloud.Host = Host; Cloud.ProjectToken = TEXT("\u2003phx_disabled_test \t"); FString Alias;
+                Check(FPostHogClient::CoordinationKey(Cloud, Alias) == EPostHogResult::Ok && Alias == Canonical, TEXT("SDK cloud aliases/default/whitespace share coordination key"));
+            }
+            Cloud.Host = TEXT("https://us.posthog.com"); Cloud.ProjectToken = TEXT("phx_disabled_test");
+            Check(One->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Cloud, true), TEXT("cloud owner without network"));
+            ++Phase; return false;
         }
         case 6:
         {
-            if (!One->GetSubsystem<UPostHogSubsystem>()->IsInitialized()) { return false; }
-            Check(Stats->Installs == 2 && Stats->Updates == 1, TEXT("reset/restart preserves install marker and emits update"));
-            One->GetSubsystem<UPostHogSubsystem>()->Shutdown(); ++Phase; return false;
+            auto* A = One->GetSubsystem<UPostHogSubsystem>(); if (!A->IsInitialized()) { return false; }
+            Check(A->IsDisabled(), TEXT("invalid test token disables cloud network"));
+            for (const FString& Host : {FString(), FString(TEXT(" https://app.posthog.com/// ")), FString(TEXT("https://us.i.posthog.com/")), FString(TEXT("https://us.posthog.com"))})
+            {
+                auto Cloud = Config; Cloud.ClientName = TEXT("cloud-owner"); Cloud.Host = Host; Cloud.ProjectToken = TEXT(" phx_disabled_test\t");
+                Check(!Two->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Cloud, true), TEXT("equivalent cloud inputs reject a second live engine owner"));
+            }
+            A->Shutdown(); ++Phase; return false;
         }
         case 7:
         {
             if (One->GetSubsystem<UPostHogSubsystem>()->GetState() != EPostHogSubsystemState::Idle) { return false; }
-            Destroy(One); Destroy(Two); FirstClient.Reset(); SecondClient.Reset();
-            Barrier = MakeShared<FCreationBarrier, ESPMode::ThreadSafe>();
-            Cancelled = Create(); auto Blocked = Config;
-            Blocked.Now = [Gate = Barrier] { Gate->Entered->Trigger(); Gate->Release->Wait(); return FDateTime::UtcNow(); };
-            Check(Cancelled->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Blocked, true), TEXT("begin controlled initialization"));
+            Destroy(One); Destroy(Two); Create(Cancelled); Create(Replacement);
+            Gate = MakeShared<FOwnerHookGate, ESPMode::ThreadSafe>(); auto HookGate = Gate;
+            auto OwnerConfig = Config; OwnerConfig.ClientName = TEXT("normalized-owner");
+            OwnerConfig.BeforeSend = [HookGate](FJsonObject& Event)
+            {
+                if (Event.GetStringField(TEXT("event")) == TEXT("hold-owner")) { HookGate->Entered->Trigger(); HookGate->Release->Wait(); }
+                return true;
+            };
+            Check(Cancelled->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(MoveTemp(OwnerConfig), true), TEXT("persistent replacement predecessor"));
             ++Phase; return false;
         }
         case 8:
         {
-            if (!Barrier->Entered->Wait(0)) { return false; }
-            TWeakObjectPtr<UGameInstance> Weak = Cancelled.Get(); Destroy(Cancelled);
-            CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
-            Check(!Weak.IsValid(), TEXT("initializing game instance can be garbage collected"));
-            Replacement = Create();
-            Check(Replacement->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Config, true), TEXT("new owner queues same namespace during cancelled initialization"));
+            auto* A = Cancelled->GetSubsystem<UPostHogSubsystem>(); if (!A->IsInitialized()) { return false; }
+            FirstClient = A->GetClient(); Check(FirstClient->Identify(TEXT("normalized-owner-id")) == EPostHogResult::Ok, TEXT("identify predecessor"));
+            for (const FString& Host : {Config.Host, Config.Host + TEXT("///"), TEXT(" \t") + Config.Host + TEXT("/\n")})
+            {
+                auto Equivalent = Config; Equivalent.ClientName = TEXT("normalized-owner"); Equivalent.Host = Host; Equivalent.ProjectToken = TEXT("\u2003phc_MOCK\t");
+                Check(!Replacement->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Equivalent, true), TEXT("slash/whitespace inputs reject a second live engine owner"));
+            }
+            Anonymous = FirstClient->GetAnonymousId(); auto Current = FirstClient;
+            HeldCapture = PostHogTasks::Run([Current] { return Current->Capture(TEXT("hold-owner")); });
             ++Phase; return false;
         }
         case 9:
-            Check(!Replacement->GetSubsystem<UPostHogSubsystem>()->IsInitialized(), TEXT("new owner cannot overtake old initializer"));
-            Barrier->Release->Trigger(); FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Broadcast(); ++Phase; return false;
+        {
+            if (!Gate->Entered->Wait(0)) { return false; }
+            Check(FirstClient->OptOut() == EPostHogResult::Ok && FirstClient->IsOptedOut(), TEXT("consent changes while permitted hook is held"));
+            PendingRequest = Cancelled->GetSubsystem<UPostHogSubsystem>()->GetInitializationForTests();
+            Cancelled->GetSubsystem<UPostHogSubsystem>()->Shutdown(); OwnerClose = FirstClient->ShutdownAsync();
+            UPostHogSubsystem::RetireClosedInitializationOwnersForTests();
+            Check(PendingRequest.IsValid(), TEXT("pending owner remains strongly held during retirement"));
+            Check(!OwnerClose.IsReady(), TEXT("native close is held by active hook"));
+            auto Equivalent = Config; Equivalent.ClientName = TEXT("normalized-owner");
+            Equivalent.Host = TEXT(" \t") + Config.Host + TEXT("///\n"); Equivalent.ProjectToken = TEXT("\u2003phc_MOCK\t");
+            Check(Replacement->GetSubsystem<UPostHogSubsystem>()->SetupWithConfig(Equivalent, true), TEXT("equivalent replacement starts behind cancelled predecessor"));
+            ++Phase; return false;
+        }
         case 10:
-            if (!Replacement->GetSubsystem<UPostHogSubsystem>()->IsInitialized()) { return false; }
-            Replacement->GetSubsystem<UPostHogSubsystem>()->GetClient()->Capture(TEXT("subsystem_replacement"));
-            Replacement->GetSubsystem<UPostHogSubsystem>()->Shutdown(); ++Phase; return false;
+        {
+            auto* Next = Replacement->GetSubsystem<UPostHogSubsystem>();
+            if (!Next->IsWaitingForPredecessorForTests())
+            {
+                if (Next->GetState() != EPostHogSubsystemState::Initializing)
+                { Check(false, TEXT("replacement bypassed predecessor join")); Gate->Release->Trigger(); return true; }
+                return false;
+            }
+            UPostHogSubsystem::RetireClosedInitializationOwnersForTests();
+            Check(!OwnerClose.IsReady() && !HeldCapture.IsReady() && !Next->GetClient(), TEXT("retirement preserves initializing replacement and pending predecessor coordination"));
+            Gate->Release->Trigger(); ++Phase; return false;
+        }
         case 11:
         {
-            if (Replacement->GetSubsystem<UPostHogSubsystem>()->GetState() != EPostHogSubsystemState::Idle) { return false; }
-            Destroy(Replacement);
-            auto* Settings = GetMutableDefault<UPostHogSettings>(); Settings->bAutoInitialize = true;
-            Settings->Options = {}; Settings->Options.ProjectToken = TEXT("phc_MOCK"); Settings->Options.Host = Config.Host;
-            Settings->Options.bEnableInEditor = true; Settings->Options.bPreloadFeatureFlags = false;
-            Settings->Options.bCaptureApplicationLifecycleEvents = false;
-            Settings->Options.ClientName = TEXT("automation-") + FGuid::NewGuid().ToString();
-            AutomaticStorage = FPaths::ProjectSavedDir() / TEXT("PostHog") / FMD5::HashAnsiString(*(Config.Host + TEXT("\nphc_MOCK\neditor/standalone/") + Settings->Options.ClientName));
-            Automatic = Create(); ++Phase; return false;
+            auto* Next = Replacement->GetSubsystem<UPostHogSubsystem>();
+            if (!Next->IsInitialized() || !OwnerClose.IsReady() || !HeldCapture.IsReady()) { return false; }
+            Check(OwnerClose.Get().bJoined, TEXT("predecessor native close completed"));
+            auto Restored = Next->GetClient();
+            Check(Restored->GetDistinctId() == TEXT("normalized-owner-id") && Restored->GetAnonymousId() == Anonymous, TEXT("replacement restores new Rust storage identity"));
+            Check(Restored->IsOptedOut(), TEXT("replacement restores consent instead of memory fallback default"));
+            ClosedRequest = Next->GetInitializationForTests();
+            Next->Shutdown(); ++Phase; return false;
         }
         case 12:
-            if (!Automatic->GetSubsystem<UPostHogSubsystem>()->IsInitialized()) { return false; }
-            Automatic->GetSubsystem<UPostHogSubsystem>()->GetClient()->Capture(TEXT("subsystem_auto"));
-            Automatic->GetSubsystem<UPostHogSubsystem>()->Shutdown(); ++Phase; return false;
+            if (Replacement->GetSubsystem<UPostHogSubsystem>()->GetState() != EPostHogSubsystemState::Idle) { return false; }
+            Check(ClosedRequest.IsValid(), TEXT("closed initialization owner is retained until explicit retirement"));
+            Destroy(Cancelled); Destroy(Replacement); FirstClient.Reset();
+            UPostHogSubsystem::RetireClosedInitializationOwnersForTests(); ++Phase; return false;
         case 13:
-            if (Automatic->GetSubsystem<UPostHogSubsystem>()->GetState() != EPostHogSubsystemState::Idle) { return false; }
-            Check(!Automatic->GetSubsystem<UPostHogSubsystem>()->Setup(FPostHogOptions()), TEXT("explicit setup does not inherit project credentials"));
-            Destroy(Automatic);
-            FCoreDelegates::ApplicationWillEnterBackgroundDelegate.Broadcast(); FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Broadcast();
-            Check(!Stats->OffThread, TEXT("lifecycle hooks stay on game thread"));
-            IFileManager::Get().DeleteDirectory(*Root, false, true);
-            IFileManager::Get().DeleteDirectory(*AutomaticStorage, false, true);
-            return true;
+            if (PendingRequest.IsValid() || ClosedRequest.IsValid()) { return false; }
+            Check(!PendingRequest.IsValid() && !ClosedRequest.IsValid(), TEXT("joined owner retirement releases initialization client/future holders")); return true;
         }
         return false;
     }
 private:
-    TStrongObjectPtr<UGameInstance> Create()
-    {
-        TStrongObjectPtr<UGameInstance> Instance(NewObject<UGameInstance>(GEngine));
-        Instance->InitializeStandalone(FName(*FGuid::NewGuid().ToString()));
-        return Instance;
-    }
+    void Create(TStrongObjectPtr<UGameInstance>& Instance)
+    { Instance.Reset(NewObject<UGameInstance>(GEngine)); Instance->InitializeStandalone(FName(*FGuid::NewGuid().ToString())); }
     void Destroy(TStrongObjectPtr<UGameInstance>& Instance)
     {
         if (!Instance) { return; }
@@ -197,24 +198,19 @@ private:
     void Check(bool Pass, const TCHAR* Message) { if (!Pass) { Test->AddError(Message); } }
     FAutomationTestBase* Test;
     FPostHogConfig Config;
-    FString Root, AutomaticStorage;
-    FPostHogOptions PreviousOptions;
     bool PreviousAuto = false;
     int32 Phase = 0;
-    double Deadline = 0;
-    TStrongObjectPtr<UGameInstance> One, Two, Cancelled, Replacement, Automatic;
+    double Deadline;
+    TStrongObjectPtr<UGameInstance> One, Two, Cancelled, Replacement;
     FPostHogClient::FPtr FirstClient, SecondClient;
-    TSharedFuture<bool> Reset;
-    TSharedPtr<FSubsystemStats, ESPMode::ThreadSafe> Stats;
-    TSharedPtr<FCreationBarrier, ESPMode::ThreadSafe> Barrier;
+    FString Anonymous;
+    TSharedPtr<FOwnerHookGate, ESPMode::ThreadSafe> Gate;
+    TSharedFuture<EPostHogResult> HeldCapture;
+    TSharedFuture<FPostHogDrainResult> OwnerClose;
+    TWeakPtr<FPostHogInitialization, ESPMode::ThreadSafe> PendingRequest, ClosedRequest;
 };
 }
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogSubsystemTest, "PostHog.Subsystem",
-    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-bool FPostHogSubsystemTest::RunTest(const FString& Parameters)
-{
-    FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FSubsystemScenario>(this));
-    return true;
-}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogSubsystemTest, "PostHog.Subsystem", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FPostHogSubsystemTest::RunTest(const FString&)
+{ FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FSubsystemScenario>(this)); return true; }
 #endif
