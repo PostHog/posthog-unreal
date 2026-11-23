@@ -176,7 +176,7 @@ jobs:
           set -euo pipefail
           python -m unittest discover -s Tests -p 'test_release*.py'
           # Re-runs keep every attempt's same-named artifact; require the ZIP the latest assemble attempt reported.
-          test -n "$ZIP_SHA256"
+          test -n "$ZIP_SHA256" || { echo "::error::verify reported no candidate ZIP checksum (candidate-zip-sha256); dispatch a fresh release run"; exit 1; }
           echo "$ZIP_SHA256  posthog-unreal-$VERSION.zip" | (cd artifacts/releases && sha256sum --check -)
           python scripts/release.py "$VERSION"
           git diff --exit-code
