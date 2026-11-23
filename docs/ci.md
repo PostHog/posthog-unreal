@@ -120,7 +120,7 @@ The validated archives are under `artifacts/packages/Mac/Development-AdHoc` and 
 
 ## GitHub Actions
 
-`.github/workflows/sdk-tests.yml` runs tooling on pull requests/main. Its `bundle` jobs build and test the native library, generate dependency notices and stage a release bundle on macOS 15, Ubuntu 22.04 and Windows 2022 without secrets. The [Release workflow](../RELEASING.md) calls the same workflow with a release-candidate patch, and publication assembles the plugin ZIP from those bundles. Protected native jobs run only on trusted pushes/manual dispatch, not for release candidates, with the immutable dependency selected by Cargo. Engine-backed tests require the dispatch's `unreal` input. A skipped native/engine job means validation pending.
+`.github/workflows/sdk-tests.yml` runs tooling on pull requests/main. Its `bundle` jobs build and test the native library, generate dependency notices and stage a release bundle on macOS 15, Ubuntu 22.04 and Windows 2022 without secrets. The [Release workflow](../RELEASING.md) calls the same workflow with a release-candidate patch, assembles the candidate plugin ZIP from those bundles, and publication uploads that ZIP unchanged. Protected native jobs run only on trusted pushes/manual dispatch, not for release candidates, with the immutable dependency selected by Cargo. Engine-backed tests require the dispatch's `unreal` input. A skipped native/engine job means validation pending.
 
 Create a protected `sdk-ci` environment with required reviewers and trusted-branch restrictions. Configure repository variables:
 
@@ -146,7 +146,7 @@ Check extraction size and runner free space before enabling engine jobs. Platfor
 
 ## Evidence
 
-At the current pin, `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`, on UE 5.8.4 macOS arm64 (Metal) against the SDK mock server: 8 bridge tests, 28 tooling tests and the 21-test consolidated driver pass, including all 13 engine automation tests (`--editor`), with `cargo fmt` and bridge Clippy clean and UHT/C++ compiling without warnings. The rendered fixture passes in Development Editor and in locally ad-hoc-signed packaged Development and Shipping (three 320×240 and three 320×180 JPEGs each, exit 0 with recording active). The more detailed evidence below was recorded at the previous pin.
+At the current pin, `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`, on UE 5.8.4 macOS arm64 (Metal) against the SDK mock server: 8 bridge tests, the Python tooling suite and the 21-test consolidated driver pass, including all 13 engine automation tests (`--editor`), with `cargo fmt` and bridge Clippy clean and UHT/C++ compiling without warnings. The rendered fixture passes in Development Editor and in locally ad-hoc-signed packaged Development and Shipping (three 320×240 and three 320×180 JPEGs each, exit 0 with recording active). The more detailed evidence below was recorded at the previous pin.
 
 The previous `b717aef23d4869bdf94e75ce36bbd383d3575c6f` integration passed 7 bridge tests, 27 tooling tests and the 20-test consolidated driver with matching installed release artifacts on UE 5.8 Mac arm64. All 13 engine tests passed, including real automatic-session expiry attribution, newer reentrant session preservation and Analytics defaults/stock Blueprint/Multicast routing. Both asset-free and retained example Editor consumers build; the example's Analytics automation passes.
 

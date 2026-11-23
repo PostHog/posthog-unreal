@@ -29,9 +29,9 @@ The [Release workflow](.github/workflows/release.yml) serializes releases. Queue
 The job sequence is `prepare-candidate` → `verify` → `notify-approval-needed` → `publish`, following the Godot SDK's prepare, verify, approve, then commit/publish flow:
 
 1. In a read-only job, pnpm 11.13.1 applies pending change intents locally, updates `package.json` and `CHANGELOG.md`, and records consumed intents in `.changeset/ledger.yaml`. `scripts/bump_version.py` synchronizes `PostHog.uplugin` (`VersionName`, and increments the integer `Version`), the Rust bridge crate version and its `rust/Cargo.lock` entry. The bridge reports its crate version as `$lib_version`, so all of them must match. The job uploads a patch and records its SHA-256 checksum, source commit, and resulting Git tree SHA. **No version commit or remote change is made.**
-2. The reusable [SDK tests workflow](.github/workflows/sdk-tests.yml) checks out the source commit and applies the exact patch in every job. `scripts/release_candidate.py` verifies the patch checksum, resulting tree, and versions. Tooling tests run on Ubuntu and Windows. On macOS 15, Ubuntu 22.04 and Windows 2022, the `bundle` job builds the library and runs the bridge tests (`scripts/build-native.py <target> --test`), generates dependency notices with cargo-about, stages a native bundle (`scripts/package-plugin.py stage`), and uploads it as `posthog-native-<target>`. The protected engine/mock job does not run for release candidates.
-3. Slack receives an approval request. Complete the [manual Unreal Engine validation](#manual-unreal-engine-validation), review the candidate patch, workflow summary, and CI results, then approve the **single `Release` deployment** in GitHub.
-4. After approval, `publish` reapplies the verified patch, downloads the three verified bundles and assembles `posthog-unreal-<version>.zip` with `scripts/package-plugin.py package`, which rechecks every target's provenance and refuses missing libraries or notices. `scripts/release.py` validates the ZIP and writes `SHA256SUMS`. A missing or invalid bundle fails here, before anything changes on `main`.
+2. The reusable [SDK tests workflow](.github/workflows/sdk-tests.yml) checks out the source commit and applies the exact patch in every job. `scripts/release_candidate.py` verifies the patch checksum, resulting tree, and versions. Tooling tests run on Ubuntu and Windows. On macOS 15, Ubuntu 22.04 and Windows 2022, the `bundle` job builds the library and runs the bridge tests (`scripts/build-native.py <target> --test`), generates dependency notices with cargo-about, stages a native bundle (`scripts/package-plugin.py stage`), and uploads it as `posthog-native-<target>`. An `assemble` job then combines the three bundles with the candidate source into `posthog-unreal-<version>.zip` (`scripts/package-plugin.py package` rechecks each target's provenance and refuses missing libraries or notices), validates it and writes `SHA256SUMS` with `scripts/release.py`, prints the checksum in the workflow summary, and uploads both as `posthog-unreal-candidate`. The protected engine/mock job does not run for release candidates.
+3. Slack receives an approval request. Complete the [manual Unreal Engine validation](#manual-unreal-engine-validation) on the `posthog-unreal-candidate` ZIP, review the candidate patch, workflow summary, and CI results, then approve the **single `Release` deployment** in GitHub.
+4. After approval, `publish` reapplies the verified patch, downloads `posthog-unreal-candidate` and revalidates the ZIP and its checksum. A missing or invalid ZIP fails here, before anything changes on `main`.
 5. Only then does `publish` obtain the environment-protected App key and create a GitHub-signed version commit on `main`. The expected-parent check rejects concurrent changes to `main`. A retry can reuse an already-created signed commit only when its parent, tree, and release message match this candidate exactly.
 6. The same approved job checks out the signed commit and requires its Git tree to match the tested candidate, so the ZIP's sources, version and `Cargo.lock` provenance match the released commit. No source changes are made after verification.
 7. The job verifies the checksums, creates the unprefixed tag at the signed commit, and publishes the experimental prerelease. An existing tag is accepted only if it resolves to the same commit. Release creation does not overwrite an existing release.
@@ -76,29 +76,33 @@ There is no publishing dry-run dispatch. To preview the bump locally without com
 
 ## Manual Unreal Engine validation
 
-Hosted CI cannot run Unreal Engine: native jobs establish compilation, bridge tests and package consistency, not Unreal/runtime compatibility, a minimum Linux distribution version, or screenshot privacy. **Do not approve a release until a maintainer has validated the candidate in UE 5.8.**
+Hosted CI cannot run Unreal Engine: native jobs establish compilation, bridge tests and package consistency, not Unreal/runtime compatibility, a minimum Linux distribution version, or screenshot privacy. **Do not approve a release until a maintainer has validated the candidate ZIP in UE 5.8 on at least one bundled platform and every gate run on it passed.**
 
-Assemble the exact candidate ZIP from the Release run, replacing the upper-case placeholders with values from its workflow summary. Publication assembles the ZIP from the same source tree and bundles, so its files are identical; the ZIP checksum can differ only if your Python's zlib compresses differently from the runner's:
+Replace the upper-case placeholders below with values from the Release run's workflow summary. Download the exact candidate ZIP; publication uploads these same bytes:
+
+```sh
+gh run download RUN_ID --name posthog-unreal-candidate --dir artifacts/candidate/RUN_ID
+(cd artifacts/candidate/RUN_ID && shasum -a 256 --check SHA256SUMS)
+```
+
+Compare the checksum with the run's workflow summary.
+
+For the engine gates, check out the candidate source:
 
 ```sh
 gh run download RUN_ID --name release-candidate-SOURCE_SHA --dir artifacts/release-candidate
 git fetch origin main && git checkout --detach SOURCE_SHA
 python scripts/release_candidate.py artifacts/release-candidate/release.patch \
   --source SOURCE_SHA --sha256 PATCH_SHA256 --tree TREE_SHA --version VERSION
-for target in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
-  gh run download RUN_ID --name "posthog-native-$target" --dir artifacts/native
-done
-python scripts/package-plugin.py package
-python scripts/release.py VERSION
 ```
 
-Then, on each supported platform you are releasing for:
+Then, on each bundled platform you can validate:
 
-- Extract `artifacts/releases/posthog-unreal-<version>.zip` into a clean UE 5.8 C++ consumer's `Plugins/` directory, without building Rust in that consumer. Build the Editor and packaged Development/Shipping targets, and confirm events reach the SDK mock server.
+- Extract `artifacts/candidate/RUN_ID/posthog-unreal-<version>.zip` into a clean UE 5.8 C++ consumer's `Plugins/` directory, without building Rust in that consumer. Build the Editor and packaged Development/Shipping targets, and confirm events reach the SDK mock server.
 - Run the engine gates in [CI documentation](docs/ci.md#local-commands) at the candidate source: `scripts/build-test-host.py`, `Tests/native_integration.py --editor`, and `Tests/replay_smoke.py`, plus the packaged-runtime fixture.
 - Confirm Linux libc/sysroot compatibility and Windows CRT/toolchain linkage against the intended Unreal toolchains. Mac runtime evidence does not validate Windows/Linux consumers.
 
-Record the platforms, configurations and results in the Slack approval thread. If a platform was not validated, say so explicitly; reject the deployment if a gate fails. Restore your checkout with `git restore --staged --worktree . && git checkout main` afterwards.
+Record the platforms, configurations and results in the Slack approval thread, and name each bundled platform that was not validated. As with the Godot SDK's experimental prereleases, a platform may ship unvalidated only while the README [status](README.md#status) lists it as unvalidated; the release notes link there. Reject the deployment if any gate fails. Restore your checkout with `git restore --staged --worktree . && git checkout main` afterwards.
 
 ## Inspect assets and recover failures
 
@@ -108,15 +112,15 @@ gh run watch RUN_ID --exit-status
 gh run download RUN_ID --name release-assets --dir artifacts/release-review/RUN_ID
 ```
 
-Before approval, download `release-candidate-SOURCE_SHA` to inspect `release.patch`; the workflow summary gives its checksum and resulting tree SHA. The `posthog-native-<target>` artifacts are the exact bundles publication will assemble.
+Before approval, download `release-candidate-SOURCE_SHA` to inspect `release.patch`; the workflow summary gives its checksum and resulting tree SHA. `posthog-unreal-candidate` is the exact ZIP and `SHA256SUMS` publication will upload; the `posthog-native-<target>` artifacts are the bundles it was assembled from.
 
-After approval, `release-assets` contains `posthog-unreal-<version>.zip` and `SHA256SUMS`. Check them with `sha256sum --check SHA256SUMS` inside the downloaded directory (macOS: `shasum -a 256 --check SHA256SUMS`). Its extracted files should match the ZIP you validated. Its release download URL is unavailable until publication.
+After approval, `release-assets` contains `posthog-unreal-<version>.zip` and `SHA256SUMS`. Check them with `sha256sum --check SHA256SUMS` inside the downloaded directory (macOS: `shasum -a 256 --check SHA256SUMS`). Its checksum matches the `posthog-unreal-candidate` ZIP you validated. Its release download URL is unavailable until publication.
 
 A failed candidate check or rejected approval leaves `main`, versions, and remote intents unchanged. If `main` moves before committing the approved patch, the workflow fails safely. Dispatch a fresh run on `main` to prepare and verify a new candidate before approving again.
 
-If publication fails **after the version commit**, fix the underlying infrastructure issue and **re-run failed jobs in the original run**, preserving the verified patch, bundles and metadata. The job recognizes and reuses its already-created signed commit if it is still the tip of `main` and its parent, tree, and message match. It does not create another version commit. A fresh dispatch sees consumed intents and will not republish that version. If `main` has advanced again or a code fix is needed, release a new version rather than overwriting history.
+If publication fails **after the version commit**, fix the underlying infrastructure issue and **re-run failed jobs in the original run**, preserving the verified patch, ZIP and metadata. The job recognizes and reuses its already-created signed commit if it is still the tip of `main` and its parent, tree, and message match. It does not create another version commit. A fresh dispatch sees consumed intents and will not republish that version. If `main` has advanced again or a code fix is needed, release a new version rather than overwriting history.
 
-Inspect any existing tag/release before retrying publication. Never replace a published release, overwrite its assets, move a tag, or disable signing to work around a failure. Candidate patches and native bundles are retained for five days. If an artifact expires before any commit, dispatch a fresh candidate; if the version commit already exists, ship a new version rather than synthesizing an unverified patch or rebuilding bundles outside the verified run.
+Inspect any existing tag/release before retrying publication. Never replace a published release, overwrite its assets, move a tag, or disable signing to work around a failure. Candidate patches, native bundles and the candidate ZIP are retained for five days. If an artifact expires before any commit, dispatch a fresh candidate; if the version commit already exists, ship a new version rather than synthesizing an unverified patch or rebuilding bundles outside the verified run.
 
 ### Failed or cancelled release
 

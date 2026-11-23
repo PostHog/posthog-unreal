@@ -162,20 +162,19 @@ jobs:
         run: |
           python scripts/release_candidate.py artifacts/release-candidate/release.patch \
             --source "$SOURCE_SHA" --sha256 "$PATCH_SHA256" --tree "$TREE_SHA" --version "$VERSION"
-      # Assemble before the irreversible version commit, so missing or invalid bundles leave main untouched.
-      # The verify jobs built them from this exact candidate tree, which the signed commit must reproduce.
+      # Verify assembled this ZIP from this exact candidate tree and its bundles; publish uploads those bytes.
+      # Validate it before the irreversible version commit, so a missing or invalid ZIP leaves main untouched.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: posthog-native-*
-          path: artifacts/native
-          merge-multiple: true
-      - name: Assemble and validate the three-platform plugin ZIP
+          name: posthog-unreal-candidate
+          path: artifacts/releases
+      - name: Validate the verified plugin ZIP
         env:
           VERSION: ${{ needs.prepare-candidate.outputs.version }}
         run: |
           set -euo pipefail
           python -m unittest discover -s Tests -p 'test_release*.py'
-          python scripts/package-plugin.py package
+          (cd artifacts/releases && sha256sum --check SHA256SUMS)
           python scripts/release.py "$VERSION"
           git diff --exit-code
       - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -233,7 +232,7 @@ jobs:
           gh release create "$VERSION" "posthog-unreal-${VERSION}.zip" SHA256SUMS \
             --repo "$GH_REPO" --verify-tag --prerelease --latest=false \
             --title "PostHog Unreal $VERSION (Experimental)" --generate-notes \
-            --notes "Experimental UE 5.8 SDK for C++ projects. Download posthog-unreal-${VERSION}.zip below, not the automatic source archives, and copy its PostHog/ directory into your project's Plugins/ directory. It bundles prebuilt Mac arm64, Linux x64 and Windows x64 native libraries; Rust is not required. See the packaged README and CHANGELOG. Fab distribution is not available yet."
+            --notes "Experimental UE 5.8 SDK for C++ projects. Download posthog-unreal-${VERSION}.zip below, not the automatic source archives, and copy its PostHog/ directory into your project's Plugins/ directory. It bundles prebuilt Mac arm64, Linux x64 and Windows x64 native libraries; Rust is not required. See https://github.com/PostHog/posthog-unreal/blob/${VERSION}/README.md#status for platform validation status and limitations, and the packaged README and CHANGELOG. Fab distribution is not available yet."
 
   notify-result:
     name: Notify Slack/PostHog - Release Result

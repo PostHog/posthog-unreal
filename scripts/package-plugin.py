@@ -48,7 +48,7 @@ def stage_native(root, target, output, notices, metadata, rust_docs):
     copyrights = sorted(rust_docs.glob("COPYRIGHT*.html"))
     licenses = sorted((rust_docs / "licenses").glob("*.txt"))
     if not copyrights or not licenses:
-        raise ValueError("Install the matching rust-docs component for Rust copyright notices")
+        raise ValueError(f"Rust toolchain has no copyright notices under {rust_docs}")
     for path in [*copyrights, *licenses]:
         files[f"RustNotices/{target}/" + path.relative_to(rust_docs).as_posix()] = path.read_bytes()
 
@@ -130,7 +130,7 @@ The matching Rust static libraries are bundled; you do not need Rust or Cargo.
 Unreal links only the library for your target platform.
 A Blueprint-only project must first add a C++ class and use the Unreal C++ toolchain.
 
-Setup, API and screenshot privacy guidance:
+Setup, API, screenshot privacy guidance and platform validation status:
 https://github.com/PostHog/posthog-unreal/blob/{version}/README.md
 
 See LICENSE, THIRD_PARTY_NOTICES.txt, RustNotices/ and ThirdPartySources/ for

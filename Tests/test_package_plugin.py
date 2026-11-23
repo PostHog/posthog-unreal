@@ -173,7 +173,7 @@ class PluginPackageTests(unittest.TestCase):
             self.stage(target, self.root / "other-native")
         self.notices.write_text("Dependency licenses", encoding="utf-8")
         (self.rust_docs / "COPYRIGHT-library.html").unlink()
-        with self.assertRaisesRegex(ValueError, "rust-docs"):
+        with self.assertRaisesRegex(ValueError, "Rust toolchain has no copyright notices"):
             self.stage(target, self.root / "other-native")
 
     def test_assembly_requires_each_platforms_license_material(self):

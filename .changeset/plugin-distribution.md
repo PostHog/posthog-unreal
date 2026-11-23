@@ -2,4 +2,4 @@
 'posthog-unreal': minor
 ---
 
-Distribute the Unreal SDK as one installable plugin ZIP bundling Mac arm64, Linux x64 and Windows x64 Rust static libraries with the C++ source, checksums and third-party notices. Install it into a UE 5.8 C++ project without a Rust toolchain.
+First experimental prerelease of the PostHog Unreal SDK for UE 5.8 C++ projects: a thin Unreal adapter over the pinned stateful posthog-rs core, which owns identity, properties, consent, sessions, feature flags, remote configuration, persistence and delivery. It adds Blueprint and C++ APIs, an Unreal Analytics provider, application lifecycle events, and viewport and manual screenshot replay (automatic captures are unredacted). Install the posthog-unreal-<version>.zip release asset, which bundles prebuilt Mac arm64, Linux x64 and Windows x64 Rust static libraries, checksums and third-party notices; no Rust toolchain is needed. Not production-ready; see the README status for platform validation.
