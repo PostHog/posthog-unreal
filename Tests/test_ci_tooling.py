@@ -147,7 +147,7 @@ class BuildToolingTests(unittest.TestCase):
                 (core / "Cargo.lock").write_text("version = 4\n")
                 (core / "src/lib.rs").write_text("// fixture\n")
                 (root / "rust").mkdir()
-                source = 'git+ssh://git@github.com/PostHog/posthog-rs.git?rev=' + 'a' * 40 + '#' + 'a' * 40
+                source = 'git+https://github.com/PostHog/posthog-rs.git?rev=' + 'a' * 40 + '#' + 'a' * 40
                 (root / "rust/Cargo.lock").write_text('[[package]]\nname = "posthog"\nversion = "1.0.0"\nsource = "' + source + '"\n')
                 target_dir = root / "build outputs"
                 artifact = target_dir / target / "release" / filename
@@ -173,7 +173,6 @@ class BuildToolingTests(unittest.TestCase):
                                  [["cargo", "build", *common], ["cargo", "test", *common]])
                 for call in run.call_args_list:
                     self.assertTrue(call.kwargs["check"])
-                    self.assertEqual(call.kwargs["env"]["CARGO_NET_GIT_FETCH_WITH_CLI"], "true")
                     if target.endswith("apple-darwin"):
                         self.assertEqual(call.kwargs["env"]["MACOSX_DEPLOYMENT_TARGET"], "14.0")
                 destination = root / "Source/ThirdParty/PostHogRust/lib" / target

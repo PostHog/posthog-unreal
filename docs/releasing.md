@@ -42,7 +42,7 @@ You can also run `sampo add` from `rust/`.
 ## Prepare a release
 
 Start from current `main` on a release-preparation branch, with a clean working
-tree. Use Python 3.11+ and configure SSH read access for the pinned Rust dependency.
+tree. Use Python 3.11+.
 
 ```sh
 python scripts/release.py prepare
@@ -73,7 +73,6 @@ TARGET=aarch64-apple-darwin
 # Linux: TARGET=x86_64-unknown-linux-gnu
 # Windows: TARGET=x86_64-pc-windows-msvc
 export RUSTUP_TOOLCHAIN=1.96.1
-export CARGO_NET_GIT_FETCH_WITH_CLI=true
 rustup toolchain install 1.96.1 --profile minimal --component rust-docs --target "$TARGET"
 python scripts/build-native.py "$TARGET" --test
 cargo install cargo-about --version 0.9.3 --locked --features cli
@@ -165,9 +164,6 @@ inspection. Do not move a published tag. Fix released code with a new changeset/
 
 - Create a protected `Release` environment with required reviewers.
 - Restrict `v*` tag creation to maintainers through a repository ruleset.
-- Configure `SDK_GIT_SSH_KEY` in that environment as an SSH key with read access to
-  this repository and the pinned Rust repository, and `SDK_GIT_KNOWN_HOSTS` as
-  verified GitHub host entries. Checkout and Cargo Git fetches use SSH.
 - Grant the publication job `contents: write` for GitHub Releases. Validation and
   native build jobs have read-only repository permissions.
 - Permit the `macos-15`, `ubuntu-22.04` and `windows-2022` hosted runners and

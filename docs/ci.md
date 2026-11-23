@@ -17,7 +17,7 @@ The rendered fixture draws a non-sensitive four-color viewport and an unrelated 
 
 ## Local commands
 
-Use Python 3.11+ (CI uses 3.13), Rust and the platform's UE 5.8 toolchain. Cargo uses an immutable SSH Git pin; configure read access to GitHub. No separate source-ref variable or local checkout is required.
+Use Python 3.11+ (CI uses 3.13), Rust and the platform's UE 5.8 toolchain. Cargo fetches an immutable public Git pin over HTTPS; no credentials, separate source-ref variable or local checkout is required.
 
 ```sh
 python -m pip install -r Tests/requirements.txt
@@ -126,7 +126,6 @@ Create a protected `sdk-ci` environment with required reviewers and trusted-bran
 | Variable | Purpose |
 | --- | --- |
 | `SDK_MOCK_ARCHIVE_SHA256` | SHA-256 of maintained mock ZIP; enables the native matrix |
-| `SDK_GIT_KNOWN_HOSTS` | Verified GitHub SSH known-hosts entry/entries; strict host checking is enabled |
 | `UE_WINDOWS_ARCHIVE_SHA256` | Authorized Windows UE 5.8 installed-build ZIP checksum |
 | `UE_LINUX_ARCHIVE_SHA256` | Authorized Linux UE 5.8 installed-build ZIP checksum |
 
@@ -134,12 +133,11 @@ Configure protected environment secrets:
 
 | Secret | Purpose |
 | --- | --- |
-| `SDK_GIT_SSH_KEY` | Read-only GitHub SSH key for Cargo's pinned Rust dependency |
 | `SDK_MOCK_ARCHIVE_URL` | Private download URL for the maintained mock ZIP |
 | `UE_WINDOWS_ARCHIVE_URL` | Authorized private engine ZIP URL |
 | `UE_LINUX_ARCHIVE_URL` | Authorized private engine ZIP URL |
 
-The SSH key and verified host entries are written only to the ephemeral runner's private temporary files; they are not uploaded. Engine/mock assets and their credentials are not exposed to pull-request code.
+Engine/mock assets and their credentials are not exposed to pull-request code.
 
 The mock archive must have `server.py` and required companion files at its root, with v1 analytics, snapshot dumps and the control/inspection endpoints used by tests. Engine archives must contain `Engine/` with headers, libraries, UBT/UAT, editor binaries and bundled toolchains. Obtain them through authorized Epic access and keep them protected. The workflow verifies checksums and redacts download errors; it never uploads engine files.
 

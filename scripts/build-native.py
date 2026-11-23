@@ -23,7 +23,7 @@ def main():
     parser.add_argument("target", choices=LIBRARIES)
     parser.add_argument("--test", action="store_true", help="Also run bridge unit tests on the host target")
     args = parser.parse_args()
-    env = {**os.environ, "CARGO_NET_GIT_FETCH_WITH_CLI": "true"}
+    env = dict(os.environ)
     if args.target.endswith("apple-darwin"):
         env.setdefault("MACOSX_DEPLOYMENT_TARGET", "14.0")
     manifest_path = ["--manifest-path", str(ROOT / "rust/Cargo.toml")]

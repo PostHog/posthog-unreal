@@ -14,7 +14,7 @@ See [Releasing](docs/releasing.md) for checksums, versioning and distribution de
 
 ## Build
 
-The development target is UE 5.8 with macOS arm64, Windows x64 or Linux x64. Source builds need Rust, Python 3.11+ and the platform's Unreal toolchain. Cargo resolves the immutable SSH Git dependency in `rust/posthog-unreal-ffi/Cargo.toml`; configure read access to GitHub. No local Rust checkout is required.
+The development target is UE 5.8 with macOS arm64, Windows x64 or Linux x64. Source builds need Rust, Python 3.11+ and the platform's Unreal toolchain. Cargo fetches the immutable `posthog-rs` Git pin in `rust/posthog-unreal-ffi/Cargo.toml` over HTTPS; no credentials or local Rust checkout are required.
 
 ```sh
 export UE_ROOT=/path/to/UE_5.8
