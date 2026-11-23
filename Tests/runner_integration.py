@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 import socket
 import subprocess
@@ -17,8 +18,14 @@ def request(host, path, value=None):
         return json.load(response)
 
 
+# The example's default RequestTimeoutSeconds; /flags responses slower than this are abandoned.
+REQUEST_TIMEOUT_SECONDS = 10
+
+
 def run_scenario(args, name, hard, delay, enabled):
     root = Path(__file__).resolve().parents[1]
+    # The SDK restores its flag cache at startup, so a scenario must not inherit another's state.
+    shutil.rmtree(root / "Examples/PostHogExample/Saved/PostHogStateful", ignore_errors=True)
     output = (root / "artifacts/runner" / name).resolve()
     output.mkdir(parents=True, exist_ok=True)
     with socket.socket() as sock:
@@ -42,7 +49,7 @@ def run_scenario(args, name, hard, delay, enabled):
             env = {k: v for k, v in os.environ.items() if k not in ("POSTHOG_TOKEN", "POSTHOG_HOST")}
             env.update(UE_ROOT=args.ue_root, RUNNER_TEST_OUTPUT=str(output),
                        RUNNER_EXPECT_HARD=str(int(hard and delay == 0)),
-                       RUNNER_EXPECT_SECOND_HARD=str(int(hard and delay < 3)),
+                       RUNNER_EXPECT_SECOND_HARD=str(int(hard and delay < REQUEST_TIMEOUT_SECONDS)),
                        RUNNER_SHORT_COUNTDOWN=str(int(name == "delayed")))
             if enabled:
                 env.update(POSTHOG_TOKEN="phc_MOCK", POSTHOG_HOST=host)
@@ -69,7 +76,7 @@ def run_scenario(args, name, hard, delay, enabled):
                 assert len({e["distinct_id"] for e in starts + ends + coins}) == 1, "Identity changed on restart"
                 assert len({e["properties"]["$session_id"] for e in starts + ends}) == 1, "Session changed on restart"
                 assert starts[0]["properties"]["difficulty"] == ("hard" if hard and delay == 0 else "normal")
-                assert starts[1]["properties"]["difficulty"] == ("hard" if hard and delay < 3 else "normal")
+                assert starts[1]["properties"]["difficulty"] == ("hard" if hard and delay < REQUEST_TIMEOUT_SECONDS else "normal")
                 assert all(e["properties"]["duration_seconds"] > 0 and e["properties"]["reason"] == "collision" for e in ends)
                 assert any(e["properties"]["distance_meters"] > 700 for e in ends)
             else:
@@ -88,7 +95,7 @@ def main():
     parser.add_argument("--scenario", choices=["offline", "normal", "hard", "delayed", "timeout"])
     args = parser.parse_args()
     for name, hard, delay, enabled in [("offline", False, 0, False), ("normal", False, 0, True),
-                                        ("hard", True, 0, True), ("delayed", True, 2, True), ("timeout", True, 5, True)]:
+                                        ("hard", True, 0, True), ("delayed", True, 2, True), ("timeout", True, REQUEST_TIMEOUT_SECONDS + 2, True)]:
         if args.scenario is None or args.scenario == name:
             run_scenario(args, name, hard, delay, enabled)
 
