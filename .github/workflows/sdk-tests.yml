@@ -31,6 +31,10 @@ on:
         type: string
         required: false
         default: ''
+    outputs:
+      candidate-zip-sha256:
+        description: 'SHA-256 of the candidate plugin ZIP the assemble job uploaded'
+        value: ${{ jobs.assemble.outputs.zip-sha256 }}
 
 permissions:
   contents: read
@@ -173,7 +177,8 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: inputs.candidate-patch-sha256 != ''
         with:
-          name: posthog-native-${{ matrix.target }}
+          # The tree SHA keeps another candidate's bundles, retained from an earlier run attempt, out of assemble.
+          name: posthog-native-${{ matrix.target }}-${{ inputs.candidate-tree-sha }}
           path: artifacts/native/
           if-no-files-found: error
           include-hidden-files: true
@@ -185,6 +190,8 @@ jobs:
     if: inputs.candidate-patch-sha256 != ''
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    outputs:
+      zip-sha256: ${{ steps.zip.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -208,10 +215,11 @@ jobs:
             --source "$SOURCE_SHA" --sha256 "$PATCH_SHA256" --tree "$TREE_SHA" --version "$VERSION"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: posthog-native-*
+          pattern: posthog-native-*-${{ inputs.candidate-tree-sha }}
           path: artifacts/native
           merge-multiple: true
       - name: Assemble and validate the three-platform plugin ZIP
+        id: zip
         env:
           TREE_SHA: ${{ inputs.candidate-tree-sha }}
           VERSION: ${{ inputs.candidate-version }}
@@ -221,6 +229,8 @@ jobs:
           python scripts/release.py "$VERSION"
           git diff --exit-code
           test "$(git write-tree)" = "$TREE_SHA"
+          zip_sha256=$(sha256sum "artifacts/releases/posthog-unreal-$VERSION.zip" | awk '{print $1}')
+          echo "sha256=$zip_sha256" >> "$GITHUB_OUTPUT"
           {
             echo "## Candidate plugin ZIP $VERSION"
             echo "Validate the posthog-unreal-candidate artifact in UE 5.8 before approving. Publication uploads these exact bytes:"

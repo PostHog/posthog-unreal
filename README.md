@@ -8,7 +8,7 @@ See [status](#status), [architecture](docs/integration-plan.md) and [validation]
 
 ## Releases
 
-[GitHub Releases](https://github.com/PostHog/posthog-unreal/releases) provide experimental prereleases: one `posthog-unreal-<version>.zip` bundling Mac arm64, Linux x64 and Windows x64 Rust static libraries with the Unreal C++ source, plus `SHA256SUMS`. Copy the ZIP's `PostHog/` directory into your C++ project's `Plugins/` directory and rebuild with UE 5.8 for your platform. Unreal selects the matching library; Rust is not required for this installation. The SDK is not on Fab yet.
+[GitHub Releases](https://github.com/PostHog/posthog-unreal/releases) provide experimental prereleases: one `posthog-unreal-<version>.zip` bundling Mac arm64, Linux x64 and Windows x64 Rust static libraries with the Unreal C++ source, plus `SHA256SUMS`. Copy the ZIP's `PostHog/` directory into your C++ project's `Plugins/` directory and rebuild with UE 5.8 for your platform. Unreal selects the matching library; Rust is not required for this installation. Platforms not yet validated in Unreal are listed under [status](#status). The SDK is not on Fab yet.
 
 See [RELEASING](RELEASING.md) for checksums, versioning, the release pipeline and its manual Unreal validation gate. To develop the SDK or build other source targets, use the instructions below.
 

@@ -171,10 +171,13 @@ jobs:
       - name: Validate the verified plugin ZIP
         env:
           VERSION: ${{ needs.prepare-candidate.outputs.version }}
+          ZIP_SHA256: ${{ needs.verify.outputs.candidate-zip-sha256 }}
         run: |
           set -euo pipefail
           python -m unittest discover -s Tests -p 'test_release*.py'
-          (cd artifacts/releases && sha256sum --check SHA256SUMS)
+          # Re-runs keep every attempt's same-named artifact; require the ZIP the latest assemble attempt reported.
+          test -n "$ZIP_SHA256"
+          echo "$ZIP_SHA256  posthog-unreal-$VERSION.zip" | (cd artifacts/releases && sha256sum --check -)
           python scripts/release.py "$VERSION"
           git diff --exit-code
       - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
