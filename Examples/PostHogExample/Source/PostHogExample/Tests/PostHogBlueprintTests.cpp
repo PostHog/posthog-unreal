@@ -84,7 +84,13 @@ public:
         case 3:
         {
             if (!Drain.IsReady() || Probe->Notifications <= BaselineNotifications) { return false; }
-            Test->TestEqual(TEXT("manual replay request"), Invoke(Subsystem, TEXT("StartSessionReplay")), EPostHogResult::Ok);
+            if (!bReplayRequested)
+            {
+                Test->TestEqual(TEXT("manual replay request"), Invoke(Subsystem, TEXT("StartSessionReplay")), EPostHogResult::Ok);
+                bReplayRequested = true;
+            }
+            // Remote replay settings load asynchronously; flush does not wait for them.
+            if (!Subsystem->IsSessionReplayActive()) { return false; }
             struct { int32 Width; int32 Height; int32 RowStrideBytes; UPostHogReplayFrame* Frame; EPostHogResult ReturnValue; } Params{32, 24, 128, nullptr, EPostHogResult::Closed};
             Subsystem->ProcessEvent(Subsystem->FindFunctionChecked(TEXT("BeginReplayFrame")), &Params);
             Test->TestEqual(TEXT("reflected owned acquisition"), Params.ReturnValue, EPostHogResult::Ok);
@@ -127,7 +133,7 @@ private:
     }
     FAutomationTestBase* Test;
     FPostHogConfig Config;
-    bool PreviousAuto = false;
+    bool PreviousAuto = false, bReplayRequested = false;
     int32 Phase = 0, BaselineNotifications = 0;
     double Deadline;
     TStrongObjectPtr<UGameInstance> Instance;

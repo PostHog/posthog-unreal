@@ -68,7 +68,7 @@ The native client also delegates registered/person/group properties, targeting o
 
 `PostHogAnalytics` adapts Unreal's `IAnalyticsProvider` to an explicitly initialized game-instance subsystem. Native callers can use `GetAnalyticsProvider()` or `FPostHogAnalyticsProvider::GetForWorld(WorldContext)`. Call `BindAnalyticsProvider()` to designate that instance for world-less configured-provider, stock Analytics Blueprint and AnalyticsMulticast paths; another live instance cannot steal the binding. Credentials and client options stay on subsystem setup, not Analytics INI/delegate routing. Unbind/shutdown releases only that instance's designation; retained adapters never retarget a replacement client.
 
-Default event attributes are a replaceable provider-owned array. They are per-capture fallbacks, not registered SDK properties: explicit event properties and SDK registered/platform/generated properties take priority. Unregistering an SDK property reveals an adapter fallback on the next adapter capture; defaults do not leak into direct client captures. JSON fragments remain typed; ordinary Analytics attribute strings remain strings. Rust fills fallbacks before BeforeSend, so hooks can remove them without refill.
+Default event attributes are a replaceable provider-owned array, not registered SDK properties. On each adapter capture the provider merges them under that event's attributes (an event attribute wins on a key collision) and sends the result as ordinary event properties. Because they are event properties, a default attribute outranks an SDK registered, platform or generated property with the same key; Rust fills only keys that neither layer sets. Defaults do not leak into direct client captures. JSON fragments remain typed; ordinary Analytics attribute strings remain strings. BeforeSend sees the merged properties and can remove them.
 
 `StartSession` uses the SDK session and captures `SessionStart` once per admitted SDK-session annotation; a dropped or callback-closed start returns false. `EndSession` attributes `SessionEnd` to the passively observed SDK session, including an expired session, and conditionally ends the SDK-current session without clearing a newer session created by a hook. **`SetSessionID` is unsupported and always returns false**, including for valid UUIDs; use native SDK-created automatic/manual sessions. Identity and flush calls delegate to the same client, and `Immediate` events request a flush without promising ingestion.
 
@@ -76,9 +76,9 @@ Default event attributes are a replaceable provider-owned array. They are per-ca
 
 **Get Feature Flag** returns an owned result with availability, enabled state, boolean/variant value, payload presence/value and the complete SDK record. Known false differs from missing. A present JSON null payload has `bHasPayload = true`.
 
-Reporting can use the configured **Default**, explicit **Send**, or **Silent**. The Rust SDK owns exposure policy and deduplication. Full flag getters do not record exposures and include known disabled flags.
+Reporting can use the configured **Default**, explicit **Send**, or **Silent**. The Rust SDK owns exposure policy and deduplication; a reported read of a missing flag records `$feature_flag_called` with `$feature_flag_error = flag_missing`. Full flag getters do not record exposures and include known disabled flags.
 
-**Reload Feature Flags** requests a refresh; it does not return a request-correlated future. **On Feature Flags Changed** publishes the bounded mailbox's last received SDK update on the game thread, including automatic, restored and manual loads. Unread updates coalesce. Notifications include enabled flags only; use **Get Feature Flags** for all cached results. Error/partial/payload diagnostics come from the SDK. An update describes its producing evaluation, not necessarily current targeting at game-thread delivery time.
+**Reload Feature Flags** requests a refresh; it does not return a request-correlated future, and flush does not wait for flag loads. **On Feature Flags Changed** publishes the bounded mailbox's last received SDK update on the game thread, including automatic, restored and manual loads. Unread updates coalesce. Notifications include enabled flags only; use **Get Feature Flags** for all cached results. Error/partial/payload diagnostics come from the SDK. An update describes its producing evaluation, not necessarily current targeting at game-thread delivery time.
 
 ## Hooks, flush and shutdown
 
@@ -90,9 +90,9 @@ Reporting can use the configured **Default**, explicit **Send**, or **Silent**. 
 
 ## Screenshot replay
 
-Recording is stopped by default. **Start Session Replay** requests manual recording; consent, valid session and supported remote permission still apply. **Stop Session Replay** stops new acquisitions, but valid outstanding acquisitions can still complete.
+Recording is stopped by default. **Start Session Replay** requests manual recording; consent, valid session and supported remote permission still apply. A start made while opted out is ignored; start again after opting in. Remote replay settings load asynchronously and flush does not wait for them, so check **Is Session Replay Active** before expecting frames. **Stop Session Replay** stops new acquisitions, but valid outstanding acquisitions can still complete.
 
-The game-instance subsystem attaches automatic capture to its own game viewport. It captures the visible axis-aligned viewport rectangle from that window's composited backbuffer, excluding unrelated windows and editor chrome outside that rectangle. Direct clients do not attach a viewport. Host capture defaults are `IntervalMs = 1000` (minimum 100) and `MaxDimension = 960` (minimum 64).
+The game-instance subsystem attaches automatic capture to its own game viewport. It captures the visible axis-aligned viewport rectangle from that window's composited backbuffer, excluding unrelated windows and editor chrome outside that rectangle. Direct clients do not attach a viewport. Replay defaults are `IntervalMs = 1000` and `MaxDimension = 960` (minimum 64). `IntervalMs` is the Rust SDK's `throttle_delay`: the minimum time between replay frames for every producer of that client. **Begin Replay Frame** returns `Throttled` sooner than that after the previous frame began; skip the frame and try again on a later render frame. `0` disables the throttle for manual producers; the automatic viewport recorder never polls faster than 100 ms. Other refusals, including not recording before start or after stop, return `Inactive`.
 
 **Automatic captures are unredacted.** They include readable UI and other content displayed inside the viewport. Enable recording only for content approved for collection. This is not a screenshot-privacy guarantee.
 
@@ -116,7 +116,7 @@ python3 Tests/native_integration.py \
 
 After installing matching ABI-v3 artifacts and building the host, add `--editor "$UE_ROOT/Engine/Binaries/Mac/UnrealEditor-Cmd"` for C++/Blueprint automation.
 
-The current Rust pin passes 7 bridge tests, 27 tooling tests and the 20-test consolidated driver, including all 13 engine tests on UE 5.8 macOS arm64. Metal replay passes in Development Editor and locally ad-hoc-signed packaged Development/Shipping, with resize, halt/resume and clean active-recording exit. The retained example's Editor Analytics automation also passes; its full gameplay suite is not green. See [implementation status](docs/implementation-status.md) for known failures and remaining validation, and [CI documentation](docs/ci.md) for fixture commands and local signing steps.
+The current Rust pin passes 8 bridge tests, 27 tooling tests and the 19 standalone native driver tests. Its C++/Blueprint automation, rendered replay and packaged runs have not been run yet: they are pending a UE 5.8 reinstall. The previous pin passed all 13 engine tests and Metal replay in Development Editor and locally ad-hoc-signed packaged Development/Shipping. The retained example's full gameplay suite is not green. See [implementation status](docs/implementation-status.md) for known failures and remaining validation, and [CI documentation](docs/ci.md) for fixture commands and local signing steps.
 
 ## Contributing
 

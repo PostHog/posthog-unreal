@@ -15,7 +15,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import unittest
 import uuid
 
@@ -78,7 +77,7 @@ class MockServerTestCase(unittest.TestCase):
 
 
 OK, ACCEPTED, INVALID, CLOSED = 0, 1, 2, 3
-DISABLED, FULL, OPTED_OUT, DROPPED, REENTRANT, DEFERRED, INACTIVE, WRONG, STALE = 7, 8, 10, 11, 12, 13, 14, 15, 16
+DISABLED, FULL, OPTED_OUT, DROPPED, REENTRANT, DEFERRED, INACTIVE, WRONG, STALE, THROTTLED = 7, 8, 10, 11, 12, 13, 14, 15, 16, 17
 HOOK = c.CFUNCTYPE(c.c_int32, c.c_void_p, Bytes, c.POINTER(Buffer))
 
 
@@ -115,9 +114,8 @@ class StatefulNativeTests(MockServerTestCase):
         cls.lib.phu_abi_version.restype = c.c_uint32
         if cls.lib.phu_abi_version() != 3:
             raise RuntimeError("Stateful integration requires ABI v3")
-        lock = tomllib.loads((Path(__file__).resolve().parents[1] / "rust/Cargo.lock").read_text())
-        core = next(package for package in lock["package"] if package["name"] == "posthog")
-        cls.transport_sdk_info = f"posthog-rs/{core['version']}"
+        # The SDK names the configured library, not posthog-rs, in its transport header.
+        cls.transport_sdk_info = "posthog-unreal/0.0.1"
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -217,11 +215,37 @@ class StatefulNativeTests(MockServerTestCase):
         return self.lib.phu_submit_frame(handle, frame, Bytes(c.cast(storage, c.c_void_p), len(pixels)))
 
     def replay(self, **options):
-        handle = self.create(**options)
+        # Most tests acquire frames back to back; throttling has its own test.
+        handle = self.create(**{"throttle_delay_ms": 0, **options})
         self.flush(handle)  # Completes the initial remote-config attempt, not renderer startup.
         self.command(handle, "replay_start")
-        self.assertTrue(self.read(handle, "replay_active"))
+        self.wait_for_replay(handle)
         return handle
+
+    def next_flags(self, handle):
+        # Flag loads are asynchronous; flush does not wait for them.
+        deadline = time.monotonic() + 5
+        while True:
+            status, update = self.result("phu_poll_flags", handle)
+            if status == OK:
+                return update
+            self.assertEqual(status, INACTIVE)
+            self.assertLess(time.monotonic(), deadline, "no feature flag notification")
+            time.sleep(0.01)
+
+    def wait_for_settings(self, count):
+        deadline = time.monotonic() + 5
+        while len(self.http("/__captured/all")["config_calls"]) < count:
+            self.assertLess(time.monotonic(), deadline, "remote config was not requested")
+            time.sleep(0.01)
+        time.sleep(0.2)  # Lets the client apply the served settings.
+
+    def wait_for_replay(self, handle):
+        # Remote replay settings load asynchronously; flush does not wait for them.
+        deadline = time.monotonic() + 5
+        while not self.read(handle, "replay_active"):
+            self.assertLess(time.monotonic(), deadline, "replay settings did not permit recording")
+            time.sleep(0.01)
 
     def events(self):
         return self.http("/__captured/events")
@@ -284,7 +308,7 @@ class StatefulNativeTests(MockServerTestCase):
         variant = "x" * (700 * 1024)
         self.http("/__control/state", {"flags": {"large": variant}})
         handle = self.create(preload_feature_flags=True)
-        self.flush(handle)
+        self.next_flags(handle)
         flag = self.read(handle, "feature_flag", key="large", send_event=False)
         self.assertIsNotNone(flag)
         self.assertEqual(flag["variant"], variant)
@@ -371,42 +395,11 @@ class StatefulNativeTests(MockServerTestCase):
             if event["event"].startswith("manual_"):
                 self.assertIsNone(event.get("session_id"))
 
-    def test_capture_fallback_precedence_hook_removal_and_nonleak(self):
-        observed = []
-        def inspect(event):
-            if event["event"].startswith("fallback_"):
-                observed.append(json.loads(json.dumps(event)))
-                event["properties"].pop("remove_via_hook", None)
-            return event
-        handle = self.create(hook=self.hook(inspect), platform_context={"platform": "context", "choice": "context"})
-        self.command(handle, "register", properties={"choice": "registered", "reveal": "registered"})
-        defaults = {"choice": "fallback", "platform": "fallback", "reveal": "fallback", "only": "fallback",
-                    "remove_via_hook": True, "$lib": "not-the-sdk", "$is_identified": "not-a-boolean"}
-        self.assertEqual(self.capture(handle, "fallback_explicit", properties={"choice": "explicit"}, fallback_properties=defaults)[0], ACCEPTED)
-        self.command(handle, "unregister", key="reveal")
-        self.assertEqual(self.capture(handle, "fallback_revealed", fallback_properties=defaults)[0], ACCEPTED)
-        self.assertEqual(self.capture(handle, "fallback_direct")[0], ACCEPTED)
-        self.flush(handle)
-        self.assertEqual(len(observed), 3)
-        first, revealed, direct = [event["properties"] for event in observed]
-        self.assertEqual(first["choice"], "explicit")
-        self.assertEqual(first["platform"], "context")
-        self.assertEqual(first["reveal"], "registered")
-        self.assertEqual(first["only"], "fallback")
-        self.assertEqual(first["$lib"], "posthog-unreal")
-        self.assertIs(first["$is_identified"], False)
-        self.assertTrue(first["remove_via_hook"])
-        self.assertEqual(revealed["choice"], "registered")
-        self.assertEqual(revealed["reveal"], "fallback")
-        self.assertNotIn("only", direct)
-        self.assertNotIn("reveal", direct)
-        self.assertTrue(all("remove_via_hook" not in event["properties"] for event in self.wire()))
-
-    def test_queue_capacity_and_screen_outcomes(self):
+    def test_full_queue_keeps_newest_and_screen_outcomes(self):
         handle = self.create(max_queue_size=1, max_batch_size=1)
         self.flush(handle)
         self.assertEqual(self.capture(handle, "first")[0], ACCEPTED)
-        self.assertEqual(self.capture(handle, "full"), (FULL, None))
+        self.assertEqual(self.capture(handle, "full")[0], ACCEPTED)
         self.flush(handle)
         status, receipt = self.input_result("phu_screen", handle,
                                             {"name": "Store", "properties": {"$screen_name": "ignored"}})
@@ -414,7 +407,7 @@ class StatefulNativeTests(MockServerTestCase):
         self.assertIsNotNone(receipt["uuid"])
         self.flush(handle)
         events = self.wire()
-        self.assertEqual([event["event"] for event in events], ["first", "$screen"])
+        self.assertEqual([event["event"] for event in events], ["full", "$screen"])
         self.assertEqual(events[-1]["properties"]["$screen_name"], "Store")
         self.assertEqual(self.capture(handle, "")[0], INVALID)
 
@@ -520,9 +513,7 @@ class StatefulNativeTests(MockServerTestCase):
 
     def test_flags_mailbox_getters_and_exposures(self):
         handle = self.create(preload_feature_flags=True)
-        self.flush(handle)
-        status, update = self.result("phu_poll_flags", handle)
-        self.assertEqual(status, OK)
+        update = self.next_flags(handle)
         self.assertEqual(set(update["flags"]), {"bool-value", "string-value"})
         self.assertNotIn("disabled-flag", update["flags"])
         self.assertEqual(self.result("phu_poll_flags", handle), (INACTIVE, None))
@@ -537,22 +528,22 @@ class StatefulNativeTests(MockServerTestCase):
         self.assertFalse(self.read(handle, "feature_flag", key="disabled-flag")["enabled"])
         self.read(handle, "feature_flag", key="disabled-flag")
         self.flush(handle)
-        self.assertEqual([event["event"] for event in self.events()], ["$feature_flag_called"])
+        # A missing flag reports its exposure with an error, as the peer SDKs do; repeats deduplicate.
+        called = self.events()
+        self.assertEqual([(event["event"], event["properties"]["$feature_flag"]) for event in called],
+                         [("$feature_flag_called", "missing"), ("$feature_flag_called", "disabled-flag")])
+        self.assertEqual(called[0]["properties"]["$feature_flag_error"], "flag_missing")
         self.command(handle, "opt_out")
         self.assertFalse(self.read(handle, "feature_flag", key="disabled-flag")["enabled"])
         self.command(handle, "reload_feature_flags")
-        self.flush(handle)
-        self.assertEqual(self.result("phu_poll_flags", handle)[0], OK)
+        self.next_flags(handle)
 
     def test_flags_load_failure_is_real_notification_not_a_future(self):
         handle = self.create(preload_feature_flags=True)
-        self.flush(handle)
-        self.result("phu_poll_flags", handle)
+        self.next_flags(handle)
         self.http("/__control/state", {"flagsQuotaLimited": True})
         self.command(handle, "reload_feature_flags")
-        self.flush(handle)
-        status, update = self.result("phu_poll_flags", handle)
-        self.assertEqual(status, OK)
+        update = self.next_flags(handle)
         self.assertEqual(update["error"]["kind"], "quota_limited")
         self.assertTrue(update["errors_loading"])
         self.assertFalse(self.read(handle, "feature_flags")["disabled-flag"]["enabled"])
@@ -587,6 +578,15 @@ class StatefulNativeTests(MockServerTestCase):
         self.assertEqual(self.lib.phu_abandon_frame(frame), CLOSED)
         self.assertEqual(self.submit(handle, frame), CLOSED)
         self.assertEqual(self.close(handle)[0], OK)
+
+    def test_replay_throttle_skips_frames_until_the_delay_passes(self):
+        handle = self.replay(throttle_delay_ms=300, max_frames_in_flight=2)
+        self.assertEqual(self.lib.phu_abandon_frame(self.frame(handle)), OK)
+        self.assertEqual(self.begin(handle), (THROTTLED, 0))
+        time.sleep(0.35)
+        self.assertEqual(self.lib.phu_abandon_frame(self.frame(handle)), OK)
+        self.command(handle, "replay_stop")
+        self.assertEqual(self.begin(handle), (INACTIVE, 0))
 
     def test_encoded_replay_dimensions_mask_pixels_and_late_completion(self):
         from PIL import Image
@@ -647,16 +647,17 @@ class StatefulNativeTests(MockServerTestCase):
     def test_replay_remote_restrictions_and_manual_start(self):
         self.http("/__control/state", {"sampleRate": "0.5"})
         handle = self.create()
-        self.flush(handle)
         self.command(handle, "replay_start")
+        self.wait_for_settings(1)
         self.assertFalse(self.read(handle, "replay_active"))
         self.assertEqual(self.begin(handle), (INACTIVE, 0))
         self.http("/__control/state", {"sampleRate": "1"})
         other = self.create()
-        self.flush(other)
+        self.wait_for_settings(2)
         self.assertFalse(self.read(other, "replay_active"))
         self.assertEqual(self.begin(other), (INACTIVE, 0))
         self.command(other, "replay_start")
+        self.wait_for_replay(other)
         frame = self.frame(other)
         self.assertEqual(self.lib.phu_abandon_frame(frame), OK)
 
@@ -713,19 +714,22 @@ class StatefulNativeTests(MockServerTestCase):
         self.assertFalse(wire["blueprint_anonymous"]["properties"]["boolean"])
         self.assertNotEqual(wire["subsystem_one"]["distinct_id"], wire["subsystem_two"]["distinct_id"])
         self.assertTrue(wire["subsystem_one"]["properties"]["$engine_version"])
-        for name in ("analytics_before", "analytics_during", "analytics_revealed_default", "analytics_replaced_defaults",
+        for name in ("analytics_before", "analytics_during", "analytics_after_unregister", "analytics_replaced_defaults",
                      "analytics_cleared_defaults", "analytics_native", "analytics_native_after_defaults",
                      "analytics_stock_blueprint", "analytics_multicast", "analytics_restart"):
             self.assertIn(name, wire)
         expiry_ends = [event for event in events if event["event"] == "SessionEnd" and event["properties"].get("expiry_fixture")]
         self.assertEqual(len(expiry_ends), 1)
         self.assertEqual(expiry_ends[0]["session_id"], wire["analytics_expiry_seed"]["session_id"])
+        # Per-event attributes win over Analytics defaults; both are event properties, so defaults
+        # outrank registered/platform properties and Rust fills only keys neither layer sets.
         before = wire["analytics_before"]["properties"]
         self.assertEqual(before["precedence"], "caller")
-        self.assertEqual(before["context_wins"], "registered")
-        self.assertEqual(before["registered_wins"], "registered")
+        self.assertEqual(before["default_over_context"], "default")
+        self.assertEqual(before["default_over_registered"], "default")
+        self.assertIs(before["registered_only"], True)
         self.assertNotIn("secret", before)
-        self.assertEqual(wire["analytics_revealed_default"]["properties"]["registered_wins"], "default")
+        self.assertEqual(wire["analytics_after_unregister"]["properties"]["default_over_registered"], "default")
         for name in ("analytics_native", "analytics_native_after_defaults", "analytics_cleared_defaults"):
             self.assertNotIn("default_only", wire[name]["properties"])
             self.assertNotIn("replacement", wire[name]["properties"])

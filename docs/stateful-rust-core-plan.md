@@ -1,6 +1,6 @@
 # Stateful Rust core and thin Unreal adapter
 
-The stateful Rust SDK now exists at `b717aef23d4869bdf94e75ce36bbd383d3575c6f`. Unreal integrates its public API through ABI v3. The current responsibility map and integration sequence are in [integration-plan.md](integration-plan.md); validation gates are tracked in [implementation-status.md](implementation-status.md).
+The stateful Rust SDK is pinned at `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`. Unreal integrates its public API through ABI v3. The current responsibility map and integration sequence are in [integration-plan.md](integration-plan.md); validation gates are tracked in [implementation-status.md](implementation-status.md).
 
 ## Contract
 
@@ -16,7 +16,7 @@ The bridge is not a second SDK. It can own handles, buffers, borrowed foreign ca
 - Captures permitted before opt-out may still persist and deliver. Reset restores configured default consent.
 - State and event storage belong to Rust under its own namespaces and schema. Storage failure uses the SDK's memory fallback.
 - Feature-flag notifications are owned SDK snapshots; they can be superseded by the time the game thread consumes them. They are not a targeting-generation protocol.
-- Capture-time SDK `session_id` and `distinct_id` are top-level fields in raw canonical v1 analytics events. Event library properties identify `posthog-unreal/0.0.1`; the transport header separately identifies `posthog-rs/0.31.3`.
+- Capture-time SDK `session_id` and `distinct_id` are top-level fields in raw canonical v1 analytics events. Event library properties and the transport `posthog-sdk-info` header both identify `posthog-unreal/0.0.1`.
 - Before-send filtering preserves complete event fields, supports mutation/drop and fails closed. Removed attribution is not refilled by the adapter.
 
 ## Replay

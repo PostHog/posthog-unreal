@@ -168,6 +168,39 @@ fn malformed_inputs_and_abi_mismatch_zero_outputs() {
         Status::InvalidInput
     );
     assert!(out.data.is_null());
+    // Analytics defaults are merged by the Unreal adapter; the ABI has no fallback field.
+    assert_eq!(
+        unsafe {
+            phu_capture(
+                handle,
+                bytes(r#"{"event":"test","fallback_properties":{"a":1}}"#),
+                &mut out,
+            )
+        },
+        Status::InvalidInput
+    );
+    assert_eq!(close(handle).0, Status::Ok);
+}
+#[test]
+fn replay_refusals_report_throttling_separately() {
+    assert_eq!(unavailable(FrameUnavailable::Throttled), Status::Throttled);
+    for reason in [
+        FrameUnavailable::NotRecording,
+        FrameUnavailable::NotPermitted,
+        FrameUnavailable::AtCapacity,
+        FrameUnavailable::InvalidLayout,
+        FrameUnavailable::Closed,
+    ] {
+        assert_eq!(unavailable(reason), Status::Inactive);
+    }
+    let handle = create(json!({"throttle_delay_ms":0}), no_hooks());
+    let mut frame = 7;
+    let layout = bytes(r#"{"width":2,"height":2,"row_stride_bytes":8}"#);
+    assert_eq!(
+        unsafe { phu_begin_frame(handle, layout, &mut frame) },
+        Status::Inactive
+    );
+    assert_eq!(frame, 0);
     assert_eq!(close(handle).0, Status::Ok);
 }
 #[test]

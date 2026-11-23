@@ -1,20 +1,23 @@
 #include "PostHogReplayWork.h"
 #include "Misc/ScopeLock.h"
 
-TUniquePtr<FPostHogReplayWork> FPostHogReplayWorkState::Begin(FPostHogClient& Client, int32 Width, int32 Height)
+TUniquePtr<FPostHogReplayWork> FPostHogReplayWorkState::Begin(FPostHogClient& Client, int32 Width, int32 Height, EPostHogResult* OutResult)
 {
+    EPostHogResult Ignored; EPostHogResult& Result = OutResult ? *OutResult : Ignored;
+    Result = EPostHogResult::Inactive;
     FScopeLock Lock(&Mutex);
     if (bStopped || Count.load() >= Capacity || Width <= 0 || Width > MAX_int32 / 4) { return nullptr; }
     TUniquePtr<FPostHogReplayFrame> Frame;
-    if (Client.BeginReplayFrame(Width, Height, Width * 4, Frame) != EPostHogResult::Ok) { return nullptr; }
+    Result = Client.BeginReplayFrame(Width, Height, Width * 4, Frame);
+    if (Result != EPostHogResult::Ok) { return nullptr; }
     Count.fetch_add(1);
     return TUniquePtr<FPostHogReplayWork>(new FPostHogReplayWork(AsShared(), Revision, MoveTemp(Frame)));
 }
 bool FPostHogReplayWorkState::BeginCopy(FPostHogClient& Client, int32 Width, int32 Height,
-    TFunctionRef<void(TUniquePtr<FPostHogReplayWork>)> Copy)
+    TFunctionRef<void(TUniquePtr<FPostHogReplayWork>)> Copy, EPostHogResult* OutResult)
 {
     FScopeLock Admission(&AdmissionMutex);
-    auto Work = Begin(Client, Width, Height);
+    auto Work = Begin(Client, Width, Height, OutResult);
     if (!Work) { return false; }
     Copy(MoveTemp(Work)); return true;
 }

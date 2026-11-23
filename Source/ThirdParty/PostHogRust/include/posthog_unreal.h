@@ -16,9 +16,9 @@ typedef int32_t phu_status;
 enum {
     PHU_OK = 0, PHU_ACCEPTED = 1, PHU_INVALID_INPUT = 2, PHU_CLOSED = 3,
     PHU_INTERNAL_ERROR = 5, PHU_UNSUPPORTED_ABI = 6, PHU_DISABLED = 7,
-    PHU_FULL = 8, PHU_OUTPUT_TOO_LARGE = 9, PHU_OPTED_OUT = 10,
+    PHU_OUTPUT_TOO_LARGE = 9, PHU_OPTED_OUT = 10,
     PHU_DROPPED = 11, PHU_REENTRANT = 12, PHU_DEFERRED = 13,
-    PHU_INACTIVE = 14, PHU_WRONG_RECORDER = 15, PHU_STALE = 16
+    PHU_INACTIVE = 14, PHU_WRONG_RECORDER = 15, PHU_STALE = 16, PHU_THROTTLED = 17
 };
 typedef struct phu_bytes { const uint8_t* data; size_t len; } phu_bytes;
 typedef struct phu_buffer { uint8_t* data; size_t len; } phu_buffer;
@@ -67,7 +67,7 @@ phu_status phu_coordination_key(phu_bytes input, phu_buffer* out_key);
  * send_feature_flag_event (true), platform_context ({}), flush_at (20),
  * flush_interval_ms (30000), max_queue_size (1000), max_batch_size (50),
  * request_timeout_seconds (10), shutdown_timeout_ms (3000), jpeg_quality (65),
- * max_frames_in_flight (2)}.
+ * max_frames_in_flight (2), throttle_delay_ms (1000; minimum time between replay frames, 0 disables)}.
  * Absent/null storage_root selects MEMORY, otherwise Rust namespaces the supplied root
  * by normalized host/project/instance and owns state/events. No legacy state import.
  * Core config/startup failures produce a disabled client; storage failures permit
@@ -77,9 +77,10 @@ phu_status phu_coordination_key(phu_bytes input, phu_buffer* out_key);
  */
 phu_status phu_create(uint32_t abi_version, phu_bytes options, phu_hooks hooks, phu_handle* out_handle);
 
-/* Input: {event, properties?, fallback_properties?, options?, groups?, timestamp? (RFC3339), uuid?}.
- * fallback_properties fills only absent assembled property keys before before-send; it is not registered state.
- * Identity/session/enrichment come from Rust. No disk/network on caller; hooks run inline.
+/* Input: {event, properties?, options?, groups?, timestamp? (RFC3339), uuid?}.
+ * Event properties win; Rust fills registered/platform/SDK properties only for absent keys.
+ * Identity/session/enrichment come from Rust. A full queue drops its oldest event.
+ * No disk/network on caller; hooks run inline.
  * ACCEPTED returns {uuid} in out_receipt and means bounded admission, not persistence or
  * ingestion. Other capture outcomes have no buffer. Screen input: {name, properties?}.
  */
@@ -110,13 +111,13 @@ phu_status phu_screen(phu_handle handle, phu_bytes input, phu_buffer* out_receip
 phu_status phu_command(phu_handle handle, phu_bytes command);
 
 /* Read {op,...fields}:
- * state -> {disabled,identified,opt_out,anonymous_id,distinct_id} (individual SDK reads)
- * session_id -> UUID string|null (may maintain session); peek_session_id -> string|null
+ * state -> {disabled,opt_out,anonymous_id,distinct_id} (individual SDK reads)
+ * session_id -> UUID string|null (SDK get_session_id: may maintain session); peek_session_id -> string|null
  *   (passive, may return expired state, per SDK contract)
  * feature_flag: key, send_event? -> rich result|null (omission uses SDK reporting default)
  * feature_flags -> map of rich results|null, including known false, no exposures
  * replay_active -> bool (passive)
- * Rich result: {key,enabled,variant,has_payload,payload,context,evaluation_revision,
+ * Rich result: {key,enabled,variant,has_payload,payload,context,
  * request_id,evaluated_at,partial,id,version,reason}. Nullable fields stay null;
  * has_payload distinguishes absent payload from present JSON null. Context contains
  * distinct_id,anonymous_id,groups,person_properties,group_properties,disable_geoip.
@@ -164,8 +165,10 @@ phu_status phu_close(phu_handle handle, phu_buffer* out_report);
 /* Reserve immediately before GPU/readback work. Layout JSON:
  * {width,height,row_stride_bytes}. Pixels must be complete composited/downscaled/masked
  * top-down BGRA8888 (alpha ignored). Core validates layout and owns capacity/attribution.
- * OK returns a single-use frame token; INACTIVE means core refused acquisition (including
- * inactive/policy/capacity/invalid-layout/allocation). No time-based token expiry.
+ * OK returns a single-use frame token. THROTTLED means the previous frame began less than
+ * throttle_delay_ms ago: skip this frame and retry on a later render frame. INACTIVE means core
+ * refused acquisition for any other reason (not recording before replay_start/after replay_stop,
+ * policy, session, consent, capacity, invalid layout, allocation). No time-based token expiry.
  * Carry token through readback; abandon on failure/cancellation/resize. No prefetch queue.
  * Submission COPIES exactly row_stride_bytes*height bytes into the acquired Rust buffer.
  * Every submit attempt consumes the token, including bad length/wrong client/errors.

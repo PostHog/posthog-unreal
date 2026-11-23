@@ -41,7 +41,7 @@ public:
         Config.SessionMode = EPostHogSessionMode::Manual;
         Config.FlushAt = 100; Config.FlushIntervalMilliseconds = 60000;
         Config.Context.SetString(TEXT("test_suite"), TEXT("analytics"));
-        Config.Context.SetString(TEXT("context_wins"), TEXT("context"));
+        Config.Context.SetString(TEXT("default_over_context"), TEXT("context"));
         auto Hook = Hooks;
         Config.BeforeSend = [Hook](FJsonObject& Event)
         {
@@ -107,13 +107,13 @@ public:
             Check(First == A->GetAnalyticsProvider() && !Factory(), TEXT("adapter stable; no implicit binding"));
 
             FPostHogProperties Registered;
-            Registered.SetString(TEXT("registered_wins"), TEXT("registered"));
-            Registered.SetString(TEXT("context_wins"), TEXT("registered"));
+            Registered.SetString(TEXT("default_over_registered"), TEXT("registered"));
+            Registered.SetString(TEXT("default_over_context"), TEXT("registered"));
             Registered.SetBoolean(TEXT("registered_only"), true);
             FirstClient->Register(Registered);
             First->SetDefaultEventAttributes(MakeAnalyticsEventAttributeArray(
-                TEXT("precedence"), TEXT("default"), TEXT("registered_wins"), TEXT("default"),
-                TEXT("context_wins"), TEXT("default"), TEXT("default_only"), 123));
+                TEXT("precedence"), TEXT("default"), TEXT("default_over_registered"), TEXT("default"),
+                TEXT("default_over_context"), TEXT("default"), TEXT("default_only"), 123));
             Check(First->GetDefaultEventAttributeCount() == 4 && First->GetDefaultEventAttribute(0).GetName() == TEXT("precedence"), TEXT("default attribute accessors"));
             auto DefaultCopy = First->GetDefaultEventAttributesSafe(); DefaultCopy.Empty();
             Check(First->GetDefaultEventAttributeCount() == 4, TEXT("default attributes returned by value"));
@@ -133,8 +133,8 @@ public:
             Check(!Session.IsEmpty() && Session == FirstClient->GetSessionId(), TEXT("adapter and native client share session"));
             Check(First->StartSession(MakeAnalyticsEventAttributeArray(TEXT("chapter"), TEXT("duplicate"))), TEXT("repeated start is idempotent"));
             First->RecordEvent(TEXT("analytics_during"));
-            FirstClient->Unregister(TEXT("registered_wins"));
-            First->RecordEvent(TEXT("analytics_revealed_default"));
+            FirstClient->Unregister(TEXT("default_over_registered"));
+            First->RecordEvent(TEXT("analytics_after_unregister"));
             FirstClient->Register(Registered);
             Check(!First->SetSessionID(TEXT("invalid")), TEXT("invalid session ID rejected"));
             Check(First->GetSessionID() == Session, TEXT("invalid setter retains session"));

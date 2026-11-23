@@ -22,12 +22,12 @@ struct Context<'a> {
 }
 fn context(value: &FeatureFlagContext) -> Context<'_> {
     Context {
-        distinct_id: &value.distinct_id,
-        anonymous_id: &value.anonymous_id,
-        groups: &value.groups,
-        person_properties: &value.person_properties,
-        group_properties: &value.group_properties,
-        disable_geoip: value.disable_geoip,
+        distinct_id: value.distinct_id(),
+        anonymous_id: value.anonymous_id(),
+        groups: value.groups(),
+        person_properties: value.person_properties(),
+        group_properties: value.group_properties(),
+        disable_geoip: value.disable_geoip(),
     }
 }
 #[derive(Serialize)]
@@ -38,7 +38,6 @@ pub struct Flag<'a> {
     has_payload: bool,
     payload: &'a Option<Value>,
     context: Context<'a>,
-    evaluation_revision: u64,
     request_id: &'a Option<String>,
     evaluated_at: Option<i64>,
     partial: bool,
@@ -54,7 +53,6 @@ pub fn flag(value: &FeatureFlagResult) -> Flag<'_> {
         has_payload: value.payload.is_some(),
         payload: &value.payload,
         context: context(&value.context),
-        evaluation_revision: value.evaluation_revision,
         request_id: &value.request_id,
         evaluated_at: value.evaluated_at,
         partial: value.partial,
@@ -76,14 +74,10 @@ impl Serialize for FlagMap<'_> {
 fn error(value: FeatureFlagLoadError) -> Value {
     use FeatureFlagLoadError::*;
     match value {
-        RequestTooLarge => json!({"kind":"request_too_large"}),
         Network => json!({"kind":"network"}),
         Http(status) => json!({"kind":"http","status":status}),
-        ResponseTooLarge => json!({"kind":"response_too_large"}),
         InvalidResponse => json!({"kind":"invalid_response"}),
-        TooManyFlags => json!({"kind":"too_many_flags"}),
         QuotaLimited => json!({"kind":"quota_limited"}),
-        CacheTooLarge => json!({"kind":"cache_too_large"}),
         _ => json!({"kind":"unknown"}),
     }
 }

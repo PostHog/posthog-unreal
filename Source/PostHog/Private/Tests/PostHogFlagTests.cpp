@@ -14,8 +14,8 @@ bool FPostHogFlagsTest::RunTest(const FString&)
         Config.BeforeSend = [&Exposures](FJsonObject& Event) { if (Event.GetStringField(TEXT("event")) == TEXT("$feature_flag_called")) { ++Exposures; } return true; };
 
         auto Client = FPostHogClient::CreateAsync(Config).Get(); if (!Client) { Errors.Add(TEXT("flag client creation")); return Errors; }
-        Client->FlushAsync().Get(); FPostHogFeatureFlagsUpdate Update;
-        Check(Client->PollFeatureFlags(Update) == EPostHogResult::Ok, TEXT("polled automatic notification"));
+        FPostHogFeatureFlagsUpdate Update;
+        Check(PostHogTests::WaitForFlags(*Client, Update) == EPostHogResult::Ok, TEXT("polled automatic notification"));
         Check(Update.Snapshot.bAvailable && Update.Snapshot.Flags.Contains(TEXT("bool-value")) && !Update.Snapshot.Flags.Contains(TEXT("disabled-flag")), TEXT("notification retains SDK enabled-only shape"));
         const auto All = Client->GetFeatureFlags();
         Check(All.Status == EPostHogResult::Ok && All.Flags.Contains(TEXT("disabled-flag")) && !All.Flags[TEXT("disabled-flag")].bEnabled, TEXT("getter includes known false"));
@@ -28,7 +28,7 @@ bool FPostHogFlagsTest::RunTest(const FString&)
         Client->GetFeatureFlagResult(TEXT("disabled-flag"), EPostHogFlagReporting::Send);
         Check(Exposures == 1, TEXT("explicit reporting overrides core default"));
         Check(Client->ReloadFeatureFlags() == EPostHogResult::Ok, TEXT("fire-and-forget reload"));
-        Client->FlushAsync().Get(); Check(Client->PollFeatureFlags(Update) == EPostHogResult::Ok, TEXT("manual update notification"));
+        Check(PostHogTests::WaitForFlags(*Client, Update) == EPostHogResult::Ok, TEXT("manual update notification"));
         Check(Client->ShutdownAsync().Get().bJoined, TEXT("flag client close"));
         Check(Client->PollFeatureFlags(Update) == EPostHogResult::Closed, TEXT("close cancels unread notification"));
         return Errors;

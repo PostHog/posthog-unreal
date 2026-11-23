@@ -102,12 +102,15 @@ public:
     bool IsSessionReplayActive() const;
     /** Reserve before acquisition. Host provides already composited/downscaled
      * top-down BGRA8888; any redaction must already have been applied by the producer.
-     * The returned lease must be submitted once or abandoned; destruction abandons it. */
+     * The returned lease must be submitted once or abandoned; destruction abandons it.
+     * Throttled: within Replay.IntervalMs of the previous frame; skip it. Inactive: any other refusal. */
     EPostHogResult BeginReplayFrame(int32 Width, int32 Height, int32 RowStrideBytes, TUniquePtr<FPostHogReplayFrame>& OutFrame);
 
 private:
     friend class FPostHogModule;
     friend class FPostHogAnalyticsProvider;
+    /** Analytics default attributes: merges Fallback under Properties (Properties win on a key
+     * collision) and captures the result as ordinary event properties. */
     EPostHogResult CaptureWithFallback(const FString& Event, const FPostHogProperties& Properties,
         const FPostHogProperties& Fallback, const FPostHogProperties& Options = {});
     friend class FPostHogReplayFrame;

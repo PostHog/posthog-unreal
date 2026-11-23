@@ -16,7 +16,7 @@ Game instance / Blueprint / C++
   shared Rust storage and delivery
 ```
 
-The dependency is package `posthog` at immutable revision `b717aef23d4869bdf94e75ce36bbd383d3575c6f`, with default features disabled and `tls`/`session-replay` enabled. The Cargo import alias is `posthog_rs`. The legacy embedding model is superseded by this stateful public API.
+The dependency is package `posthog` at immutable revision `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812` (version 1.3.0), with default features disabled and `tls`/`session-replay` enabled. The Cargo import alias is `posthog_rs`. The legacy embedding model is superseded by this stateful public API.
 
 ## Responsibilities
 
@@ -26,7 +26,7 @@ The dependency is package `posthog` at immutable revision `b717aef23d4869bdf94e7
 | C ABI | Bounded JSON, owned buffers, panic containment, opaque client/frame handles, callback lifetime accounting, polled flag mailbox and tracked shutdown |
 | `FPostHogClient` | Unreal value/status conversion, complete foreign-hook adaptation, strong native-lifetime registry, tracked asynchronous waits and manual frame leases |
 | `UPostHogSubsystem` | Game-instance ownership, editor/server guards, initialization cancellation, environment/PIE inputs, sampled context, engine signals, game-thread notification delivery and instance-bound Analytics adapter/binding lifetime |
-| `FPostHogAnalyticsProvider` / `PostHogAnalytics` | Explicit world/instance resolution and world-less designation, Unreal attribute conversion/default array, host SessionStart/SessionEnd annotations and factory configuration validation |
+| `FPostHogAnalyticsProvider` / `PostHogAnalytics` | Explicit world/instance resolution and world-less designation, Unreal attribute conversion/default array and its merge under event attributes, host SessionStart/SessionEnd annotations and factory configuration validation |
 | Prepared-pixel caller | Safe acquisition, BGRA conversion/downscaling, any application-provided redaction and submission/abandonment |
 | `FPostHogReplayRecorder` | Owning-viewport paint/window association, GPU readbacks, pixel worker and engine-resource retirement |
 | `FPostHogReplayWorkState` / `FPostHogReplayWork` | Two host staging permits, exact native-lease ownership and engine-source cancellation |
@@ -61,7 +61,7 @@ The subsystem selects `Saved/PostHogStateful` and instance/environment inputs. B
 
 ## Analytics and canonical migration
 
-The Analytics provider retains only its default-attribute array and annotation admission markers. `FPostHogClient::CaptureWithFallback` is a private friend boundary that serializes per-capture `fallback_properties`; Rust fills absent keys after registered/platform/generated properties and typed-group merging, before hooks. No adapter superproperty, identity, consent, session-clock or flag cache is maintained. Explicit properties win; hooks remain authoritative. Array replacement/clear does not mutate SDK registration. Callback-capable operations retain local client/annotation-state references and do not hold adapter mutexes across native hooks.
+The Analytics provider retains only its default-attribute array and annotation admission markers. `FPostHogClient::CaptureWithFallback` is a private friend helper: it merges the defaults under the event's attributes (the event attribute wins on a key collision) and calls the ordinary `Capture`, so defaults reach Rust as event properties. Rust then fills registered/platform/generated properties only for absent keys, before hooks. A default therefore outranks a registered property with the same key; the SDK has no per-capture fallback layer. No adapter superproperty, identity, consent, session-clock or flag cache is maintained. Hooks remain authoritative. Array replacement/clear does not mutate SDK registration. Callback-capable operations retain local client/annotation-state references and do not hold adapter mutexes across native hooks.
 
 Unreal `SessionStart`/`SessionEnd` annotate SDK-created sessions. Repeated successful starts deduplicate by SDK ID; in-flight or rejected starts cannot claim admission, and end revalidates SDK identity after callbacks rather than clearing a newer session. Custom `SetSessionID` now returns false without changing SDK state. Registered properties take the canonical SDK precedence over platform context, rather than the prototype C++ context-over-registration order.
 
@@ -69,8 +69,8 @@ Failed flag handling also follows the canonical SDK, not the retired C++ cache. 
 
 ## Replay sequence
 
-1. Explicitly request recording with the SDK's manual start operation.
-2. Reserve an owned Rust acquisition immediately before capture using final dimensions/stride.
+1. Explicitly request recording with the SDK's manual start operation. A start while opted out is ignored. Remote settings load asynchronously; flush does not wait for them.
+2. Reserve an owned Rust acquisition immediately before capture using final dimensions/stride. Rust refuses a reservation sooner than `IntervalMs` (its `throttle_delay`) after the previous one with `Throttled`; other refusals, including not recording, are `Inactive`.
 3. Carry that token through host work; release it on every failure or cancellation path.
 4. Submit complete composited/downscaled BGRA8888 once. Automatic viewport content is unredacted; manual producers supply any required redaction.
 5. Rust validates attribution and consent/session transitions, encodes JPEG, runs hooks and delivers with retained attribution.
@@ -79,7 +79,7 @@ A valid outstanding acquisition may complete after manual stop. Flush excludes h
 
 The subsystem attaches the recorder to its own game instance. A transparent viewport paint observer publishes same-paint window-relative geometry before Slate queues that window's draw; an end-of-draw command expires unused metadata. Only the matching window/backbuffer dimensions can authorize a cropped GPU copy, and native admission occurs before acquisition. Embedded editor/PIE surfaces use the viewport rectangle, not the whole editor window. Unsupported transforms/layouts/formats skip capture.
 
-Two host permits cover GPU, queued and processing work. Each `TPostHogReadbackSlot` reuses its readback only for the allocated crop extent and pixel format; incompatible allocations are replaced after their previous GPU job/fence retires. Ready readbacks have padding removed on the render thread; conversion/downscaling runs on one joined worker. GPU fence waits occur during retirement, not normal capture. Engine-source revisions cancel resize/window/foreground work and do not represent SDK identity or consent. Rust stop can still permit an already acquired frame.
+The recorder polls no faster than `IntervalMs` (minimum 100 ms) and does not spend its interval on a `Throttled` reservation, so the next paint retries against Rust's clock. Two host permits cover GPU, queued and processing work. Each `TPostHogReadbackSlot` reuses its readback only for the allocated crop extent and pixel format; incompatible allocations are replaced after their previous GPU job/fence retires. Ready readbacks have padding removed on the render thread; conversion/downscaling runs on one joined worker. GPU fence waits occur during retirement, not normal capture. Engine-source revisions cancel resize/window/foreground work and do not represent SDK identity or consent. Rust stop can still permit an already acquired frame.
 
 `PostHogReplay.*` owns pixel math; the recorder does not encode JPEG or envelopes. Automatic content is unredacted. Real rendered verification is required before claiming renderer correctness.
 

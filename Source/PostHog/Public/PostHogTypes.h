@@ -13,9 +13,11 @@ enum class EPostHogFlagReporting : uint8 { Default, Send, Silent };
 UENUM(BlueprintType)
 enum class EPostHogResult : uint8
 {
-    Ok, Accepted, InvalidInput, Closed, InternalError, UnsupportedAbi, Disabled, Full,
+    Ok, Accepted, InvalidInput, Closed, InternalError, UnsupportedAbi, Disabled,
     OutputTooLarge, OptedOut, Dropped, Reentrant, Deferred, Inactive, WrongRecorder, Stale,
-    InvalidResponse, TaskUnavailable
+    InvalidResponse, TaskUnavailable,
+    /** Replay frame refused because the previous frame began less than the replay interval ago. */
+    Throttled
 };
 UENUM(BlueprintType)
 enum class EPostHogPersistenceOutcome : uint8
@@ -51,8 +53,10 @@ USTRUCT(BlueprintType)
 struct POSTHOG_API FPostHogReplaySettings
 {
     GENERATED_BODY()
-    /** Automatic owning-viewport capture cadence; Rust recording must be manually started. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay", meta = (ClampMin = "100"))
+    /** Minimum time between replay frames, enforced by Rust for automatic and manual frames
+     * (Throttled). Automatic owning-viewport capture polls no faster than 100 ms. 0 disables the
+     * Rust throttle for manual producers. Rust recording must be manually started. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay", meta = (ClampMin = "0"))
     int32 IntervalMs = 1000;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay", meta = (ClampMin = "64"))
     int32 MaxDimension = 960;

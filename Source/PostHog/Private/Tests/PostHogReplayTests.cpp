@@ -14,6 +14,7 @@ bool FPostHogReplayTest::RunTest(const FString&)
         auto Config = PostHogTests::Config(TEXT("adapter-replay")); Config.Replay.MaxFramesInFlight = 1;
         auto Client = FPostHogClient::CreateAsync(Config).Get(); if (!Client) { Errors.Add(TEXT("replay client creation")); return Errors; }
         Client->FlushAsync().Get(); Check(!Client->IsSessionReplayActive(), TEXT("no recording before manual start")); Client->StartSessionReplay();
+        Check(PostHogTests::WaitForReplay(*Client), TEXT("remote replay settings permit recording"));
         TUniquePtr<FPostHogReplayFrame> Frame, Other;
         Check(Client->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("acquire core reservation"));
         if (Frame)
@@ -32,6 +33,15 @@ bool FPostHogReplayTest::RunTest(const FString&)
         Client->SetAppInBackground(false); Check(Client->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("foreground acquisition"));
         Check(Client->ShutdownAsync().Get().bJoined, TEXT("close with held frame"));
         Frame.Reset(); // The core already invalidated its token; no dangling pixel pointer exists.
+
+        auto Throttled = PostHogTests::Config(TEXT("adapter-replay-throttle")); Throttled.Replay.IntervalMs = 60000;
+        auto Paced = FPostHogClient::CreateAsync(Throttled).Get(); if (!Paced) { Errors.Add(TEXT("throttled client creation")); return Errors; }
+        Paced->FlushAsync().Get(); Paced->StartSessionReplay();
+        Check(PostHogTests::WaitForReplay(*Paced), TEXT("throttled client records"));
+        Check(Paced->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("first frame within the interval"));
+        Frame.Reset();
+        Check(Paced->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Throttled && !Frame, TEXT("replay interval throttles the next frame"));
+        Check(Paced->ShutdownAsync().Get().bJoined, TEXT("close throttled client"));
         return Errors;
     });
 }
@@ -117,6 +127,7 @@ bool FPostHogStagingTest::RunTest(const FString&)
         auto CopyFirst = [&](TUniquePtr<FPostHogReplayWork> Work) { ++Copies; First = MoveTemp(Work); };
         Check(!State->BeginCopy(*Client, 32, 24, CopyFirst) && Copies == 0 && State->Pending() == 0, TEXT("no acquisition before native recording admission"));
         Client->StartSessionReplay();
+        Check(PostHogTests::WaitForReplay(*Client), TEXT("remote replay settings permit staging"));
         Check(State->BeginCopy(*Client, 32, 24, CopyFirst) && Copies == 1 && State->Pending() == 1, TEXT("native reservation precedes acquisition callback"));
         Check(State->BeginCopy(*Client, 32, 24, [&](TUniquePtr<FPostHogReplayWork> Work) { ++Copies; Second = MoveTemp(Work); }), TEXT("second host slot"));
         Check(!State->BeginCopy(*Client, 32, 24, CopyFirst) && Copies == 2, TEXT("host backlog bounded independently of native capacity"));

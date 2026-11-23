@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use posthog_rs::stateful::{
-    self, CaptureOutcome, DeliveryOutcome, DrainReport, PersistenceOutcome, SubmitOutcome,
+    self, CaptureOutcome, DeliveryOutcome, DrainReport, FrameUnavailable, PersistenceOutcome,
+    SubmitOutcome,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,6 +46,7 @@ struct Options {
     shutdown_timeout_ms: u64,
     jpeg_quality: u8,
     max_frames_in_flight: usize,
+    throttle_delay_ms: u64,
 }
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +86,7 @@ impl Default for Options {
             shutdown_timeout_ms: 3000,
             jpeg_quality: 65,
             max_frames_in_flight: 2,
+            throttle_delay_ms: 1000,
         }
     }
 }
@@ -120,10 +123,11 @@ impl Options {
         config.flush_interval = Duration::from_millis(self.flush_interval_ms);
         config.max_queue_size = self.max_queue_size;
         config.max_batch_size = self.max_batch_size;
-        config.request_timeout_seconds = self.request_timeout_seconds;
+        config.request_timeout = Duration::from_secs(self.request_timeout_seconds);
         config.shutdown_timeout = Duration::from_millis(self.shutdown_timeout_ms);
         config.session_replay.jpeg_quality = self.jpeg_quality;
         config.session_replay.max_frames_in_flight = self.max_frames_in_flight;
+        config.session_replay.throttle_delay = Duration::from_millis(self.throttle_delay_ms);
         config.sdk_name = "posthog-unreal".into();
         config.sdk_version = env!("CARGO_PKG_VERSION").into();
         config
@@ -214,8 +218,6 @@ pub unsafe extern "C" fn phu_create(
 struct Capture {
     event: String,
     #[serde(default)]
-    fallback_properties: HashMap<String, Value>,
-    #[serde(default)]
     properties: HashMap<String, Value>,
     #[serde(default)]
     options: HashMap<String, Value>,
@@ -239,7 +241,6 @@ fn captured(result: CaptureOutcome, out: *mut Buffer) -> Result<Status> {
         Invalid => Status::InvalidInput,
         Dropped => Status::Dropped,
         Reentrant => Status::Reentrant,
-        Full => Status::Full,
         _ => Status::InternalError,
     })
 }
@@ -255,7 +256,6 @@ pub unsafe extern "C" fn phu_capture(handle: u64, input: Bytes, out: *mut Buffer
         let input: Capture = unsafe { parse(input)? };
         let mut capture = stateful::Capture::new(input.event);
         capture.properties = input.properties;
-        capture.fallback_properties = input.fallback_properties;
         capture.options = input.options;
         capture.groups = input.groups;
         capture.timestamp = input.timestamp;
@@ -280,7 +280,9 @@ pub unsafe extern "C" fn phu_screen(handle: u64, input: Bytes, out: *mut Buffer)
         }
         let call = handles::acquire(handle)?;
         let input: Screen = unsafe { parse(input)? };
-        captured(call.0.client.screen(input.name, input.properties), out)
+        let mut screen = stateful::Screen::new(input.name);
+        screen.properties = input.properties;
+        captured(call.0.client.screen(screen), out)
     })
 }
 
@@ -375,17 +377,29 @@ pub unsafe extern "C" fn phu_command(handle: u64, input: Bytes) -> Status {
             Alias { alias } => client.alias(alias),
             Register { properties } => client.register(properties),
             Unregister { key } => client.unregister(&key),
-            SetPersonProperties { set, set_once } => client.set_person_properties(set, set_once),
+            SetPersonProperties { set, set_once } => {
+                let mut person = stateful::PersonProperties::from(set);
+                person.set_once = set_once;
+                client.set_person_properties(person)
+            }
             Group {
                 group_type,
                 group_key,
                 properties,
-            } => client.group(group_type, group_key, properties),
+            } => {
+                let mut group = stateful::Group::new(group_type, group_key);
+                group.properties = properties.unwrap_or_default();
+                client.group(group)
+            }
             GroupIdentify {
                 group_type,
                 group_key,
                 properties,
-            } => client.group_identify(group_type, group_key, properties),
+            } => {
+                let mut group = stateful::Group::new(group_type, group_key);
+                group.properties = properties;
+                client.group_identify(group)
+            }
             RemoveGroup { group_type } => client.remove_group(&group_type),
             OptIn {} => client.opt_in(),
             OptOut {} => client.opt_out(),
@@ -442,10 +456,10 @@ pub unsafe extern "C" fn phu_read(handle: u64, input: Bytes, out: *mut Buffer) -
         let client = &call.0.client;
         let value = match query {
             Read::State {} => {
-                json!({"disabled":client.is_disabled(),"identified":client.is_identified(),
+                json!({"disabled":client.is_disabled(),
                 "opt_out":client.is_opt_out(),"anonymous_id":client.get_anonymous_id(),"distinct_id":client.get_distinct_id()})
             }
-            Read::SessionId {} => json!(client.session_id()),
+            Read::SessionId {} => json!(client.get_session_id()),
             Read::PeekSessionId {} => json!(client.peek_session_id()),
             Read::FeatureFlag { key, send_event } => {
                 let lookup = client.feature_flag(&key);
@@ -587,24 +601,31 @@ pub unsafe extern "C" fn phu_begin_frame(handle: u64, layout: Bytes, out: *mut u
         }
         let call = handles::acquire(handle)?;
         let layout: Layout = unsafe { parse(layout)? };
-        let layout = stateful::FrameLayout {
-            width: layout.width,
-            height: layout.height,
-            row_stride_bytes: layout.row_stride_bytes,
-            format: stateful::PixelFormat::Bgra8888,
-        };
+        let layout = stateful::FrameLayout::new(
+            layout.width,
+            layout.height,
+            layout.row_stride_bytes,
+            stateful::PixelFormat::Bgra8888,
+        );
         let frame = call
             .0
             .client
             .session_replay()
             .begin_frame(layout)
-            .ok_or(Status::Inactive)?;
+            .map_err(unavailable)?;
         let id = call.0.insert_frame(handle, frame)?;
         unsafe {
             *out = id;
         }
         Ok(Status::Ok)
     })
+}
+fn unavailable(reason: FrameUnavailable) -> Status {
+    // Throttled is the only refusal a host retries on its next render frame.
+    match reason {
+        FrameUnavailable::Throttled => Status::Throttled,
+        _ => Status::Inactive,
+    }
 }
 /// # Safety
 /// Pixels readable for their exact acquired length; token is consumed on every submission attempt.

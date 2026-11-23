@@ -10,9 +10,10 @@ class FPostHogReplayWorkState final : public TSharedFromThis<FPostHogReplayWorkS
 {
 public:
     static constexpr int32 Capacity = 2;
-    TUniquePtr<FPostHogReplayWork> Begin(FPostHogClient& Client, int32 Width, int32 Height);
+    /** OutResult, when supplied, receives the native acquisition result or Inactive for a host refusal. */
+    TUniquePtr<FPostHogReplayWork> Begin(FPostHogClient& Client, int32 Width, int32 Height, EPostHogResult* OutResult = nullptr);
     bool BeginCopy(FPostHogClient& Client, int32 Width, int32 Height,
-        TFunctionRef<void(TUniquePtr<FPostHogReplayWork>)> Copy);
+        TFunctionRef<void(TUniquePtr<FPostHogReplayWork>)> Copy, EPostHogResult* OutResult = nullptr);
     void Cancel();
     void Stop();
     int32 Pending() const { return Count.load(); }

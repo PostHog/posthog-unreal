@@ -233,6 +233,8 @@ TSharedFuture<FPostHogClient::FPtr> FPostHogClient::CreateAsync(FPostHogConfig C
         Options->SetNumberField(TEXT("shutdown_timeout_ms"), Config.ShutdownTimeoutMilliseconds);
         Options->SetNumberField(TEXT("jpeg_quality"), Config.Replay.JpegQuality);
         Options->SetNumberField(TEXT("max_frames_in_flight"), Config.Replay.MaxFramesInFlight);
+        // The replay interval is Rust's minimum time between frames for every producer of this client.
+        Options->SetNumberField(TEXT("throttle_delay_ms"), FMath::Max(0, Config.Replay.IntervalMs));
         const FString Json = PostHogJson::Encode(Options);
         if (!PostHogJson::IsBounded(Json)) { return nullptr; }
         const FTCHARToUTF8 Utf8(*Json);
@@ -261,19 +263,25 @@ FString FPostHogClient::GetAnonymousId() const
 { const auto State = Impl->State(); FString Id; if (State) { State->TryGetStringField(TEXT("anonymous_id"), Id); } return Id; }
 
 EPostHogResult FPostHogClient::Capture(const FString& Name, const FPostHogProperties& Properties, const FPostHogProperties& Options)
-{ return CaptureWithFallback(Name, Properties, {}, Options); }
-EPostHogResult FPostHogClient::CaptureWithFallback(const FString& Name, const FPostHogProperties& Properties,
-    const FPostHogProperties& Fallback, const FPostHogProperties& Options)
 {
-    if (!Properties.IsValid() || !Options.IsValid() || !Fallback.IsValid()) { return EPostHogResult::InvalidInput; }
+    if (!Properties.IsValid() || !Options.IsValid()) { return EPostHogResult::InvalidInput; }
     auto Input = MakeShared<FJsonObject>(); Input->SetStringField(TEXT("event"), Name);
     Input->SetObjectField(TEXT("properties"), Properties.ToNative()); Input->SetObjectField(TEXT("options"), Options.ToNative());
-    Input->SetObjectField(TEXT("fallback_properties"), Fallback.ToNative());
     const FString Json = PostHogJson::Encode(Input);
     if (!PostHogJson::IsBounded(Json)) { return EPostHogResult::InvalidInput; }
     FImpl::FCall Call(Impl); if (!Call.Handle) { return EPostHogResult::Closed; }
     const FTCHARToUTF8 Utf8(*Json); PostHogNative::FBuffer Receipt;
     return PostHogNative::Result(phu_capture(Call.Handle, PostHogNative::View(Utf8), &Receipt.Value));
+}
+EPostHogResult FPostHogClient::CaptureWithFallback(const FString& Name, const FPostHogProperties& Properties,
+    const FPostHogProperties& Fallback, const FPostHogProperties& Options)
+{
+    if (!Properties.IsValid() || !Fallback.IsValid()) { return EPostHogResult::InvalidInput; }
+    // Per-event properties win over fallbacks; the merged keys are ordinary event properties,
+    // so Rust registered/platform/SDK properties fill only keys neither layer sets.
+    const auto Merged = Fallback.ToNative(); const auto Event = Properties.ToNative();
+    for (const auto& Pair : Event->Values) { Merged->SetField(Pair.Key, Pair.Value); }
+    return Capture(Name, FPostHogProperties::FromNative(Merged, PHU_MAX_INPUT), Options);
 }
 EPostHogResult FPostHogClient::Screen(const FString& Name, const FPostHogProperties& Properties)
 {

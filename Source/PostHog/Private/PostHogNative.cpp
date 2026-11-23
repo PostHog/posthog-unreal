@@ -27,7 +27,6 @@ EPostHogResult PostHogNative::Result(phu_status Status)
     case PHU_CLOSED: return EPostHogResult::Closed;
     case PHU_UNSUPPORTED_ABI: return EPostHogResult::UnsupportedAbi;
     case PHU_DISABLED: return EPostHogResult::Disabled;
-    case PHU_FULL: return EPostHogResult::Full;
     case PHU_OUTPUT_TOO_LARGE: return EPostHogResult::OutputTooLarge;
     case PHU_OPTED_OUT: return EPostHogResult::OptedOut;
     case PHU_DROPPED: return EPostHogResult::Dropped;
@@ -36,6 +35,7 @@ EPostHogResult PostHogNative::Result(phu_status Status)
     case PHU_INACTIVE: return EPostHogResult::Inactive;
     case PHU_WRONG_RECORDER: return EPostHogResult::WrongRecorder;
     case PHU_STALE: return EPostHogResult::Stale;
+    case PHU_THROTTLED: return EPostHogResult::Throttled;
     default: return EPostHogResult::InternalError;
     }
 }

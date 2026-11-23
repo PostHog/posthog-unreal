@@ -19,7 +19,6 @@ pub enum Status {
     InternalError = 5,
     UnsupportedAbi = 6,
     Disabled = 7,
-    Full = 8,
     OutputTooLarge = 9,
     OptedOut = 10,
     Dropped = 11,
@@ -28,6 +27,7 @@ pub enum Status {
     Inactive = 14,
     WrongRecorder = 15,
     Stale = 16,
+    Throttled = 17,
 }
 pub type Result<T> = std::result::Result<T, Status>;
 

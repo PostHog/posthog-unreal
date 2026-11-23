@@ -63,8 +63,17 @@ public:
             Drain = Client->FlushAsync(); ++Phase; return false;
         case 2:
             if (!Drain.IsReady()) { return false; }
-            Test->TestEqual(TEXT("manual replay request remains available"), Client->StartSessionReplay(), EPostHogResult::Ok);
-            if (Case != ELifecycleCase::InitialBackground && Case != ELifecycleCase::OptedOut) { FrameAllowed(true); }
+            if (!bReplayRequested)
+            {
+                Test->TestEqual(TEXT("manual replay request remains available"), Client->StartSessionReplay(), EPostHogResult::Ok);
+                bReplayRequested = true;
+            }
+            if (Case != ELifecycleCase::InitialBackground && Case != ELifecycleCase::OptedOut)
+            {
+                // Remote replay settings load asynchronously; flush does not wait for them.
+                if (!Client->IsSessionReplayActive()) { return false; }
+                FrameAllowed(true);
+            }
             Signal(Case != ELifecycleCase::InitialBackground); ++Phase; return false;
         case 3:
             Expect(Startup()); // Duplicate activation, or duplicate initial background.
@@ -111,7 +120,7 @@ public:
             Test->TestTrue(TEXT("lifecycle close joins native/host work"), Joined.Get().bJoined);
             Test->TestEqual(TEXT("closed client denies new work"), Client->Capture(TEXT("lifecycle_after_close")), EPostHogResult::Closed);
             Destroy(); CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
-            Client.Reset(); Probe.Reset(); Seen.Empty(); Session.Empty(); bStoppedInHook = false;
+            Client.Reset(); Probe.Reset(); Seen.Empty(); Session.Empty(); bStoppedInHook = false; bReplayRequested = false;
             HookClose = {}; Joined = {}; Drain = {}; Phase = 0;
             Case = static_cast<ELifecycleCase>(static_cast<uint8>(Case) + 1);
             return Case == ELifecycleCase::Count;
@@ -133,6 +142,7 @@ private:
             FPostHogOptions Options; Options.ProjectToken = TEXT("phc_MOCK"); Options.Host = Host;
             Options.ClientName = FGuid::NewGuid().ToString(); Options.bEnableInEditor = true;
             Options.bCaptureApplicationLifecycleEvents = false; Options.AppBuild = TEXT("lifecycle-disabled");
+            Options.Replay.IntervalMs = 0; // Frame admission checks run back to back.
             struct { FPostHogOptions Options; bool ReturnValue; } Params{Options, false};
             Owner->ProcessEvent(Owner->FindFunctionChecked(TEXT("Setup")), &Params);
             Test->TestTrue(TEXT("reflected lifecycle-disabled setup"), Params.ReturnValue);
@@ -143,6 +153,7 @@ private:
             Config.ClientName = FGuid::NewGuid().ToString();
             Config.StorageRoot = FPaths::ProjectSavedDir() / TEXT("PostHogLifecycleTests") / Config.ClientName;
             Config.bInitiallyOptedOut = Case == ELifecycleCase::OptedOut;
+            Config.Replay.IntervalMs = 0; // Frame admission checks run back to back.
             Config.Context.SetString(TEXT("lifecycle_test_case"), FString::FromInt(static_cast<int32>(Case)));
             Config.Context.SetString(TEXT("$app_version"), TEXT("lifecycle-test-version"));
             Config.BeforeSend = [this](FJsonObject& Event) { return Observe(Event); };
@@ -237,7 +248,7 @@ private:
     int32 Phase = 0, LastProgress = -1;
     uint64 WaitFrame = 0;
     double Deadline;
-    bool PreviousAuto = false, bStoppedInHook = false;
+    bool PreviousAuto = false, bStoppedInHook = false, bReplayRequested = false;
     std::atomic<bool> bWrongThread{false};
     TStrongObjectPtr<UGameInstance> Instance;
     TStrongObjectPtr<UPostHogBlueprintProbe> Probe;

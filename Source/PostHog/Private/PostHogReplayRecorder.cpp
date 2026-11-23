@@ -146,11 +146,12 @@ struct FPostHogReplayRecorder::FImpl final : FRunnable
         { State->Cancel(); Previous = Source; PreviousFormat = Desc.Format; }
         const double Now = FPlatformTime::Seconds();
         if (Now - LastCapture < Interval) { return; }
-        LastCapture = Now;
+        const double PreviousCapture = LastCapture; LastCapture = Now;
         FSlot* Free = nullptr;
         for (auto& Slot : Slots) { if (!Slot.Job) { Free = &Slot; break; } }
         if (!Free) { return; }
         const FIntPoint Target = PostHogReplay::ScaledSize(Source.Rect.Width(), Source.Rect.Height(), MaxDimension);
+        EPostHogResult Admission = EPostHogResult::Inactive;
         State->BeginCopy(*Client, Target.X, Target.Y, [&](TUniquePtr<FPostHogReplayWork> Work)
         {
             auto Job = MakeUnique<FJob>(); Job->Work = MoveTemp(Work); Job->Size = Source.Rect.Size(); Job->Format = Desc.Format;
@@ -161,7 +162,9 @@ struct FPostHogReplayRecorder::FImpl final : FRunnable
             Free->Readback->EnqueueCopy(Cmd, Texture, FResolveRect(Source.Rect.Min.X, Source.Rect.Min.Y, Source.Rect.Max.X, Source.Rect.Max.Y));
             Cmd.Transition(FRHITransitionInfo(Texture, ERHIAccess::CopySrc, ERHIAccess::Present));
             Free->Job = MoveTemp(Job);
-        });
+        }, &Admission);
+        // Rust applies the same interval from its own clock; retry on the next paint instead of skipping an interval.
+        if (Admission == EPostHogResult::Throttled) { LastCapture = PreviousCapture; }
     }
     void Painted(const FGeometry& Geometry, const FSlateRect& Culling, SWindow* Window)
     {
