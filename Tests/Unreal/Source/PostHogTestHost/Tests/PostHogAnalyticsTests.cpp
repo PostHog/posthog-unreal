@@ -354,6 +354,9 @@ bool FPostHogAnalyticsTest::RunTest(const FString& Parameters)
 {
     AddExpectedError(TEXT("Ignoring an invalid Analytics JSON attribute"), EAutomationExpectedErrorFlags::Contains, 1);
     AddExpectedError(TEXT("Configure PostHog credentials and client options on the subsystem"), EAutomationExpectedErrorFlags::Contains, 1);
+    // The scenario deliberately misuses identity; posthog-rs warns through LogPostHog.
+    AddExpectedMessagePlain(TEXT("identity update requires a nonblank distinct ID"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
+    AddExpectedMessagePlain(TEXT("reset before identifying a different user"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 2);
     FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FAnalyticsScenario>(this));
     return true;
 }

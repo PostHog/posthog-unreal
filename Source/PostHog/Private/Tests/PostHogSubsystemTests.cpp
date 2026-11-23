@@ -212,5 +212,9 @@ private:
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogSubsystemTest, "PostHog.Subsystem", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FPostHogSubsystemTest::RunTest(const FString&)
-{ FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FSubsystemScenario>(this)); return true; }
+{
+    // The disabled-owner case uses a personal API key; posthog-rs reports why through LogPostHog.
+    AddExpectedMessagePlain(TEXT("project_token is a personal API key"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
+    FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FSubsystemScenario>(this)); return true;
+}
 #endif
