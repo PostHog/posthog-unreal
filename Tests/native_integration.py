@@ -484,7 +484,9 @@ class StatefulNativeTests(MockServerTestCase):
             results.append(self.close(handle)[0])
             return event
         handle = self.create(hook=self.hook(transform))
-        self.assertEqual(self.capture(handle), (CLOSED, None))
+        # The in-hook close starts core shutdown on its own thread, so the outer capture
+        # may finish before or after shutdown begins. Either outcome is valid.
+        self.assertIn(self.capture(handle)[0], (CLOSED, ACCEPTED))
         self.assertEqual(results, [REENTRANT, DEFERRED])
         self.assertEqual(self.close(handle)[0], OK)
 
