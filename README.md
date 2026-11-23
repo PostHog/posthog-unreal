@@ -4,7 +4,7 @@ PostHog analytics, feature flags and viewport/manual screenshot replay for Unrea
 
 The plugin is a thin engine adapter over the pinned stateful Rust SDK. Rust owns identity, properties, consent, sessions, feature flags, remote configuration, persistence and delivery. Unreal owns engine signals, value conversion, game-instance lifetime and game-thread delegates.
 
-See [implementation status](docs/implementation-status.md), [architecture](docs/integration-plan.md) and [validation](docs/ci.md).
+See [status](#status), [architecture](docs/integration-plan.md) and [validation](docs/ci.md).
 
 ## Build
 
@@ -82,7 +82,7 @@ Reporting can use the configured **Default**, explicit **Send**, or **Silent**. 
 
 ## Hooks, flush and shutdown
 
-`FPostHogConfig::BeforeSend` receives the complete assembled `FJsonObject`, including options, groups, timestamp and UUID. Return false to drop; preserve every field you do not modify. Analytics hooks run on the capturing thread, while screenshot hooks run on Rust's encoder worker. Hooks must be thread-safe and non-throwing; do not access UObjects off the game thread. Same-client recursive capture is rejected. Use weak references for client back-references, and never wait for another capture from a hook.
+`FPostHogConfig::BeforeSend` receives the complete assembled `FJsonObject`, including options, groups, timestamp and UUID. Return false to drop; preserve every field you do not modify. Analytics hooks run on the capturing thread, while screenshot hooks run on Rust's encoder worker. Hooks must be thread-safe and non-throwing; do not access UObjects off the game thread. Same-client recursive capture is rejected. Use weak references for client back-references, and never wait for another capture from a hook. Close waits for a running hook, and module shutdown closes clients on the game thread, so a hook must never block on the game thread or on any thread that may shut the client down. Read only thread-safe state from a hook.
 
 `FlushAsync` reports independent state-persistence and delivery progress. A completed attempt can leave retries pending. It includes earlier submitted replay encoding and eligible delivery, not host-held acquisitions or guaranteed ingestion.
 
@@ -100,7 +100,7 @@ For manual producers, immediately before acquiring pixels, call **Begin Replay F
 
 Manual pixels must already be composited and downscaled; apply any required redaction before submission. Alpha is ignored. Rust pins attribution at acquisition, validates completion, encodes JPEG, runs hooks and delivers to `/s/`. Capacity includes acquisition through retries, so skip a frame when acquisition is inactive. Replay is memory-only and can be lost on process exit or shutdown.
 
-The automatic path uses two bounded host staging permits independently of Rust capacity. It converts/downscales off the render thread; Rust owns encoding. Window/viewport/size and foreground transitions cancel obsolete host work. See [implementation status](docs/implementation-status.md) for matching-consumer and rendered validation results and remaining platform limits.
+The automatic path uses two bounded host staging permits independently of Rust capacity. It converts/downscales off the render thread; Rust owns encoding. Window/viewport/size and foreground transitions cancel obsolete host work. See [CI evidence](docs/ci.md#evidence) for matching-consumer and rendered validation results, and [status](#status) for remaining platform limits.
 
 ## Tests
 
@@ -116,7 +116,21 @@ python3 Tests/native_integration.py \
 
 After installing matching ABI-v3 artifacts and building the host, add `--editor "$UE_ROOT/Engine/Binaries/Mac/UnrealEditor-Cmd"` for C++/Blueprint automation.
 
-On UE 5.8 / macOS arm64 / Metal, the current Rust pin passes 8 bridge tests, 28 tooling tests, all 21 native driver tests including the 13 engine automation tests, Metal replay in Development Editor and locally ad-hoc-signed packaged Development/Shipping, and all five gameplay scenarios of the retained example. See [implementation status](docs/implementation-status.md) for known failures and remaining validation, and [CI documentation](docs/ci.md) for fixture commands and local signing steps.
+On UE 5.8 / macOS arm64 / Metal, the current Rust pin passes 8 bridge tests, 28 tooling tests, all 21 native driver tests including the 13 engine automation tests, Metal replay in Development Editor and locally ad-hoc-signed packaged Development/Shipping, and all five gameplay scenarios of the retained example. See [status](#status) for remaining validation, and [CI documentation](docs/ci.md) for fixture commands, local signing steps and the known hook-close timing issue.
+
+## Status
+
+The plugin is in development and is not production-ready. Source targets UE 5.8 on macOS arm64, Windows x64 and Linux x64; configured targets are not a declaration of completed platform validation. Results at the current pin are in [CI documentation](docs/ci.md#evidence).
+
+Remaining milestones:
+
+1. Stress embedded/multiple-PIE surface isolation, foreground/window/screen transitions, resize races and GPU/worker teardown.
+2. Validate actual HDR/backend formats, resource bounds and sustained renderer operation beyond the current Metal fixture.
+3. Validate Windows/Linux engine and packaged runtime, protected native/engine CI, Blueprint-only packaged consumers and the wider desktop configuration matrix.
+4. Validate storage failures, offline/retry/resource behavior and realistic capture/frame-time/shutdown budgets across the supported matrix.
+5. Complete release/platform review and artifact/license/toolchain evidence across the intended release matrix.
+
+Full Blueprint convenience/async coverage remains separate development work. No release readiness is implied by source completion or tooling-only CI.
 
 ## Contributing
 

@@ -277,7 +277,11 @@ class BuildToolingTests(unittest.TestCase):
         restore = load_script("restore-ci-archive")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.zip"
-            for name in ("../escape", "/absolute", "C:/drive", "folder\\escape"):
+            names = ["../escape", "/absolute", "C:/drive"]
+            if os.sep == "/":
+                # zipfile rewrites os.sep to "/" on Windows, so a backslash name exists only in archives made elsewhere.
+                names.append("folder\\escape")
+            for name in names:
                 with zipfile.ZipFile(path, "w") as archive:
                     archive.writestr(name, "data")
                 with self.assertRaises(ValueError):

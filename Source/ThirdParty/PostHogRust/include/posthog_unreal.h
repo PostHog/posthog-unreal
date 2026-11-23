@@ -45,7 +45,9 @@ void phu_buffer_free(phu_buffer buffer);
  * Callback and user_data must be thread-safe and remain valid through completed close.
  * Analytics runs on the capturing thread; replay runs on the encoder worker. No UI
  * thread dispatch is provided. Same-client recursive capture returns REENTRANT.
- * Do not wait for another capture from a hook. Catch foreign exceptions in the host
+ * Do not wait for another capture from a hook. Close waits for a running hook, so never
+ * block a hook on a thread that may close this client or wait for its close.
+ * Catch foreign exceptions in the host
  * and return a drop status. Rust panic containment cannot catch a foreign exception.
  */
 typedef phu_status (*phu_before_send)(void* user_data, phu_bytes event, phu_buffer* out_event);

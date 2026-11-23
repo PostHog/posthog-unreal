@@ -1,5 +1,6 @@
 """Build the example first, then exercise its public launch script and the SDK mock backend."""
 import argparse
+from datetime import datetime
 import json
 import os
 import shutil
@@ -77,6 +78,11 @@ def run_scenario(args, name, hard, delay, enabled):
                 assert len({e["properties"]["$session_id"] for e in starts + ends}) == 1, "Session changed on restart"
                 assert starts[0]["properties"]["difficulty"] == ("hard" if hard and delay == 0 else "normal")
                 assert starts[1]["properties"]["difficulty"] == ("hard" if hard and delay < REQUEST_TIMEOUT_SECONDS else "normal")
+                if hard and delay >= REQUEST_TIMEOUT_SECONDS:
+                    # The mock records a /flags call after its delay, when the late response is sent. The second run
+                    # must snapshot flags after that, or "normal" would not show that the SDK abandoned the response.
+                    answered = datetime.fromisoformat(request(host, "/__captured/all")["flags_calls"][0]["ts"])
+                    assert datetime.fromisoformat(starts[1]["timestamp"]) > answered, (answered, starts[1]["timestamp"])
                 assert all(e["properties"]["duration_seconds"] > 0 and e["properties"]["reason"] == "collision" for e in ends)
                 assert any(e["properties"]["distance_meters"] > 700 for e in ends)
             else:

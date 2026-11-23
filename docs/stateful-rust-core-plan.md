@@ -1,6 +1,6 @@
 # Stateful Rust core and thin Unreal adapter
 
-The stateful Rust SDK is pinned at `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`. Unreal integrates its public API through ABI v3. The current responsibility map and integration sequence are in [integration-plan.md](integration-plan.md); validation gates are tracked in [implementation-status.md](implementation-status.md).
+The stateful Rust SDK is pinned at `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`. Unreal integrates its public API through ABI v3. The current responsibility map and integration sequence are in [integration-plan.md](integration-plan.md); validation results are in [ci.md](ci.md#evidence) and remaining milestones in the [README status](../README.md#status).
 
 ## Contract
 
@@ -27,7 +27,7 @@ Automatic viewport pixels are unredacted, including readable UI. Applications mu
 
 ## Lifetime and shutdown
 
-Creation and blocking waits run on tracked host workers. C++ keeps callback contexts strongly owned through completed native shutdown and all admitted host calls. Callback-origin shutdown cannot wait for itself; `Deferred` requires an outside finisher. Native and host threads must join before code unload. Thread-creation failure must retain ownership rather than abandon executable work.
+Creation and blocking waits run on tracked host workers. C++ keeps callback contexts strongly owned through completed native shutdown and all admitted host calls. Callback-origin shutdown cannot wait for itself; `Deferred` requires an outside finisher. Host threads and SDK callbacks must finish before code unload; only in-flight network requests may still be finishing, and they touch no host memory. Thread-creation failure must retain ownership rather than abandon executable work.
 
 Initialization cancellation and game-instance replacement serialize namespace reuse. Late UObject delivery is cancelled using owner lifetime, not independently reimplemented SDK targeting/consent generations.
 

@@ -91,4 +91,4 @@ The recorder polls no faster than `IntervalMs` (minimum 100 ms) and does not spe
 4. Automatic owning-viewport acquisition with real rendered source/orientation/resize/retirement evidence.
 5. Supported desktop runtime and packaged Development/Shipping validation, performance budgets and independent review.
 
-Native synthetic images prove encoding and wire behavior, not renderer safety, mask discovery, live ingestion or backend playback. See [implementation status](implementation-status.md) and [CI](ci.md).
+Native synthetic images prove encoding and wire behavior, not renderer safety, mask discovery, live ingestion or backend playback. See the [README status](../README.md#status) and [CI evidence](ci.md#evidence).

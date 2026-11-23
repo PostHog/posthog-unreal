@@ -129,6 +129,12 @@ bool FPostHogClientTest::RunTest(const FString&)
         Check(Client->ShutdownAsync().Get().bJoined, TEXT("external close joins after hook"));
         Check(Client->ShutdownAsync().Get().bJoined && Client->Capture(TEXT("after-close")) == EPostHogResult::Closed, TEXT("completed close remains completed"));
         Client.Reset();
+        // Out-of-range settings are clamped; without the clamp, -1 fails the SDK's unsigned decoding and creation returns null.
+        auto Clamped = PostHogTests::Config(TEXT("clamped-options"));
+        Clamped.FlushAt = -1; Clamped.RequestTimeoutSeconds = -1; Clamped.Replay.JpegQuality = 300;
+        auto ClampedClient = FPostHogClient::CreateAsync(MoveTemp(Clamped)).Get();
+        Check(ClampedClient.IsValid(), TEXT("out-of-range settings are clamped, not rejected"));
+        if (ClampedClient) { Check(ClampedClient->ShutdownAsync().Get().bJoined, TEXT("clamped client closes")); }
         return Errors;
     });
 }

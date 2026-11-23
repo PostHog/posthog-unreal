@@ -37,6 +37,8 @@ struct POSTHOG_API FPostHogConfig
      * Analytics runs inline on the capturing thread; replay runs on the Rust encoder.
      * Return false to drop. Must be thread-safe/non-throwing, with no off-thread UObject
      * access. Same-client recursive capture is rejected. Never wait for another capture.
+     * Close waits for a running hook, and module shutdown closes on the game thread: never
+     * block a hook on the game thread or on a thread that may shut this client down.
      * Capture back-references weakly. Callback-origin flush/close report Deferred. */
     TFunction<bool(FJsonObject&)> BeforeSend;
 };
@@ -73,7 +75,8 @@ public:
     EPostHogResult OptOut();
     EPostHogResult OptIn();
     TSharedFuture<FPostHogDrainResult> FlushAsync();
-    /** One shutdown operation: stops admission immediately and joins native/attached host work.
+    /** One shutdown operation: stops admission immediately, then waits for native shutdown, running SDK callbacks
+     * and attached host work; in-flight network requests may finish in the background.
      * Native hooks and attached render-thread callers report Deferred; never block that thread on retirement. */
     TSharedFuture<FPostHogDrainResult> ShutdownAsync();
 

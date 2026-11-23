@@ -21,6 +21,10 @@ bool FPostHogNativeTest::RunTest(const FString&)
         Check(phu_capture(Handle, PostHogNative::View(Event), &Receipt.Value) == PHU_ACCEPTED && Receipt.Read().IsValid(), TEXT("stateful input and owned receipt"));
         PostHogNative::FBuffer Drain;
         Check(phu_flush(Handle, &Drain.Value) == PHU_OK && PostHogNative::Drain(PHU_OK, Drain).Delivery == EPostHogDeliveryOutcome::Attempted, TEXT("drain report shape"));
+        const FTCHARToUTF8 TimedOutText(TEXT("{\"state\":\"memory_only\",\"delivery\":\"timed_out\"}"));
+        PostHogNative::FBuffer TimedOutReport;
+        Check(phu_buffer_copy(PostHogNative::View(TimedOutText), &TimedOutReport.Value) == PHU_OK &&
+              PostHogNative::Drain(PHU_OK, TimedOutReport).Delivery == EPostHogDeliveryOutcome::TimedOut, TEXT("timed_out delivery maps to TimedOut"));
         PostHogNative::FBuffer Closed;
         Check(phu_close(Handle, &Closed.Value) == PHU_OK, TEXT("native close"));
         PostHogNative::FBuffer Repeated;

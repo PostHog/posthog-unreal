@@ -82,7 +82,7 @@ def validate(sources):
 
 class ArchitectureTests(unittest.TestCase):
     def test_production_graph_and_classification(self):
-        sources = {str(path.relative_to(ROOT)): path.read_text() for path in ROOT.rglob("*")
+        sources = {path.relative_to(ROOT).as_posix(): path.read_text() for path in ROOT.rglob("*")
                    if path.suffix in (".h", ".cpp") and "Tests" not in path.relative_to(ROOT).parts
                    and path.relative_to(ROOT).parts[0] in {"PostHog", "PostHogAnalytics"}}
         self.assertEqual(set(sources), set(OWNERS), "Classify each new production unit by responsibility")
