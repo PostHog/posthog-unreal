@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,16 +9,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 import zipfile
 
-from test_release import release
+from test_release import ROOT, release
 
-ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("package_plugin", ROOT / "scripts/package-plugin.py")
 packaging = importlib.util.module_from_spec(spec)
-with patch.dict(sys.modules, {"release": release}):
-    spec.loader.exec_module(packaging)
+spec.loader.exec_module(packaging)
 
 
 class PluginPackageTests(unittest.TestCase):
@@ -28,8 +26,8 @@ class PluginPackageTests(unittest.TestCase):
         self.native_root = self.root / "native"
         self.write("rust/posthog-unreal-ffi/Cargo.toml", '[package]\nname = "posthog-unreal-ffi"\nversion = "0.1.0"\n')
         self.write("rust/Cargo.lock", '[[package]]\nname = "posthog-unreal-ffi"\nversion = "0.1.0"\n')
-        self.write("rust/posthog-unreal-ffi/CHANGELOG.md", "# Changelog\n\n## 0.1.0 — 2026-01-01\n\n- SDK feature.\n")
-        (self.root / "rust/.sampo/changesets").mkdir(parents=True)
+        self.write("package.json", json.dumps({"name": "posthog-unreal", "version": "0.1.0", "private": True}))
+        self.write("CHANGELOG.md", "# Changelog\n\n## 0.1.0\n\n### Minor Changes\n\n- SDK feature.\n")
         self.write("PostHog.uplugin", json.dumps({
             "VersionName": "0.1.0", "Version": 2, "SupportedTargetPlatforms": ["Mac", "Win64", "Linux"],
             "Modules": [{"Name": "PostHog", "PlatformAllowList": ["Mac", "Win64", "Linux"]}],
@@ -76,7 +74,7 @@ class PluginPackageTests(unittest.TestCase):
     def test_combined_plugin_layout_contains_all_libraries_and_licenses(self):
         original = (self.root / "PostHog.uplugin").read_bytes()
         archive = self.package()
-        self.assertEqual(archive.name, "PostHog-v0.1.0.zip")
+        self.assertEqual(archive.name, "posthog-unreal-0.1.0.zip")
         with zipfile.ZipFile(archive) as package:
             self.assertIsNone(package.testzip())
             names = set(package.namelist())
@@ -90,13 +88,11 @@ class PluginPackageTests(unittest.TestCase):
                 self.assertIn(f"PostHog/RustNotices/{target}/licenses/MIT.txt", names)
                 self.assertIn(f"PostHog/ThirdPartySources/{target}/option-ext-0.2.0/src/lib.rs", names)
             self.assertIn("PostHog/THIRD_PARTY_NOTICES.txt", names)
-            self.assertIn("PostHog/CHANGELOG.md", names)
+            self.assertEqual(package.read("PostHog/CHANGELOG.md"), (self.root / "CHANGELOG.md").read_bytes())
             self.assertIn("PostHog/LICENSE", names)
             self.assertIn(b"you do not need Rust or Cargo", package.read("PostHog/README.md"))
             self.assertEqual(package.read("PostHog/PostHog.uplugin"), original)
         self.assertEqual((self.root / "PostHog.uplugin").read_bytes(), original)
-        self.assertEqual(archive.with_suffix(".zip.sha256").read_text(encoding="utf-8"),
-                         f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
 
     def test_excludes_checkout_and_unrelated_build_products(self):
         for name in (".env", "Tests/Unreal/Source/Host.Build.cs", "Examples/Example.uproject",
@@ -123,7 +119,7 @@ class PluginPackageTests(unittest.TestCase):
             "--native", str(self.native_root), "--output", str(self.root / "output"),
         ], env={**os.environ, "PATH": str(empty_path)}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        with zipfile.ZipFile(self.root / "output/PostHog-v0.1.0.zip") as package:
+        with zipfile.ZipFile(self.root / "output/posthog-unreal-0.1.0.zip") as package:
             self.assertIsNone(package.testzip())
             for target, filename in packaging.TARGETS.items():
                 self.assertIn(f"PostHog/Source/ThirdParty/PostHogRust/lib/{target}/{filename}", package.namelist())
@@ -201,6 +197,50 @@ class PluginPackageTests(unittest.TestCase):
         self.write(f"native/{target}/.env", "private")
         with self.assertRaisesRegex(ValueError, "Unexpected"):
             self.package()
+
+
+    def test_release_assets_checksum_the_assembled_plugin(self):
+        archive = self.package()
+        release.prepare_release("0.1.0", archive.parent, self.root)
+        self.assertEqual((archive.parent / "SHA256SUMS").read_text(encoding="utf-8"),
+                         f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+
+    def test_release_assets_require_the_versioned_archive(self):
+        (self.root / "output").mkdir()
+        with self.assertRaises(FileNotFoundError):
+            release.prepare_release("0.1.0", self.root / "output", self.root)
+        self.package()
+        with self.assertRaisesRegex(ValueError, "without a v prefix"):
+            release.prepare_release("v0.1.0", self.root / "output", self.root)
+        self.assertFalse((self.root / "output/SHA256SUMS").exists())
+
+    def test_release_assets_reject_an_incomplete_or_mismatched_archive(self):
+        archive = self.package()
+        original = archive.read_bytes()
+        library = "PostHog/Source/ThirdParty/PostHogRust/lib/x86_64-pc-windows-msvc/posthog_unreal_ffi.lib"
+        manifest = "PostHog/Source/ThirdParty/PostHogRust/lib/aarch64-apple-darwin/manifest.json"
+
+        def stale_manifest(files):
+            files[manifest] = json.dumps({**json.loads(files[manifest]), "bridge_version": "0.0.9"}).encode()
+
+        cases = {
+            "missing": lambda files: files.pop(library),
+            "sha256": lambda files: files.update({library: b"other library"}),
+            "bridge_version": stale_manifest,
+            "outside PostHog/": lambda files: files.update({"Other/file.txt": b"stray"}),
+            "descriptor": lambda files: files.update({"PostHog/PostHog.uplugin": b'{"VersionName": "0.0.9"}'}),
+        }
+        for error, change in cases.items():
+            with self.subTest(error=error):
+                with zipfile.ZipFile(io.BytesIO(original)) as package:
+                    files = {name: package.read(name) for name in package.namelist()}
+                change(files)
+                with zipfile.ZipFile(archive, "w") as package:
+                    for name, data in files.items():
+                        package.writestr(name, data)
+                with self.assertRaisesRegex(ValueError, error):
+                    release.prepare_release("0.1.0", archive.parent, self.root)
+                self.assertFalse((archive.parent / "SHA256SUMS").exists())
 
 
 if __name__ == "__main__":

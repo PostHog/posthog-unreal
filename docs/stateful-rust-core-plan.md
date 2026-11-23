@@ -16,7 +16,7 @@ The bridge is not a second SDK. It can own handles, buffers, borrowed foreign ca
 - Captures permitted before opt-out may still persist and deliver. Reset restores configured default consent.
 - State and event storage belong to Rust under its own namespaces and schema. Storage failure uses the SDK's memory fallback.
 - Feature-flag notifications are owned SDK snapshots; they can be superseded by the time the game thread consumes them. They are not a targeting-generation protocol.
-- Capture-time SDK `session_id` and `distinct_id` are top-level fields in raw canonical v1 analytics events. Event library properties and the transport `posthog-sdk-info` header both identify `posthog-unreal/0.0.1`.
+- Capture-time SDK `session_id` and `distinct_id` are top-level fields in raw canonical v1 analytics events. Event library properties and the transport `posthog-sdk-info` header both identify `posthog-unreal/<SDK version>`, where the SDK version is the plugin and bridge crate version.
 - Before-send filtering preserves complete event fields, supports mutation/drop and fails closed. Removed attribution is not refilled by the adapter.
 
 ## Replay

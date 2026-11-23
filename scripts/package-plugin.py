@@ -8,13 +8,7 @@ import re
 import subprocess
 import zipfile
 
-from release import ROOT, check, release_notes
-
-TARGETS = {
-    "aarch64-apple-darwin": "libposthog_unreal_ffi.a",
-    "x86_64-unknown-linux-gnu": "libposthog_unreal_ffi.a",
-    "x86_64-pc-windows-msvc": "posthog_unreal_ffi.lib",
-}
+from release import ROOT, TARGETS, get_version
 
 
 def sha256(path):
@@ -22,7 +16,7 @@ def sha256(path):
 
 
 def validate_native(root, target, files):
-    version, _ = check(root)
+    version = get_version(root)
     prefix = f"Source/ThirdParty/PostHogRust/lib/{target}/"
     manifest = json.loads(files[prefix + "manifest.json"])
     header = (root / "Source/ThirdParty/PostHogRust/include/posthog_unreal.h").read_text(encoding="utf-8")
@@ -79,8 +73,7 @@ def stage_native(root, target, output, notices, metadata, rust_docs):
 
 
 def package_plugin(root, native_root, output):
-    version, _ = check(root)
-    release_notes(root, version)
+    version = get_version(root)
     files = {}
     for target, library in TARGETS.items():
         bundle = native_root / target
@@ -118,7 +111,7 @@ def package_plugin(root, native_root, output):
         files[path.relative_to(root).as_posix()] = path.read_bytes()
     for path in (third_party / "PostHogRust.Build.cs", root / "PostHog.uplugin", root / "LICENSE"):
         files[path.relative_to(root).as_posix()] = path.read_bytes()
-    files["CHANGELOG.md"] = (root / "rust/posthog-unreal-ffi/CHANGELOG.md").read_bytes()
+    files["CHANGELOG.md"] = (root / "CHANGELOG.md").read_bytes()
     files["THIRD_PARTY_NOTICES.txt"] = (
         "PostHog Unreal SDK dependency notices, grouped by native build target:\n\n" +
         "".join(f"- ThirdPartyNotices/{target}.txt\n" for target in TARGETS) +
@@ -138,14 +131,14 @@ Unreal links only the library for your target platform.
 A Blueprint-only project must first add a C++ class and use the Unreal C++ toolchain.
 
 Setup, API and screenshot privacy guidance:
-https://github.com/PostHog/posthog-unreal/blob/v{version}/README.md
+https://github.com/PostHog/posthog-unreal/blob/{version}/README.md
 
 See LICENSE, THIRD_PARTY_NOTICES.txt, RustNotices/ and ThirdPartySources/ for
 license texts, copyright notices and corresponding dependency sources.
 """.encode()
 
     output.mkdir(parents=True, exist_ok=True)
-    archive = output / f"PostHog-v{version}.zip"
+    archive = output / f"posthog-unreal-{version}.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
         for name, data in sorted(files.items()):
             # Stable ZIP metadata makes identical inputs produce the same checksum.
@@ -153,7 +146,6 @@ license texts, copyright notices and corresponding dependency sources.
             info.create_system = 3
             info.external_attr = 0o100644 << 16
             package.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED)
-    archive.with_suffix(".zip.sha256").write_text(f"{sha256(archive)}  {archive.name}\n", encoding="utf-8")
     return archive
 
 

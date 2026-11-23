@@ -1,0 +1,98 @@
+const { readdirSync, readFileSync } = require('node:fs');
+const { join } = require('node:path');
+
+const unsuccessful = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
+const publishJobName = 'Commit and publish approved release';
+const resultJobName = 'Notify Slack/PostHog - Release Result';
+
+function readThreadTimestamp(directory, attempt) {
+    if (!directory) return undefined;
+    try {
+        const entries = readdirSync(directory);
+        // A single matching artifact is extracted straight into the directory.
+        // Failed-job reruns reuse the approval thread from the latest earlier attempt.
+        const files = entries.includes('thread-ts.txt')
+            ? [join(directory, 'thread-ts.txt')]
+            : entries
+                .map(name => /^release-slack-thread-(\d+)$/.exec(name)?.[1])
+                .filter(value => value && Number(value) <= attempt)
+                .sort((a, b) => Number(b) - Number(a))
+                .map(value => join(directory, `release-slack-thread-${value}`, 'thread-ts.txt'));
+        if (files.length === 0) return undefined;
+        const timestamp = readFileSync(files[0], 'utf8').trim();
+        return /^\d+\.\d+$/.test(timestamp) ? timestamp : undefined;
+    } catch (error) {
+        if (error.code !== 'ENOENT') console.error('Could not read Slack thread:', error.message);
+        return undefined;
+    }
+}
+
+module.exports = async function releaseFailureNotification({ github, context, channel, threadDirectory }) {
+    const run = context.payload.workflow_run;
+    const threadTs = readThreadTimestamp(threadDirectory, run.run_attempt);
+    const destination = { channel, ...(threadTs ? { thread_ts: threadTs } : {}) };
+    let jobs;
+    try {
+        jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+            ...context.repo,
+            run_id: run.id,
+            attempt_number: run.run_attempt,
+            per_page: 100,
+        });
+    } catch (error) {
+        console.error('Failed to inspect release jobs:', error.status ?? error.name, error.message);
+        return {
+            ...destination,
+            text: [
+                `⚠️ Could not inspect release jobs for \`${context.repo.owner}/${context.repo.repo}\` (attempt ${run.run_attempt}).`,
+                'Please check this release manually; individual job results are unavailable.',
+                `<${run.html_url}|View release logs> (run: ${run.conclusion})`,
+            ].join('\n'),
+            unfurl_links: false,
+            unfurl_media: false,
+        };
+    }
+
+    if (jobs.length === 0 && run.conclusion === 'cancelled') {
+        return null;
+    }
+
+    const failedJobs = jobs.filter(job => unsuccessful.has(job.conclusion));
+    const publish = jobs.find(job => job.name === publishJobName);
+    const resultJob = jobs.find(job => job.name === resultJobName);
+    const stepSucceeded = (name) => resultJob?.steps?.some(step => step.name === name && step.conclusion === 'success') ?? false;
+
+    if (run.conclusion === 'failure' && failedJobs.length === 1
+        && publish?.conclusion === 'failure' && publish.steps?.length === 0
+        && stepSucceeded('Notify Slack - Rejected')) {
+        return null;
+    }
+
+    const releaseCreated = publish?.conclusion === 'success';
+    const problems = failedJobs.map(job => `• <${job.html_url}|${job.name}>: ${job.conclusion}`);
+
+    if (run.conclusion !== 'success' && failedJobs.length === 0 && !publish) {
+        problems.push(`• ${publishJobName}: never ran`);
+    }
+
+    if (releaseCreated && !stepSucceeded('Notify Slack - Released') && !failedJobs.includes(resultJob)) {
+        problems.push('• The released Slack notification did not run.');
+    }
+
+    if (problems.length === 0 && run.conclusion === 'success') {
+        return null;
+    }
+
+    return {
+        ...destination,
+        text: [
+            releaseCreated
+                ? `⚠️ GitHub release published; follow-up problems for \`${context.repo.owner}/${context.repo.repo}\` (attempt ${run.run_attempt}).`
+                : `❌ Release process failed or was cancelled for \`${context.repo.owner}/${context.repo.repo}\` (attempt ${run.run_attempt}).`,
+            ...problems,
+            `<${run.html_url}|View release logs> (run: ${run.conclusion})`,
+        ].join('\n'),
+        unfurl_links: false,
+        unfurl_media: false,
+    };
+};

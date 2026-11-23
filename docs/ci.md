@@ -22,6 +22,7 @@ Use Python 3.11+ (CI uses 3.13), Rust and the platform's UE 5.8 toolchain. Cargo
 ```sh
 python -m pip install -r Tests/requirements.txt
 python -m unittest discover -s Tests -p 'test_*.py' -v
+node --test scripts/release-failure-notification.test.cjs
 cargo test --manifest-path rust/Cargo.toml --locked
 
 # Installs a library/manifest into the source plugin; coordinate with consumers first.
@@ -119,7 +120,7 @@ The validated archives are under `artifacts/packages/Mac/Development-AdHoc` and 
 
 ## GitHub Actions
 
-`.github/workflows/sdk-tests.yml` runs tooling on pull requests/main. Protected native jobs run only on trusted pushes/manual dispatch, with the immutable dependency selected by Cargo. Engine-backed tests require the dispatch's `unreal` input. A skipped native/engine job means validation pending.
+`.github/workflows/sdk-tests.yml` runs tooling on pull requests/main. Its `bundle` jobs build and test the native library, generate dependency notices and stage a release bundle on macOS 15, Ubuntu 22.04 and Windows 2022 without secrets. The [Release workflow](../RELEASING.md) calls the same workflow with a release-candidate patch, and publication assembles the plugin ZIP from those bundles. Protected native jobs run only on trusted pushes/manual dispatch, not for release candidates, with the immutable dependency selected by Cargo. Engine-backed tests require the dispatch's `unreal` input. A skipped native/engine job means validation pending.
 
 Create a protected `sdk-ci` environment with required reviewers and trusted-branch restrictions. Configure repository variables:
 
@@ -149,7 +150,7 @@ At the current pin, `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`, on UE 5.8.4 macO
 
 The previous `b717aef23d4869bdf94e75ce36bbd383d3575c6f` integration passed 7 bridge tests, 27 tooling tests and the 20-test consolidated driver with matching installed release artifacts on UE 5.8 Mac arm64. All 13 engine tests passed, including real automatic-session expiry attribution, newer reentrant session preservation and Analytics defaults/stock Blueprint/Multicast routing. Both asset-free and retained example Editor consumers build; the example's Analytics automation passes.
 
-The real Metal fixture passes in Development Editor and locally ad-hoc-signed packaged Development/Shipping: three initial 320×240 and three resized 320×180 JPEGs per configuration, explicit-start gating, halt/stable/resume and exit code 0 with recording active. Independent verification decoded all 18 JPEGs and checked raw v1 event attribution and analytics/replay session, window and identity linkage. In raw analytics events, `session_id` and `distinct_id` are top-level fields; event library properties are `posthog-unreal/0.0.1`, distinct from the `posthog-rs/0.31.3` transport header at that pin (the current pin's transport header names `posthog-unreal/0.0.1`). Packaged runs cover monolithic shutdown, including retirement of registry-held initialization futures while engine services are live.
+The real Metal fixture passes in Development Editor and locally ad-hoc-signed packaged Development/Shipping: three initial 320×240 and three resized 320×180 JPEGs per configuration, explicit-start gating, halt/stable/resume and exit code 0 with recording active. Independent verification decoded all 18 JPEGs and checked raw v1 event attribution and analytics/replay session, window and identity linkage. In raw analytics events, `session_id` and `distinct_id` are top-level fields; event library properties are `posthog-unreal/0.0.1`, distinct from the `posthog-rs/0.31.3` transport header at that pin (the current pin's transport header names `posthog-unreal/<SDK version>`). Packaged runs cover monolithic shutdown, including retirement of registry-held initialization futures while engine services are live.
 
 The retained example's gameplay smoke passes all five scenarios (offline, normal, hard, delayed, timeout) with 34 checks each; each scenario starts without the previous scenario's saved SDK state. At the current pin, SDK PR #360's checks pass. See the [README status](../README.md#status) for remaining milestones.
 

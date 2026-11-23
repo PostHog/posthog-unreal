@@ -1,0 +1,7 @@
+{
+  "name": "posthog-unreal",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Release metadata for the PostHog Unreal SDK",
+  "packageManager": "pnpm@11.13.1"
+}
