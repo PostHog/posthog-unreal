@@ -103,11 +103,10 @@ public:
     EPostHogResult StartSessionReplay();
     EPostHogResult StopSessionReplay();
     bool IsSessionReplayActive() const;
-    /** Reserve before acquisition. Host provides already composited/downscaled
-     * top-down BGRA8888; any redaction must already have been applied by the producer.
-     * The returned lease must be submitted once or abandoned; destruction abandons it.
-     * Throttled: within Replay.IntervalMs of the previous frame; skip it. Inactive: any other refusal. */
-    EPostHogResult BeginReplayFrame(int32 Width, int32 Height, int32 RowStrideBytes, TUniquePtr<FPostHogReplayFrame>& OutFrame);
+#if WITH_DEV_AUTOMATION_TESTS
+    /** Test-only: the SDK's admission result for a replay frame now. Abandons any reservation. */
+    EPostHogResult TryReplayFrameForTests(int32 Width, int32 Height);
+#endif
 
 private:
     friend class FPostHogModule;
@@ -118,9 +117,16 @@ private:
         const FPostHogProperties& Fallback, const FPostHogProperties& Options = {});
     friend class FPostHogReplayFrame;
     friend class FPostHogReplayRecorder;
+    friend class FPostHogReplayWorkState;
 #if WITH_DEV_AUTOMATION_TESTS
     friend struct FPostHogHostCloseTestAccess;
+    friend struct FPostHogReplayTestAccess;
 #endif
+    /** Only the SDK's own viewport recorder acquires pixels. It reserves before acquisition and
+     * provides composited/downscaled top-down BGRA8888. The returned lease must be submitted once
+     * or abandoned; destruction abandons it. Throttled: within Replay.IntervalMs of the previous
+     * frame; skip it. Inactive: any other refusal. */
+    EPostHogResult BeginReplayFrame(int32 Width, int32 Height, int32 RowStrideBytes, TUniquePtr<FPostHogReplayFrame>& OutFrame);
     using FHostClose = TPair<TSharedFuture<bool>, bool>;
     bool BindHostClose(TFunction<void()>&& Cancel, TFunction<FHostClose()>&& Retire);
     static void ShutdownAll();
@@ -132,7 +138,7 @@ private:
     static bool bStopping;
 };
 
-/** Single-use native reservation. Owns no renderer resources and exposes no Rust buffer. */
+/** Single-use native reservation for the SDK's viewport recorder. Owns no renderer resources and exposes no Rust buffer. */
 class POSTHOG_API FPostHogReplayFrame final
 {
 public:

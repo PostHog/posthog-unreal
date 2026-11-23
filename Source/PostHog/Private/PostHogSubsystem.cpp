@@ -322,13 +322,6 @@ EPostHogResult UPostHogSubsystem::StopSessionReplay()
 { auto Current = GetClient(); return Current ? Current->StopSessionReplay() : EPostHogResult::Closed; }
 bool UPostHogSubsystem::IsSessionReplayActive() const
 { auto Current = GetClient(); return Current && Current->IsSessionReplayActive(); }
-EPostHogResult UPostHogSubsystem::BeginReplayFrame(int32 Width, int32 Height, int32 Stride, UPostHogReplayFrame*& Frame)
-{
-    Frame = nullptr; auto Current = GetClient(); if (!Current) { return EPostHogResult::Closed; }
-    TUniquePtr<FPostHogReplayFrame> Lease; const auto Result = Current->BeginReplayFrame(Width, Height, Stride, Lease);
-    if (Result == EPostHogResult::Ok) { Frame = NewObject<UPostHogReplayFrame>(this); Frame->Lease = MoveTemp(Lease); }
-    return Result;
-}
 void UPostHogSubsystem::Stop()
 {
     if (State == EPostHogSubsystemState::Deinitialized) { return; }

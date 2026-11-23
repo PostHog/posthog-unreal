@@ -5,6 +5,12 @@
 #include "PostHogReadbackSlot.h"
 #include "Math/Float16Color.h"
 
+struct FPostHogReplayTestAccess
+{
+    static EPostHogResult Begin(FPostHogClient& Client, int32 Width, int32 Height, int32 RowStrideBytes, TUniquePtr<FPostHogReplayFrame>& OutFrame)
+    { return Client.BeginReplayFrame(Width, Height, RowStrideBytes, OutFrame); }
+};
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogReplayTest, "PostHog.ReplayPreparedPixels", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FPostHogReplayTest::RunTest(const FString&)
 {
@@ -16,11 +22,11 @@ bool FPostHogReplayTest::RunTest(const FString&)
         Client->FlushAsync().Get(); Check(!Client->IsSessionReplayActive(), TEXT("no recording before manual start")); Client->StartSessionReplay();
         Check(PostHogTests::WaitForReplay(*Client), TEXT("remote replay settings permit recording"));
         TUniquePtr<FPostHogReplayFrame> Frame, Other;
-        Check(Client->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("acquire core reservation"));
+        Check(FPostHogReplayTestAccess::Begin(*Client, 32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("acquire core reservation"));
         if (Frame)
         {
-            Check(Client->BeginReplayFrame(32, 24, 128, Other) == EPostHogResult::Inactive, TEXT("held lease reserves core capacity"));
-            Frame.Reset(); Check(Client->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("RAII abandonment releases capacity"));
+            Check(FPostHogReplayTestAccess::Begin(*Client, 32, 24, 128, Other) == EPostHogResult::Inactive, TEXT("held lease reserves core capacity"));
+            Frame.Reset(); Check(FPostHogReplayTestAccess::Begin(*Client, 32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("RAII abandonment releases capacity"));
             Client->StopSessionReplay();
             TArray<uint8> Pixels; Pixels.SetNumZeroed(128 * 24);
             for (int32 Row = 0; Row < 24; ++Row) { for (int32 X = 0; X < 16; ++X) { Pixels[(Row * 32 + X) * 4] = 255; } }
@@ -29,8 +35,8 @@ bool FPostHogReplayTest::RunTest(const FString&)
         }
         Client->FlushAsync().Get(); Client->StartSessionReplay();
         Client->SetAppInBackground(true);
-        Check(Client->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Inactive, TEXT("engine foreground gate"));
-        Client->SetAppInBackground(false); Check(Client->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("foreground acquisition"));
+        Check(FPostHogReplayTestAccess::Begin(*Client, 32, 24, 128, Frame) == EPostHogResult::Inactive, TEXT("engine foreground gate"));
+        Client->SetAppInBackground(false); Check(FPostHogReplayTestAccess::Begin(*Client, 32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("foreground acquisition"));
         Check(Client->ShutdownAsync().Get().bJoined, TEXT("close with held frame"));
         Frame.Reset(); // The core already invalidated its token; no dangling pixel pointer exists.
 
@@ -38,9 +44,9 @@ bool FPostHogReplayTest::RunTest(const FString&)
         auto Paced = FPostHogClient::CreateAsync(Throttled).Get(); if (!Paced) { Errors.Add(TEXT("throttled client creation")); return Errors; }
         Paced->FlushAsync().Get(); Paced->StartSessionReplay();
         Check(PostHogTests::WaitForReplay(*Paced), TEXT("throttled client records"));
-        Check(Paced->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("first frame within the interval"));
+        Check(FPostHogReplayTestAccess::Begin(*Paced, 32, 24, 128, Frame) == EPostHogResult::Ok, TEXT("first frame within the interval"));
         Frame.Reset();
-        Check(Paced->BeginReplayFrame(32, 24, 128, Frame) == EPostHogResult::Throttled && !Frame, TEXT("replay interval throttles the next frame"));
+        Check(FPostHogReplayTestAccess::Begin(*Paced, 32, 24, 128, Frame) == EPostHogResult::Throttled && !Frame, TEXT("replay interval throttles the next frame"));
         Check(Paced->ShutdownAsync().Get().bJoined, TEXT("close throttled client"));
         return Errors;
     });

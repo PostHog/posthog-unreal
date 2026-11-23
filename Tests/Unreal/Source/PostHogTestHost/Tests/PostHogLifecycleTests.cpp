@@ -216,10 +216,8 @@ private:
     }
     void FrameAllowed(bool bAllowed)
     {
-        TUniquePtr<FPostHogReplayFrame> Frame;
-        Test->TestEqual(TEXT("foreground replay admission independent of lifecycle analytics"), Client->BeginReplayFrame(32, 24, 128, Frame),
+        Test->TestEqual(TEXT("foreground replay admission independent of lifecycle analytics"), Client->TryReplayFrameForTests(32, 24),
             bAllowed ? EPostHogResult::Ok : EPostHogResult::Inactive);
-        if (Frame) { Frame->Abandon(); }
     }
     FString Startup() const
     { return Case == ELifecycleCase::InitialBackground || Case == ELifecycleCase::Disabled || Case == ELifecycleCase::OptedOut ? TEXT("") : TEXT("opened:false"); }
