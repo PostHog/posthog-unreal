@@ -57,7 +57,7 @@ Property objects retain their accepted decode/mutation byte bound across native 
 
 Flags are read from Rust. The mailbox is a one-slot coalescing presentation queue, not a cache. Notifications include enabled results and their producing context; all-results getters include known false. No C++ targeting generations or request-correlated futures are synthesized.
 
-The subsystem selects `Saved/PostHogStateful` and instance/environment inputs. Before initialization it obtains an opaque host/token/instance coordination key from Rust, using SDK endpoint normalization and trimmed host/token inputs. Equivalent inputs reject a second live engine owner or wait for a cancelled predecessor to finish. Rust owns fresh versioned records and namespace leases; direct native clients may use memory-only operation. Storage failures retain canonical Rust memory fallback.
+The subsystem selects `Saved/PostHogStateful` and instance/environment inputs. Before initialization it obtains an opaque token/instance coordination key from Rust, matching the Rust storage namespace, which ignores the host. Equivalent inputs reject a second live engine owner or wait for a cancelled predecessor to finish. Rust owns fresh versioned records and namespace leases; direct native clients may use memory-only operation. Storage failures retain canonical Rust memory fallback.
 
 ## Analytics and canonical migration
 

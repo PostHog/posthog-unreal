@@ -143,19 +143,9 @@ pub unsafe extern "C" fn phu_coordination_key(input: Bytes, out: *mut Buffer) ->
             clear(out)?;
         }
         let options: Options = unsafe { parse(input)? };
-        // Match Config's input normalization; endpoint aliases remain SDK-owned.
-        let host = options.host.trim();
-        let host = posthog_rs::EndpointManager::determine_server_host(if host.is_empty() {
-            posthog_rs::DEFAULT_HOST
-        } else {
-            host
-        });
-        // An unambiguous opaque host/token/instance key, not a storage namespace/path.
-        let fields = [
-            host.as_str(),
-            options.project_token.trim(),
-            options.instance_name.as_str(),
-        ];
+        // posthog-rs names storage by the trimmed token and the instance name only, so a
+        // host change must still wait for the client that holds the same storage.
+        let fields = [options.project_token.trim(), options.instance_name.as_str()];
         let mut key = String::with_capacity(40);
         for byte in Sha1::digest(abi::encode(&fields, abi::MAX_INPUT)?).iter() {
             write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");

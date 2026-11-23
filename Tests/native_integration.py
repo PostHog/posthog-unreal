@@ -271,13 +271,11 @@ class StatefulNativeTests(MockServerTestCase):
         self.assertEqual(status, OK)
         return key
 
-    def test_coordination_key_normalizes_sdk_aliases_and_input_whitespace(self):
+    def test_coordination_key_matches_sdk_storage_scope(self):
         expected = self.coordination_key(project_token="phc_MOCK", instance_name="owner")
-        for host in ("", " \t", "https://app.posthog.com", "https://us.posthog.com///",
-                     " \nhttps://us.i.posthog.com/\t"):
+        # posthog-rs storage ignores the host, so every host shares one coordination key.
+        for host in ("", " \t", "https://eu.posthog.com", self.host):
             self.assertEqual(self.coordination_key(host=host, project_token="\u2003phc_MOCK \n", instance_name="owner"), expected)
-        self.assertEqual(self.coordination_key(host=" https://eu.posthog.com/// ", project_token="phc_MOCK"),
-                         self.coordination_key(host="https://eu.i.posthog.com", project_token="phc_MOCK"))
         self.assertNotEqual(self.coordination_key(project_token="other", instance_name="owner"), expected)
         self.assertNotEqual(self.coordination_key(project_token="phc_MOCK", instance_name="other"), expected)
         self.assertEqual(len(expected), 40)

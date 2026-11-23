@@ -71,7 +71,7 @@ fn close(handle: u64) -> (Status, Option<Value>) {
     (status, value)
 }
 #[test]
-fn coordination_uses_sdk_host_equivalence_and_trimmed_tokens_without_initialization() {
+fn coordination_matches_sdk_storage_scope_without_initialization() {
     let key = |host: &str, token: &str, instance: &str| {
         let mut out = Buffer::empty();
         let input = json!({"host":host,"project_token":token,"instance_name":instance});
@@ -89,33 +89,16 @@ fn coordination_uses_sdk_host_equivalence_and_trimmed_tokens_without_initializat
     };
     let canonical = key(posthog_rs::DEFAULT_HOST, "phc_test", "owner");
     assert_eq!(canonical.len(), 40);
-    for host in [
-        "",
-        " \t",
-        "https://app.posthog.com",
-        "https://us.posthog.com/",
-        " \thttps://us.i.posthog.com///\n",
-    ] {
+    // posthog-rs storage ignores the host, so a host change must not escape coordination.
+    for host in ["", "https://eu.posthog.com", "http://127.0.0.1:9"] {
         assert_eq!(key(host, "\u{2003}phc_test \n", "owner"), canonical);
     }
-    assert_eq!(
-        key(" https://eu.posthog.com/// ", "phc_test", "owner"),
-        key("https://eu.i.posthog.com", "phc_test", "owner")
-    );
-    assert_eq!(
-        key(" http://127.0.0.1:9/// ", "phc_test", "owner"),
-        key("http://127.0.0.1:9", "phc_test", "owner")
-    );
     assert_ne!(
         key(posthog_rs::DEFAULT_HOST, "different", "owner"),
         canonical
     );
     assert_ne!(
         key(posthog_rs::DEFAULT_HOST, "phc_test", "different"),
-        canonical
-    );
-    assert_ne!(
-        key("https://eu.posthog.com", "phc_test", "owner"),
         canonical
     );
     let mut out = Buffer::empty();
