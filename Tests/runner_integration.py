@@ -101,7 +101,7 @@ def main():
     parser.add_argument("--scenario", choices=["offline", "normal", "hard", "delayed", "timeout"])
     args = parser.parse_args()
     for name, hard, delay, enabled in [("offline", False, 0, False), ("normal", False, 0, True),
-                                        ("hard", True, 0, True), ("delayed", True, 2, True), ("timeout", True, REQUEST_TIMEOUT_SECONDS + 2, True)]:
+                                        ("hard", True, 0, True), ("delayed", True, 2, True), ("timeout", True, REQUEST_TIMEOUT_SECONDS + 1, True)]:
         if args.scenario is None or args.scenario == name:
             run_scenario(args, name, hard, delay, enabled)
 

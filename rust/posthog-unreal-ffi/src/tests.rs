@@ -355,6 +355,8 @@ fn hooks_drop_fail_closed_reenter_and_close_without_self_wait() {
     // may finish before or after shutdown begins. Either outcome is valid.
     assert!(matches!(capture(handle), Status::Closed | Status::Accepted));
     assert_eq!(state.nested.load(Ordering::SeqCst), Status::Deferred as i32);
+    // The in-hook close has already closed admission, so this result is deterministic.
+    assert_eq!(capture(handle), Status::Closed);
     assert_eq!(close(handle).0, Status::Ok);
 }
 #[test]

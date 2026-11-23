@@ -488,6 +488,8 @@ class StatefulNativeTests(MockServerTestCase):
         # may finish before or after shutdown begins. Either outcome is valid.
         self.assertIn(self.capture(handle)[0], (CLOSED, ACCEPTED))
         self.assertEqual(results, [REENTRANT, DEFERRED])
+        # The in-hook close has already closed admission, so this result is deterministic.
+        self.assertEqual(self.capture(handle)[0], CLOSED)
         self.assertEqual(self.close(handle)[0], OK)
 
     def test_concurrent_close_waits_for_active_foreign_hook(self):

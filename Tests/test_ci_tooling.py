@@ -132,12 +132,8 @@ class ReplaySmokeTests(unittest.TestCase):
 
 
 class BuildToolingTests(unittest.TestCase):
-    def test_cargo_patch_quotes_paths(self):
+    def test_windows_library_name(self):
         build = load_script("build-native")
-        path = Path('folder with spaces') / 'core'
-        patch = build.cargo_patch(path)
-        self.assertIn('.posthog.path=', patch)
-        self.assertEqual(json.loads(patch.split("=", 1)[1]), str(path))
         self.assertEqual(build.LIBRARIES["x86_64-pc-windows-msvc"], "posthog_unreal_ffi.lib")
 
     def test_native_build_installs_artifact_and_records_manifest(self):
@@ -188,7 +184,6 @@ class BuildToolingTests(unittest.TestCase):
                 self.assertEqual(manifest["core_package"], "posthog")
                 self.assertEqual(manifest["core_source"], source)
                 self.assertEqual(manifest["core_features"], ["tls", "session-replay"])
-                self.assertFalse(manifest["development_override"])
 
     def test_host_uses_manual_code_signing(self):
         config = configparser.ConfigParser()

@@ -4,13 +4,12 @@ A playable three-lane infinite runner demonstrating the PostHog Unreal SDK. The 
 
 ## Build and play
 
-Current validated target: **Unreal Engine 5.8 on macOS arm64**. Follow the repository's [native build prerequisites](../../README.md#building-the-development-checkout), including the development Rust embedding checkout.
+Current validated target: **Unreal Engine 5.8 on macOS arm64**. Follow the repository's [native build prerequisites](../../README.md#build).
 
 From the repository root:
 
 ```sh
 export UE_ROOT="/path/to/UE_5.8"
-export POSTHOG_RS_PATH="/path/to/posthog-rs-embedding-checkout"
 export PYTHON=python3 # Python 3.11+ for the native build
 ./scripts/build-native.sh aarch64-apple-darwin
 ./scripts/build-example.sh
