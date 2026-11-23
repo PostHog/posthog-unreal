@@ -273,9 +273,13 @@ fn local_operations_and_real_outcomes() {
     assert_eq!(reset["opt_out"], true);
     let (status, report) = close(handle);
     assert_eq!(status, Status::Ok);
-    assert_eq!(
-        report.unwrap(),
-        json!({"state":"memory_only","delivery":"stopped"})
+    let report = report.unwrap();
+    assert_eq!(report["state"], "memory_only");
+    // The host is a closed local port. Unix refuses the connection at once, so delivery
+    // stops; Windows retries the connection past the 100 ms budget, so it times out.
+    assert!(
+        report["delivery"] == "stopped" || report["delivery"] == "timed_out",
+        "{report}"
     );
     assert_eq!(capture(handle), Status::Closed);
     let disabled = create(json!({"disabled":true}), no_hooks());
