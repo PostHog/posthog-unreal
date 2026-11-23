@@ -14,4 +14,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["serde"] }

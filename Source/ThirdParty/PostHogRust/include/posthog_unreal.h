@@ -53,11 +53,23 @@ void phu_buffer_free(phu_buffer buffer);
 typedef phu_status (*phu_before_send)(void* user_data, phu_bytes event, phu_buffer* out_event);
 typedef struct phu_hooks { phu_before_send before_send; void* user_data; } phu_hooks;
 
+/* Process-wide diagnostics: posthog-rs warnings/errors and every client's SDK error reports
+ * (delivery, flags, storage, initialization, remote config, replay), one sanitized UTF-8 line
+ * each, without tokens, distinct IDs or response bodies. Runs on any SDK or caller thread,
+ * possibly concurrently. Never capture from it. Setting from the callback returns REENTRANT.
+ * NULL clears. Setting waits for running callbacks, so the previous callback and user_data
+ * must stay valid until a later set returns. If another tracing subscriber is already the
+ * process default, only SDK error reports are forwarded.
+ */
+enum { PHU_LOG_WARNING = 1, PHU_LOG_ERROR = 2 };
+typedef void (*phu_log)(void* user_data, int32_t level, phu_bytes message);
+phu_status phu_set_log(phu_log callback, void* user_data);
+
 /* Pure pre-initialization ownership key; no client, filesystem or network access.
  * Input: {project_token, host?, instance_name?}, using the create defaults.
- * Trims host/token, defaults an empty host, and uses the SDK endpoint helper for
- * aliases/trailing slashes. OK returns an opaque JSON string for host/token/instance
- * equality only. Combine with the engine-selected storage root for coordination.
+ * Uses the trimmed token and the instance name, as Rust storage does; host is ignored.
+ * OK returns an opaque JSON string for token/instance equality only. Combine with the
+ * engine-selected storage root for coordination.
  * This is NOT a Rust storage namespace/path or a persistence guarantee.
  */
 phu_status phu_coordination_key(phu_bytes input, phu_buffer* out_key);
@@ -71,7 +83,7 @@ phu_status phu_coordination_key(phu_bytes input, phu_buffer* out_key);
  * request_timeout_seconds (10), shutdown_timeout_ms (3000), jpeg_quality (65),
  * max_frames_in_flight (2), throttle_delay_ms (1000; minimum time between replay frames, 0 disables)}.
  * Absent/null storage_root selects MEMORY, otherwise Rust namespaces the supplied root
- * by normalized host/project/instance and owns state/events. No legacy state import.
+ * by trimmed project token and instance and owns state/events. No legacy state import.
  * Core config/startup failures produce a disabled client; storage failures permit
  * memory fallback. Inspect phu_read(state) and drain outcomes, not the create status.
  * Creates native workers and performs local I/O: call off the game thread.

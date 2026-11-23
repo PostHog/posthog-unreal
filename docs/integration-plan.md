@@ -24,7 +24,7 @@ The dependency is package `posthog` at immutable revision `9cad3ee2a8a9313fbda2d
 | --- | --- |
 | Rust SDK | Identity/person/group transitions; registered properties; event assembly; consent; sessions; targeting/cache/exposure policy; remote config; state/event persistence; retries; replay eligibility, attribution, encoding and delivery |
 | C ABI | Bounded JSON, owned buffers, panic containment, opaque client/frame handles, callback lifetime accounting, polled flag mailbox and tracked shutdown |
-| `FPostHogClient` | Unreal value/status conversion, complete foreign-hook adaptation, strong native-lifetime registry, tracked asynchronous waits and manual frame leases |
+| `FPostHogClient` | Unreal value/status conversion, complete foreign-hook adaptation, strong native-lifetime registry, tracked asynchronous waits and the recorder's private frame leases |
 | `UPostHogSubsystem` | Game-instance ownership, editor/server guards, initialization cancellation, environment/PIE inputs, sampled context, engine signals, game-thread notification delivery and instance-bound Analytics adapter/binding lifetime |
 | `FPostHogAnalyticsProvider` / `PostHogAnalytics` | Explicit world/instance resolution and world-less designation, Unreal attribute conversion/default array and its merge under event attributes, host SessionStart/SessionEnd annotations and factory configuration validation |
 | Prepared-pixel caller | Safe acquisition, BGRA conversion/downscaling, any application-provided redaction and submission/abandonment |
@@ -57,7 +57,7 @@ Property objects retain their accepted decode/mutation byte bound across native 
 
 Flags are read from Rust. The mailbox is a one-slot coalescing presentation queue, not a cache. Notifications include enabled results and their producing context; all-results getters include known false. No C++ targeting generations or request-correlated futures are synthesized.
 
-The subsystem selects `Saved/PostHogStateful` and instance/environment inputs. Before initialization it obtains an opaque host/token/instance coordination key from Rust, using SDK endpoint normalization and trimmed host/token inputs. Equivalent inputs reject a second live engine owner or wait for a cancelled predecessor to finish. Rust owns fresh versioned records and namespace leases; direct native clients may use memory-only operation. Storage failures retain canonical Rust memory fallback.
+The subsystem selects `Saved/PostHogStateful` and instance/environment inputs. Before initialization it obtains an opaque token/instance coordination key from Rust, matching the Rust storage namespace, which ignores the host. Equivalent inputs reject a second live engine owner or wait for a cancelled predecessor to finish. Rust owns fresh versioned records and namespace leases; direct native clients may use memory-only operation. Storage failures retain canonical Rust memory fallback.
 
 ## Analytics and canonical migration
 
@@ -72,7 +72,7 @@ Failed flag handling also follows the canonical SDK, not the retired C++ cache. 
 1. Explicitly request recording with the SDK's manual start operation. A start while opted out is ignored. Remote settings load asynchronously; flush does not wait for them.
 2. Reserve an owned Rust acquisition immediately before capture using final dimensions/stride. Rust refuses a reservation sooner than `IntervalMs` (its `throttle_delay`) after the previous one with `Throttled`; other refusals, including not recording, are `Inactive`.
 3. Carry that token through host work; release it on every failure or cancellation path.
-4. Submit complete composited/downscaled BGRA8888 once. Automatic viewport content is unredacted; manual producers supply any required redaction.
+4. Submit complete composited/downscaled BGRA8888 once. Automatic viewport content is unredacted; games cannot submit their own frames, and masking is future SDK work.
 5. Rust validates attribution and consent/session transitions, encodes JPEG, runs hooks and delivers with retained attribution.
 
 A valid outstanding acquisition may complete after manual stop. Flush excludes host-held frames. Already submitted work can remain eligible after later consent changes. Replay storage is memory-only.

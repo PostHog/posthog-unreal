@@ -71,7 +71,7 @@ fn close(handle: u64) -> (Status, Option<Value>) {
     (status, value)
 }
 #[test]
-fn coordination_uses_sdk_host_equivalence_and_trimmed_tokens_without_initialization() {
+fn coordination_matches_sdk_storage_scope_without_initialization() {
     let key = |host: &str, token: &str, instance: &str| {
         let mut out = Buffer::empty();
         let input = json!({"host":host,"project_token":token,"instance_name":instance});
@@ -89,33 +89,16 @@ fn coordination_uses_sdk_host_equivalence_and_trimmed_tokens_without_initializat
     };
     let canonical = key(posthog_rs::DEFAULT_HOST, "phc_test", "owner");
     assert_eq!(canonical.len(), 40);
-    for host in [
-        "",
-        " \t",
-        "https://app.posthog.com",
-        "https://us.posthog.com/",
-        " \thttps://us.i.posthog.com///\n",
-    ] {
+    // posthog-rs storage ignores the host, so a host change must not escape coordination.
+    for host in ["", "https://eu.posthog.com", "http://127.0.0.1:9"] {
         assert_eq!(key(host, "\u{2003}phc_test \n", "owner"), canonical);
     }
-    assert_eq!(
-        key(" https://eu.posthog.com/// ", "phc_test", "owner"),
-        key("https://eu.i.posthog.com", "phc_test", "owner")
-    );
-    assert_eq!(
-        key(" http://127.0.0.1:9/// ", "phc_test", "owner"),
-        key("http://127.0.0.1:9", "phc_test", "owner")
-    );
     assert_ne!(
         key(posthog_rs::DEFAULT_HOST, "different", "owner"),
         canonical
     );
     assert_ne!(
         key(posthog_rs::DEFAULT_HOST, "phc_test", "different"),
-        canonical
-    );
-    assert_ne!(
-        key("https://eu.posthog.com", "phc_test", "owner"),
         canonical
     );
     let mut out = Buffer::empty();
@@ -422,4 +405,39 @@ fn flags_mailbox_owns_notifications_and_unsubscribes() {
     assert!(entry.subscription.lock().unwrap().is_none());
     assert!(mailbox.take().is_none());
     assert_eq!(update["flags"]["on"]["enabled"], true);
+}
+#[test]
+fn sdk_errors_and_warnings_reach_the_host_log() {
+    static LINES: std::sync::Mutex<Vec<(i32, String)>> = std::sync::Mutex::new(Vec::new());
+    unsafe extern "C" fn collect(_: *mut c_void, level: i32, message: Bytes) {
+        let text = unsafe { message.slice(abi::MAX_INPUT) }.unwrap();
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        LINES.lock().unwrap().push((level, text));
+    }
+    let logged = |needle: &str| {
+        LINES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(level, line)| *level == log::WARNING && line.contains(needle))
+    };
+    assert_eq!(
+        unsafe { phu_set_log(Some(collect), std::ptr::null_mut()) },
+        Status::Ok
+    );
+    // A posthog-rs tracing warning, and an on_error report from a disabled client.
+    let warned = create(json!({"host":"not a url"}), no_hooks());
+    let disabled = create(json!({"project_token":"phx_personal"}), no_hooks());
+    assert!(logged("invalid host"), "{:?}", LINES.lock().unwrap());
+    assert!(
+        logged("personal API key; supply a project token instead; client disabled"),
+        "{:?}",
+        LINES.lock().unwrap()
+    );
+    assert_eq!(
+        unsafe { phu_set_log(None, std::ptr::null_mut()) },
+        Status::Ok
+    );
+    close(warned);
+    close(disabled);
 }

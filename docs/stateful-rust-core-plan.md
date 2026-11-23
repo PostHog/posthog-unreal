@@ -23,7 +23,7 @@ The bridge is not a second SDK. It can own handles, buffers, borrowed foreign ca
 
 Manual producers and the automatic owning-viewport recorder reserve an opaque single-use acquisition before readback, carry it through bounded host work, then submit composited/downscaled BGRA8888 bytes or abandon it. Rust owns the raw lease, attribution checks, encoding and delivery.
 
-Automatic viewport pixels are unredacted, including readable UI. Applications must decide which content is appropriate to record; manual producers can apply redaction before submission. Rendered acceptance covers owning-surface isolation, orientation, pitch/formats, resize/window races, cancellation, bounded staging and teardown. It is not a privacy guarantee.
+Automatic viewport pixels are unredacted, including readable UI. Applications must decide which content is appropriate to record; masking is future SDK work, and games cannot submit their own frames. Rendered acceptance covers owning-surface isolation, orientation, pitch/formats, resize/window races, cancellation, bounded staging and teardown. It is not a privacy guarantee.
 
 ## Lifetime and shutdown
 

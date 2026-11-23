@@ -91,17 +91,7 @@ public:
             }
             // Remote replay settings load asynchronously; flush does not wait for them.
             if (!Subsystem->IsSessionReplayActive()) { return false; }
-            struct { int32 Width; int32 Height; int32 RowStrideBytes; UPostHogReplayFrame* Frame; EPostHogResult ReturnValue; } Params{32, 24, 128, nullptr, EPostHogResult::Closed};
-            Subsystem->ProcessEvent(Subsystem->FindFunctionChecked(TEXT("BeginReplayFrame")), &Params);
-            Test->TestEqual(TEXT("reflected owned acquisition"), Params.ReturnValue, EPostHogResult::Ok);
-            Frame.Reset(Params.Frame);
-            if (!Frame) { return true; }
-            struct { TArray<uint8> Pixels; EPostHogResult ReturnValue; } SubmitParams;
-            SubmitParams.Pixels.SetNumZeroed(128 * 24); // Deliberately fully masked synthetic image.
-            Frame->ProcessEvent(Frame->FindFunctionChecked(TEXT("Submit")), &SubmitParams);
-            Test->TestEqual(TEXT("reflected prepared pixels"), SubmitParams.ReturnValue, EPostHogResult::Accepted);
-            Test->TestEqual(TEXT("lease consumed"), Frame->Abandon(), EPostHogResult::Closed);
-            Frame.Reset(); Drain = Client->FlushAsync(); ++Phase; return false;
+            Drain = Client->FlushAsync(); ++Phase; return false;
         }
         case 4:
             if (!Drain.IsReady()) { return false; }
@@ -138,7 +128,6 @@ private:
     double Deadline;
     TStrongObjectPtr<UGameInstance> Instance;
     TStrongObjectPtr<UPostHogBlueprintProbe> Probe;
-    TStrongObjectPtr<UPostHogReplayFrame> Frame;
     FPostHogClient::FPtr Client;
     TSharedFuture<FPostHogDrainResult> Drain;
 };

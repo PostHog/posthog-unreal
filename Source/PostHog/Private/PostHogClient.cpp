@@ -422,6 +422,10 @@ EPostHogResult FPostHogClient::BeginReplayFrame(int32 Width, int32 Height, int32
     if (Status == PHU_OK) { OutFrame.Reset(new FPostHogReplayFrame(Frame, static_cast<int64>(RowStrideBytes) * Height, Impl)); }
     return PostHogNative::Result(Status);
 }
+#if WITH_DEV_AUTOMATION_TESTS
+EPostHogResult FPostHogClient::TryReplayFrameForTests(int32 Width, int32 Height)
+{ TUniquePtr<FPostHogReplayFrame> Frame; return BeginReplayFrame(Width, Height, Width * 4, Frame); }
+#endif
 FPostHogReplayFrame::~FPostHogReplayFrame() { Abandon(); }
 EPostHogResult FPostHogReplayFrame::Abandon()
 {

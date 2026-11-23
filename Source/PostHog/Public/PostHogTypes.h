@@ -54,9 +54,9 @@ USTRUCT(BlueprintType)
 struct POSTHOG_API FPostHogReplaySettings
 {
     GENERATED_BODY()
-    /** Minimum time between replay frames, enforced by Rust for automatic and manual frames
-     * (Throttled). Automatic owning-viewport capture polls no faster than 100 ms. 0 disables the
-     * Rust throttle for manual producers. Rust recording must be manually started. */
+    /** Minimum time between replay frames, enforced by Rust (Throttled). Owning-viewport capture
+     * polls no faster than 100 ms, so 0 disables only the Rust throttle. Rust recording must be
+     * manually started. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay", meta = (ClampMin = "0"))
     int32 IntervalMs = 1000;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Replay", meta = (ClampMin = "64"))

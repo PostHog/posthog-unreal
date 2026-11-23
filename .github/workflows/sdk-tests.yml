@@ -260,13 +260,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             library: libposthog_unreal_ffi.so
             editor: Engine/Binaries/Linux/UnrealEditor
-            engine_url: UE_LINUX_ARCHIVE_URL
             engine_sha: UE_LINUX_ARCHIVE_SHA256
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             library: posthog_unreal_ffi.dll
             editor: Engine/Binaries/Win64/UnrealEditor.exe
-            engine_url: UE_WINDOWS_ARCHIVE_URL
             engine_sha: UE_WINDOWS_ARCHIVE_SHA256
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -297,7 +295,8 @@ jobs:
       - name: Restore authorized UE 5.8 installed build
         if: inputs.unreal
         env:
-          CI_ARCHIVE_URL: ${{ secrets[matrix.engine_url] }}
+          # Name each secret: indexing `secrets` by a matrix value passes every secret to the runner.
+          CI_ARCHIVE_URL: ${{ runner.os == 'Linux' && secrets.UE_LINUX_ARCHIVE_URL || runner.os == 'Windows' && secrets.UE_WINDOWS_ARCHIVE_URL || '' }}
           CI_ARCHIVE_SHA256: ${{ vars[matrix.engine_sha] }}
         run: python scripts/restore-ci-archive.py "${{ env.UE_ROOT }}"
       - name: Install software-rendering prerequisites

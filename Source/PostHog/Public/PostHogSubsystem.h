@@ -3,7 +3,6 @@
 #include "Containers/Ticker.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "PostHogSettings.h"
-#include "PostHogReplayFrame.h"
 #include "PostHogSubsystem.generated.h"
 
 UENUM(BlueprintType)
@@ -66,9 +65,6 @@ public:
     EPostHogResult StopSessionReplay();
     UFUNCTION(BlueprintPure, Category = "PostHog|Session Replay")
     bool IsSessionReplayActive() const;
-    /** Reserve immediately before acquiring prepared pixels. Throttled: within Replay.IntervalMs of the previous frame; skip it and retry on a later frame. Inactive: any other refusal, including SDK capacity/policy. */
-    UFUNCTION(BlueprintCallable, Category = "PostHog|Session Replay")
-    EPostHogResult BeginReplayFrame(int32 Width, int32 Height, int32 RowStrideBytes, UPostHogReplayFrame*& Frame);
 
     /** Stable adapter for this initialized client. World lookup and binding are game-thread-only. */
     TSharedPtr<IAnalyticsProvider> GetAnalyticsProvider();
