@@ -49,7 +49,8 @@ def main():
         source_hash.update(str(path.relative_to(core)).replace("\\", "/").encode() + b"\0")
         source_hash.update(path.read_bytes() + b"\0")
     manifest = {
-        "abi_version": 3, "bridge_version": "0.0.1", "core_package": "posthog", "core_version": locked_core["version"],
+        "abi_version": 3, "bridge_version": next(p["version"] for p in metadata["packages"] if p["name"] == "posthog-unreal-ffi"),
+        "core_package": "posthog", "core_version": locked_core["version"],
         "core_source": source, "target": args.target,
         "core_base": core_base,
         "core_source_sha256": source_hash.hexdigest(),

@@ -1,0 +1,14 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "IJG",
+    "CDLA-Permissive-2.0",
+    "0BSD",
+    # The corresponding dependency sources are included in the plugin ZIP.
+    "MPL-2.0",
+]

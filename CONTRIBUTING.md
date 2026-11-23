@@ -32,6 +32,9 @@ For substantial changes, open an issue first to discuss the approach.
 3. Run the checks available for the affected code and explain how you tested it.
 4. Describe the motivation and link any related issues.
 5. Call out breaking changes and their migration path.
+6. Add a [Sampo changeset](docs/releasing.md#changesets-and-versioning) for user-visible changes.
+
+See [Releasing](docs/releasing.md) for version preparation and GitHub publication.
 
 Use a [Conventional Commits](https://www.conventionalcommits.org/) pull request
 title, such as `feat: add event capture` or `fix: preserve queued events`.

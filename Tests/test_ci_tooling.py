@@ -154,7 +154,10 @@ class BuildToolingTests(unittest.TestCase):
                 artifact.parent.mkdir(parents=True)
                 artifact.write_bytes(b"static library fixture")
                 environment = {"CARGO_TARGET_DIR": str(target_dir)}
-                metadata = json.dumps({"packages": [{"name": "posthog", "manifest_path": str(core / "Cargo.toml")}]})
+                metadata = json.dumps({"packages": [
+                    {"name": "posthog", "manifest_path": str(core / "Cargo.toml")},
+                    {"name": "posthog-unreal-ffi", "version": "0.2.3"},
+                ]})
                 with patch.object(build, "ROOT", root), patch.dict(os.environ, environment, clear=True), \
                         patch("sys.argv", ["build-native.py", target, "--test"]), \
                         patch.object(build.subprocess, "run") as run, \
@@ -181,6 +184,7 @@ class BuildToolingTests(unittest.TestCase):
                 self.assertEqual(manifest["lockfile_sha256"], hashlib.sha256((root / "rust/Cargo.lock").read_bytes()).hexdigest())
                 self.assertEqual(manifest["core_base"], "a" * 40)
                 self.assertEqual(manifest["abi_version"], 3)
+                self.assertEqual(manifest["bridge_version"], "0.2.3")
                 self.assertEqual(manifest["core_package"], "posthog")
                 self.assertEqual(manifest["core_source"], source)
                 self.assertEqual(manifest["core_features"], ["tls", "session-replay"])

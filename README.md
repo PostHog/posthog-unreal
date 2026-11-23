@@ -6,6 +6,12 @@ The plugin is a thin engine adapter over the pinned stateful Rust SDK. Rust owns
 
 See [status](#status), [architecture](docs/integration-plan.md) and [validation](docs/ci.md).
 
+## Releases
+
+[GitHub Releases](https://github.com/PostHog/posthog-unreal/releases) provide one versioned plugin ZIP bundling Mac arm64, Linux x64 and Windows x64 Rust static libraries with the Unreal C++ source. Copy `PostHog/` into your C++ project's `Plugins/` directory and rebuild with UE 5.8 for your platform. Unreal selects the matching library; Rust is not required for this installation. See the [release validation gates](docs/releasing.md#validation-gates) for platform/toolchain requirements.
+
+See [Releasing](docs/releasing.md) for checksums, versioning and distribution details. To develop the SDK or build other source targets, use the instructions below.
+
 ## Build
 
 The development target is UE 5.8 with macOS arm64, Windows x64 or Linux x64. Source builds need Rust, Python 3.11+ and the platform's Unreal toolchain. Cargo resolves the immutable SSH Git dependency in `rust/posthog-unreal-ffi/Cargo.toml`; configure read access to GitHub. No local Rust checkout is required.

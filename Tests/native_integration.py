@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import subprocess
+import tomllib
 import urllib.request
 from pathlib import Path
 import sys
@@ -114,8 +115,11 @@ class StatefulNativeTests(MockServerTestCase):
         cls.lib.phu_abi_version.restype = c.c_uint32
         if cls.lib.phu_abi_version() != 3:
             raise RuntimeError("Stateful integration requires ABI v3")
+        lock = tomllib.loads((Path(__file__).resolve().parents[1] / "rust/Cargo.lock").read_text())
+        bridge = next(package for package in lock["package"] if package["name"] == "posthog-unreal-ffi")
+        cls.sdk_version = bridge["version"]
         # The SDK names the configured library, not posthog-rs, in its transport header.
-        cls.transport_sdk_info = "posthog-unreal/0.0.1"
+        cls.transport_sdk_info = f"posthog-unreal/{cls.sdk_version}"
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -252,7 +256,7 @@ class StatefulNativeTests(MockServerTestCase):
 
     def assert_event_attribution(self, event):
         self.assertEqual(event["properties"]["$lib"], "posthog-unreal")
-        self.assertEqual(event["properties"]["$lib_version"], "0.0.1")
+        self.assertEqual(event["properties"]["$lib_version"], self.sdk_version)
 
     def wire(self, check_attribution=True):
         requests = self.http("/__captured/analytics_requests")
