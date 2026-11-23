@@ -116,7 +116,7 @@ python3 Tests/native_integration.py \
 
 After installing matching ABI-v3 artifacts and building the host, add `--editor "$UE_ROOT/Engine/Binaries/Mac/UnrealEditor-Cmd"` for C++/Blueprint automation.
 
-The current Rust pin passes 8 bridge tests, 27 tooling tests and the 19 standalone native driver tests. Its C++/Blueprint automation, rendered replay and packaged runs have not been run yet: they are pending a UE 5.8 reinstall. The previous pin passed all 13 engine tests and Metal replay in Development Editor and locally ad-hoc-signed packaged Development/Shipping. The retained example's full gameplay suite is not green. See [implementation status](docs/implementation-status.md) for known failures and remaining validation, and [CI documentation](docs/ci.md) for fixture commands and local signing steps.
+On UE 5.8 / macOS arm64 / Metal, the current Rust pin passes 8 bridge tests, 28 tooling tests, all 21 native driver tests including the 13 engine automation tests, Metal replay in Development Editor and locally ad-hoc-signed packaged Development/Shipping, and all five gameplay scenarios of the retained example. See [implementation status](docs/implementation-status.md) for known failures and remaining validation, and [CI documentation](docs/ci.md) for fixture commands and local signing steps.
 
 ## Contributing
 
