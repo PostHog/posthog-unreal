@@ -40,7 +40,7 @@ Tests use the maintained SDK mock server. Automatic pixels are unredacted. These
 
 ## Retained example and known failures
 
-The retained example's actual Editor link and Analytics automation pass, including defaults, stock Blueprint/Multicast, expired-session attribution and lifetime cases. Offline, normal and hard gameplay smoke each pass 34 checks. The full legacy gameplay gate is **not green**: the delayed case fails its first-run cached-flag expectation on both attempts, and the timeout case fails a low-obstacle jump after passing its flag/input checks. No pristine-base runtime comparison was run, so these are not established as pre-existing failures. These gameplay failures remain unresolved.
+The retained example's actual Editor link and Analytics automation pass, including defaults, stock Blueprint/Multicast, expired-session attribution and lifetime cases. All five gameplay scenarios (offline, normal, hard, delayed, timeout) pass 34 checks each on UE 5.8. Earlier delayed and timeout failures were harness issues: scenarios shared the example's saved SDK state (the flag cache is restored at startup), and the timeout case assumed the old fixed 3 s `/flags` timeout instead of the configured request timeout.
 
 At the previous pin, the Rust SDK's PR #360 CI was red on replay-policy lint and `analytics_deadline_applies_while_encoder_is_blocked` deadline/order cases. At the new pin `9cad3ee2`, PR #360 reports 59 passing checks and 1 skipped. At the previous pin, the standalone bridge release run also initially hit a timing-sensitive hook-close `Accepted` versus `Closed` assertion; an unchanged full rerun and ten targeted repeats pass. Passing reruns do not establish that the hook-close timing issue is fixed.
 
