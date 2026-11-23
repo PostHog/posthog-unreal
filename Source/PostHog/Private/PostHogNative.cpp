@@ -59,8 +59,9 @@ FPostHogDrainResult PostHogNative::Drain(phu_status Status, const FBuffer& Buffe
     };
     const TMap<FString, EPostHogDeliveryOutcome> Deliveries = {
         {TEXT("attempted"), EPostHogDeliveryOutcome::Attempted}, {TEXT("stopped"), EPostHogDeliveryOutcome::Stopped},
-        {TEXT("unavailable"), EPostHogDeliveryOutcome::Unavailable}, {TEXT("closed"), EPostHogDeliveryOutcome::Closed},
-        {TEXT("deferred"), EPostHogDeliveryOutcome::Deferred}, {TEXT("disabled"), EPostHogDeliveryOutcome::Disabled}
+        {TEXT("timed_out"), EPostHogDeliveryOutcome::TimedOut}, {TEXT("unavailable"), EPostHogDeliveryOutcome::Unavailable},
+        {TEXT("closed"), EPostHogDeliveryOutcome::Closed}, {TEXT("deferred"), EPostHogDeliveryOutcome::Deferred},
+        {TEXT("disabled"), EPostHogDeliveryOutcome::Disabled}
     };
     const auto* FoundState = States.Find(State); const auto* FoundDelivery = Deliveries.Find(Delivery);
     Out.State = FoundState ? *FoundState : EPostHogPersistenceOutcome::Unknown;

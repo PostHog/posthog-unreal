@@ -2,7 +2,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use chrono::NaiveDateTime;
 use posthog_rs::Event;
@@ -69,14 +69,49 @@ impl HookEvent {
     }
 }
 
-pub fn install(config: &mut posthog_rs::stateful::Config, hooks: Hooks, scope: Arc<CallbackScope>) {
+/// Set when the SDK drops the installed hook. After that no SDK thread can call the host.
+#[derive(Default)]
+pub struct Released {
+    done: Mutex<bool>,
+    changed: Condvar,
+}
+impl Released {
+    fn set(&self) {
+        *self.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.changed.notify_all();
+    }
+    pub fn wait(&self) {
+        let mut done = self.done.lock().unwrap_or_else(|p| p.into_inner());
+        while !*done {
+            done = self.changed.wait(done).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+struct Release(Arc<Released>);
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+
+pub fn install(
+    config: &mut posthog_rs::stateful::Config,
+    hooks: Hooks,
+    scope: Arc<CallbackScope>,
+) -> Arc<Released> {
+    let released = Arc::new(Released::default());
     let Some(callback) = hooks.before_send else {
-        return;
+        released.set();
+        return released;
     };
-    // The host promises this opaque address is thread-safe and remains valid until close joins.
+    // Core shutdown returns at its deadline while the replay encoder may still run this hook.
+    // The closure owns this guard, so `released` is set only once the SDK drops the hook.
+    let release = Release(released.clone());
+    // The host promises this opaque address is thread-safe and remains valid until close returns.
     // Capture the address as an integer so Rust never dereferences a foreign context pointer.
     let user_data = hooks.user_data as usize;
     config.before_send(move |event| {
+        let _owner = &release;
         let input = encode(&event, MAX_HOOK).ok()?;
         CALLBACKS.with(|keys| keys.borrow_mut().push(Arc::as_ptr(&scope) as usize));
         let _guard = Guard;
@@ -106,4 +141,5 @@ pub fn install(config: &mut posthog_rs::stateful::Config, hooks: Hooks, scope: A
         unsafe { out.free() };
         result
     });
+    released
 }

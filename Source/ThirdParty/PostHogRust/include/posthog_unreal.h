@@ -132,13 +132,13 @@ phu_status phu_read(phu_handle handle, phu_bytes query, phu_buffer* out_buffer);
  * This observes bootstrap/restored/automatic/manual loads, not request-correlated futures.
  * Data is the SDK's immutable callback snapshot, not proof of current targeting by
  * game-thread delivery time. Use core getters for current cached values. Close cancels
- * unread updates and explicitly unsubscribes; native worker joins finish running callbacks.
+ * unread updates and explicitly unsubscribes; close waits for running host callbacks.
  */
 phu_status phu_poll_flags(phu_handle handle, phu_buffer* out_update);
 
 /* Blocking local progress, never an ingestion receipt. JSON {state,delivery}:
  * state: persisted|memory_only|unavailable|write_failed|timed_out|deferred|disabled|not_requested
- * delivery: attempted|stopped|unavailable|closed|deferred|disabled
+ * delivery: attempted|stopped|timed_out|unavailable|closed|deferred|disabled
  * Future core variants map to "unknown". Flush includes earlier submitted encoding and
  * eligible replay delivery, not host-held frames or retry cooldown bypass.
  * Hook-origin flush requests work and reports deferred rather than waiting.
@@ -148,11 +148,13 @@ phu_status phu_flush(phu_handle handle, phu_buffer* out_report);
 /* Start closes bridge admission immediately, selects one shared best-effort budget,
  * abandons host-held frames, unsubscribes listeners and schedules tracked core shutdown.
  * Worker scheduling delay is deducted before entering core shutdown. Repeated start
- * does not extend the budget. No detached work; finish must join before module unload.
- * Existing I/O, callbacks and joins may exceed the budget. Start may return INTERNAL_ERROR
- * if thread creation fails; finish still performs cleanup synchronously.
- * Close starts shutdown if needed, waits admitted ABI calls, joins core work and releases
- * the handle. Concurrent finishers which already acquired the handle share completion.
+ * does not extend the budget. No SDK callback runs after finish returns OK; finish waits
+ * for a running hook even past the budget. Network requests already in flight may finish
+ * in the background (bounded by request_timeout); they touch no host memory.
+ * Start may return INTERNAL_ERROR if thread creation fails; finish still performs cleanup
+ * synchronously. Close starts shutdown if needed, waits admitted ABI calls, the
+ * deadline-bounded core shutdown and running hooks, then releases the handle. Concurrent
+ * finishers which already acquired the handle share completion.
  * Invalid/already-released handles return CLOSED (not proof another finisher completed).
  * From this client's hook, close starts shutdown and returns DEFERRED with no buffer:
  * return from the hook, then finish from another thread. DEFERRED is NOT unload-safe.

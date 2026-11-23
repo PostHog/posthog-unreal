@@ -8,12 +8,13 @@ use posthog_rs::stateful::{Client, DrainReport, FeatureFlagsSubscription, Replay
 
 use crate::abi::{Result, Status};
 use crate::flags::Mailbox;
-use crate::hooks::CallbackScope;
+use crate::hooks::{CallbackScope, Released};
 
 pub struct Entry {
     pub client: Arc<Client>,
     pub mailbox: Arc<Mailbox>,
     pub scope: Arc<CallbackScope>,
+    pub released: Arc<Released>,
     pub subscription: Mutex<Option<FeatureFlagsSubscription>>,
     pub timeout: Duration,
     calls: Mutex<Calls>,
@@ -83,6 +84,7 @@ impl Entry {
         client: Client,
         mailbox: Arc<Mailbox>,
         scope: Arc<CallbackScope>,
+        released: Arc<Released>,
         timeout: Duration,
     ) -> Self {
         let inbox = mailbox.clone();
@@ -91,6 +93,7 @@ impl Entry {
             client: Arc::new(client),
             mailbox,
             scope,
+            released,
             subscription: Mutex::new(Some(subscription)),
             timeout,
             calls: Mutex::new(Calls::default()),

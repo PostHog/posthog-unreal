@@ -27,7 +27,7 @@ enum class EPostHogPersistenceOutcome : uint8
 UENUM(BlueprintType)
 enum class EPostHogDeliveryOutcome : uint8
 {
-    Attempted, Stopped, Unavailable, Closed, Deferred, Disabled, Unknown
+    Attempted, Stopped, TimedOut, Unavailable, Closed, Deferred, Disabled, Unknown
 };
 
 /** Local progress only; no outcome acknowledges ingestion.
@@ -42,7 +42,8 @@ struct POSTHOG_API FPostHogDrainResult
     EPostHogPersistenceOutcome State = EPostHogPersistenceOutcome::NotRequested;
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     EPostHogDeliveryOutcome Delivery = EPostHogDeliveryOutcome::Closed;
-    /** True only after shutdown joined native workers and admitted host calls. */
+    /** True after close returned OK: admitted host calls finished and no SDK callback can run;
+     * in-flight network I/O may still complete in the background. */
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     bool bJoined = false;
 };

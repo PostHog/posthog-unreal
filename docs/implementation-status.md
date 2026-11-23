@@ -9,7 +9,7 @@ The plugin is in development and is not production-ready. Source targets UE 5.8 
 - Thin C++ delegation for identity, consent, registered/person/group properties, sessions and flags.
 - Native lifetime registry, callback-origin deferred close, host-call accounting and final module teardown, including joined initialization-owner retirement before engine event-pool teardown.
 - Game-instance setup/cancellation, namespace reuse, sampled engine context, environment/PIE isolation and game-thread flag notifications.
-- Default-on host lifecycle capture: Application Opened (`from_background=false` at foreground setup, `true` on return) and Application Backgrounded; deduplicated engine signals continue to drive sessions/replay when analytics are disabled.
+- Default-on host lifecycle capture: Application Opened (`from_background=false` at foreground setup, `true` on return) and Application Backgrounded; deduplicated engine signals continue to drive sessions/replay when analytics are disabled. Application Installed and Application Updated are not captured: Unreal has no reliable install or update signal, so this differs from the sdk-specs application-lifecycle spec and the iOS and Android SDKs on purpose.
 - Blueprint typed values, analytics/identity/consent, flag reads/reload, manual replay start/stop and owned prepared-pixel frame objects.
 - Automatic owning-viewport source: same-paint window association/cropping, two host staging permits, GPU readbacks, worker conversion/downscale and joined retirement; Rust still owns JPEG/envelope/delivery and manual stopped-by-default recording.
 - Instance-bound Unreal Analytics provider/factory, stock Analytics Blueprint and Multicast routing, adapter-merged default attributes (sent as event properties under each event's attributes) and SDK-session annotations. Custom Analytics session IDs are unsupported.
@@ -17,7 +17,7 @@ The plugin is in development and is not production-ready. Source targets UE 5.8 
 
 ## Current integration evidence
 
-The pin moved from `b717aef23d4869bdf94e75ce36bbd383d3575c6f` to `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`. At the new pin, eight Rust bridge tests, twenty-seven tooling tests and the nineteen standalone tests of the consolidated driver pass on macOS arm64 against the SDK mock server, with formatting and bridge Clippy clean. The C++ adapter changes for the new pin (Analytics default merge, `Throttled`, interval-as-throttle and asynchronous settings/flag waits in tests) have **not** been compiled or run: UHT, C++ compilation, the thirteen engine tests, the rendered fixture, packaged runs and the retained example all need a rerun on UE 5.8.
+The pin moved from `b717aef23d4869bdf94e75ce36bbd383d3575c6f` to `9cad3ee2a8a9313fbda2d9c0ad80db9e3e8ce812`. At the new pin, eight Rust bridge tests, twenty-eight tooling tests and the twenty standalone tests of the consolidated driver pass on macOS arm64 against the SDK mock server, with formatting and bridge Clippy clean. The C++ adapter changes for the new pin (Analytics default merge, `Throttled`, interval-as-throttle and asynchronous settings/flag waits in tests) have **not** been compiled or run: UHT, C++ compilation, the thirteen engine tests, the rendered fixture, packaged runs and the retained example all need a rerun on UE 5.8.
 
 Changes adopted from the new pin:
 

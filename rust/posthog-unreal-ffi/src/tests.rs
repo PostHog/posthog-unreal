@@ -398,6 +398,7 @@ fn flags_mailbox_owns_notifications_and_unsubscribes() {
         client,
         mailbox.clone(),
         Arc::new(hooks::CallbackScope),
+        Arc::default(),
         Duration::ZERO,
     );
     let bytes = mailbox.take().unwrap().unwrap();

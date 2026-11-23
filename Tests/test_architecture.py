@@ -1,6 +1,8 @@
 """Literal include boundaries for the thin adapter; UHT/compiler checks resolve engine/generated headers."""
+import json
 from pathlib import Path
 import re
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1] / "Source"
@@ -105,3 +107,9 @@ class ArchitectureTests(unittest.TestCase):
             validate({"Public/PostHogClient.h": '#include "PostHogSubsystem.h"',
                       "Public/PostHogSubsystem.h": '#include "PostHogClient.h"'})
         validate({"Public/PostHogClient.h": "", "Public/PostHogSubsystem.h": '#include "PostHogClient.h"'})
+
+    def test_plugin_and_bridge_versions_match(self):
+        # The bridge reports CARGO_PKG_VERSION as $lib_version for the shipped plugin.
+        plugin = json.loads((ROOT.parent / "PostHog.uplugin").read_text())["VersionName"]
+        bridge = tomllib.loads((ROOT.parent / "rust/posthog-unreal-ffi/Cargo.toml").read_text())["package"]["version"]
+        self.assertEqual(plugin, bridge)

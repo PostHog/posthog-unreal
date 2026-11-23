@@ -77,7 +77,7 @@ class MockServerTestCase(unittest.TestCase):
 
 
 OK, ACCEPTED, INVALID, CLOSED = 0, 1, 2, 3
-DISABLED, FULL, OPTED_OUT, DROPPED, REENTRANT, DEFERRED, INACTIVE, WRONG, STALE, THROTTLED = 7, 8, 10, 11, 12, 13, 14, 15, 16, 17
+DISABLED, OPTED_OUT, DROPPED, REENTRANT, DEFERRED, INACTIVE, WRONG, STALE, THROTTLED = 7, 10, 11, 12, 13, 14, 15, 16, 17
 HOOK = c.CFUNCTYPE(c.c_int32, c.c_void_p, Bytes, c.POINTER(Buffer))
 
 
@@ -643,6 +643,20 @@ class StatefulNativeTests(MockServerTestCase):
         self.assertEqual(self.submit(other, self.frame(other)), ACCEPTED)
         self.flush(other)
         self.assertEqual(self.http("/__captured/snapshots"), accepted_before_shutdown)
+
+    def test_close_waits_for_a_running_replay_hook(self):
+        entered, exited = threading.Event(), threading.Event()
+        def transform(event):
+            if event["event"] == "$snapshot":
+                entered.set(); time.sleep(0.5); exited.set()
+            return event
+        handle = self.replay(hook=self.hook(transform), shutdown_timeout_ms=50)
+        self.assertEqual(self.submit(handle, self.frame(handle)), ACCEPTED)
+        self.assertTrue(entered.wait(5))
+        status, report = self.close(handle)
+        self.assertEqual(status, OK)
+        self.assertTrue(exited.is_set(), "close returned while the encoder was inside before_send")
+        self.assertEqual(report["delivery"], "timed_out")
 
     def test_replay_remote_restrictions_and_manual_start(self):
         self.http("/__control/state", {"sampleRate": "0.5"})

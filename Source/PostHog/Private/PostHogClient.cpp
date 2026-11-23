@@ -225,21 +225,27 @@ TSharedFuture<FPostHogClient::FPtr> FPostHogClient::CreateAsync(FPostHogConfig C
         Options->SetBoolField(TEXT("preload_feature_flags"), Config.bPreloadFeatureFlags);
         Options->SetBoolField(TEXT("send_feature_flag_event"), Config.bSendFeatureFlagEvents);
         Options->SetObjectField(TEXT("platform_context"), Config.Context.ToNative());
-        Options->SetNumberField(TEXT("flush_at"), Config.FlushAt);
-        Options->SetNumberField(TEXT("flush_interval_ms"), Config.FlushIntervalMilliseconds);
-        Options->SetNumberField(TEXT("max_queue_size"), Config.MaxQueueSize);
-        Options->SetNumberField(TEXT("max_batch_size"), Config.MaxBatchSize);
-        Options->SetNumberField(TEXT("request_timeout_seconds"), Config.RequestTimeoutSeconds);
-        Options->SetNumberField(TEXT("shutdown_timeout_ms"), Config.ShutdownTimeoutMilliseconds);
-        Options->SetNumberField(TEXT("jpeg_quality"), Config.Replay.JpegQuality);
-        Options->SetNumberField(TEXT("max_frames_in_flight"), Config.Replay.MaxFramesInFlight);
+        // Clamp out-of-range values (ClampMin bypassed by C++ or edited ini) instead of failing creation.
+        Options->SetNumberField(TEXT("flush_at"), FMath::Max(0, Config.FlushAt));
+        Options->SetNumberField(TEXT("flush_interval_ms"), FMath::Max(0, Config.FlushIntervalMilliseconds));
+        Options->SetNumberField(TEXT("max_queue_size"), FMath::Max(0, Config.MaxQueueSize));
+        Options->SetNumberField(TEXT("max_batch_size"), FMath::Max(0, Config.MaxBatchSize));
+        Options->SetNumberField(TEXT("request_timeout_seconds"), FMath::Max(0, Config.RequestTimeoutSeconds));
+        Options->SetNumberField(TEXT("shutdown_timeout_ms"), FMath::Max(0, Config.ShutdownTimeoutMilliseconds));
+        Options->SetNumberField(TEXT("jpeg_quality"), FMath::Clamp(Config.Replay.JpegQuality, 1, 100));
+        Options->SetNumberField(TEXT("max_frames_in_flight"), FMath::Max(0, Config.Replay.MaxFramesInFlight));
         // The replay interval is Rust's minimum time between frames for every producer of this client.
         Options->SetNumberField(TEXT("throttle_delay_ms"), FMath::Max(0, Config.Replay.IntervalMs));
         const FString Json = PostHogJson::Encode(Options);
         if (!PostHogJson::IsBounded(Json)) { return nullptr; }
         const FTCHARToUTF8 Utf8(*Json);
         const phu_hooks Hooks{State->BeforeSend ? &FImpl::Hook : nullptr, &State.Get()};
-        if (phu_create(PHU_ABI_VERSION, PostHogNative::View(Utf8), Hooks, &State->Handle) != PHU_OK) { return nullptr; }
+        const phu_status Status = phu_create(PHU_ABI_VERSION, PostHogNative::View(Utf8), Hooks, &State->Handle);
+        if (Status != PHU_OK)
+        {
+            UE_LOG(LogPostHogClient, Error, TEXT("PostHog native client creation failed (status %d)."), static_cast<int32>(Status));
+            return nullptr;
+        }
         bool bStop;
         { FScopeLock Lock(&ClientsMutex); bStop = bStopping; Clients.Add(State); }
         if (bStop)
@@ -279,8 +285,8 @@ EPostHogResult FPostHogClient::CaptureWithFallback(const FString& Name, const FP
     if (!Properties.IsValid() || !Fallback.IsValid()) { return EPostHogResult::InvalidInput; }
     // Per-event properties win over fallbacks; the merged keys are ordinary event properties,
     // so Rust registered/platform/SDK properties fill only keys neither layer sets.
-    const auto Merged = Fallback.ToNative(); const auto Event = Properties.ToNative();
-    for (const auto& Pair : Event->Values) { Merged->SetField(Pair.Key, Pair.Value); }
+    const auto Merged = Fallback.ToNative();
+    PostHogJson::Merge(*Merged, *Properties.ToNative());
     return Capture(Name, FPostHogProperties::FromNative(Merged, PHU_MAX_INPUT), Options);
 }
 EPostHogResult FPostHogClient::Screen(const FString& Name, const FPostHogProperties& Properties)

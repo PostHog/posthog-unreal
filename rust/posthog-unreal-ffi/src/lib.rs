@@ -190,12 +190,13 @@ pub unsafe extern "C" fn phu_create(
         let mut config = options.config();
         let timeout = config.shutdown_timeout.min(Duration::from_secs(86400));
         let scope = Arc::new(hooks::CallbackScope);
-        hooks::install(&mut config, hooks, scope.clone());
+        let released = hooks::install(&mut config, hooks, scope.clone());
         let mailbox = Arc::new(flags::Mailbox::default());
         let entry = Arc::new(handles::Entry::new(
             stateful::Client::init_blocking(config),
             mailbox,
             scope,
+            released,
             timeout,
         ));
         let id = {
@@ -527,6 +528,7 @@ fn drain(report: DrainReport) -> Value {
     let delivery = match report.delivery {
         D::Attempted => "attempted",
         D::Stopped => "stopped",
+        D::TimedOut => "timed_out",
         D::Unavailable => "unavailable",
         D::Closed => "closed",
         D::Deferred => "deferred",
@@ -567,13 +569,18 @@ pub unsafe extern "C" fn phu_close(handle: u64, out: *mut Buffer) -> Status {
         }
         let entry = handles::begin(handle)?;
         let report = entry.finish()?;
-        // Core joins and admitted ABI calls have finished. Release the registry's ownership.
+        // Core shutdown and admitted ABI calls have finished. Release the registry's ownership.
         let removed = handles::registry()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clients
             .remove(&handle);
         drop(removed);
+        // Drop this finisher's client reference, then wait until the SDK drops the hook:
+        // a screenshot hook can still run on the encoder after the shutdown deadline.
+        let released = entry.released.clone();
+        drop(entry);
+        released.wait();
         unsafe {
             output(out, &drain(report))?;
         }
