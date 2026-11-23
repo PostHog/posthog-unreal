@@ -53,6 +53,18 @@ void phu_buffer_free(phu_buffer buffer);
 typedef phu_status (*phu_before_send)(void* user_data, phu_bytes event, phu_buffer* out_event);
 typedef struct phu_hooks { phu_before_send before_send; void* user_data; } phu_hooks;
 
+/* Process-wide diagnostics: posthog-rs warnings/errors and every client's SDK error reports
+ * (delivery, flags, storage, initialization, remote config, replay), one sanitized UTF-8 line
+ * each, without tokens, distinct IDs or response bodies. Runs on any SDK or caller thread,
+ * possibly concurrently. Never capture from it. Setting from the callback returns REENTRANT.
+ * NULL clears. Setting waits for running callbacks, so the previous callback and user_data
+ * must stay valid until a later set returns. If another tracing subscriber is already the
+ * process default, only SDK error reports are forwarded.
+ */
+enum { PHU_LOG_WARNING = 1, PHU_LOG_ERROR = 2 };
+typedef void (*phu_log)(void* user_data, int32_t level, phu_bytes message);
+phu_status phu_set_log(phu_log callback, void* user_data);
+
 /* Pure pre-initialization ownership key; no client, filesystem or network access.
  * Input: {project_token, host?, instance_name?}, using the create defaults.
  * Uses the trimmed token and the instance name, as Rust storage does; host is ignored.

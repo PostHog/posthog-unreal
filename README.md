@@ -22,7 +22,7 @@ The native builder installs a static library and provenance manifest under `Sour
 
 ## Game-instance setup
 
-Configure **Project Settings → Plugins → PostHog**, or disable automatic setup and call **Setup** on the **PostHog Game Instance Subsystem**. Bind **On Setup Completed** before starting. Setup's boolean means initialization was accepted; completion means a native instance exists. Inspect **Is Disabled** separately: the Rust SDK can initialize disabled after invalid configuration or local startup failure. Readiness does not wait for network access.
+Configure **Project Settings → Plugins → PostHog**, or disable automatic setup and call **Setup** on the **PostHog Game Instance Subsystem**. Bind **On Setup Completed** before starting. Setup's boolean means initialization was accepted; completion means a native instance exists. Inspect **Is Disabled** separately: the Rust SDK can initialize disabled after invalid configuration or local startup failure. Readiness does not wait for network access. The SDK's warnings and errors, including why a client was disabled and failed deliveries or storage writes, appear in the Output Log under `LogPostHog`.
 
 Editor/PIE and dedicated-server setup require explicit opt-in. Runtime options do not inherit credentials from Project Settings. Keep credentials out of source-controlled configuration.
 

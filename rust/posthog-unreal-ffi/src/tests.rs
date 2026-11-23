@@ -406,3 +406,38 @@ fn flags_mailbox_owns_notifications_and_unsubscribes() {
     assert!(mailbox.take().is_none());
     assert_eq!(update["flags"]["on"]["enabled"], true);
 }
+#[test]
+fn sdk_errors_and_warnings_reach_the_host_log() {
+    static LINES: std::sync::Mutex<Vec<(i32, String)>> = std::sync::Mutex::new(Vec::new());
+    unsafe extern "C" fn collect(_: *mut c_void, level: i32, message: Bytes) {
+        let text = unsafe { message.slice(abi::MAX_INPUT) }.unwrap();
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        LINES.lock().unwrap().push((level, text));
+    }
+    let logged = |needle: &str| {
+        LINES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(level, line)| *level == log::WARNING && line.contains(needle))
+    };
+    assert_eq!(
+        unsafe { phu_set_log(Some(collect), std::ptr::null_mut()) },
+        Status::Ok
+    );
+    // A posthog-rs tracing warning, and an on_error report from a disabled client.
+    let warned = create(json!({"host":"not a url"}), no_hooks());
+    let disabled = create(json!({"project_token":"phx_personal"}), no_hooks());
+    assert!(logged("invalid host"), "{:?}", LINES.lock().unwrap());
+    assert!(
+        logged("personal API key; supply a project token instead; client disabled"),
+        "{:?}",
+        LINES.lock().unwrap()
+    );
+    assert_eq!(
+        unsafe { phu_set_log(None, std::ptr::null_mut()) },
+        Status::Ok
+    );
+    close(warned);
+    close(disabled);
+}
