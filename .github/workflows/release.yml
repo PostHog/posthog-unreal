@@ -280,6 +280,16 @@ jobs:
           set -euo pipefail
           python scripts/package-plugin.py check-version --tag "${GITHUB_REF_NAME}"
           test "$VERSION" = "${GITHUB_REF_NAME}"
+          tag_info=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '"\(.object.type) \(.object.sha)"')
+          read -r tag_type tag_sha <<<"$tag_info"
+          while [[ "$tag_type" == "tag" ]]; do
+            tag_info=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '"\(.object.type) \(.object.sha)"')
+            read -r tag_type tag_sha <<<"$tag_info"
+          done
+          if [[ "$tag_type" != "commit" || "$tag_sha" != "${GITHUB_SHA}" ]]; then
+            echo "Refusing to publish: remote tag ${GITHUB_REF_NAME} resolves to ${tag_type} ${tag_sha}, expected commit ${GITHUB_SHA}" >&2
+            exit 1
+          fi
           compare_status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq '.status')
           if [[ "$compare_status" != "identical" && "$compare_status" != "behind" ]]; then
             echo "Refusing to publish tag ${GITHUB_REF_NAME} (${GITHUB_SHA}): not on main (status=${compare_status})" >&2
