@@ -1,0 +1,298 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    name: Build & stage (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    # Build inside AlmaLinux 8 (glibc 2.28) to match Unreal Engine 5.8's Linux sysroot.
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:55a36963bc0504cdf004011001c1072306402f0b8b83be5a5eba7068f93eec53
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust toolchain, Python, and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y cmake
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt,clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          test -x /opt/python/cp313-cp313/bin/python
+          echo "/opt/python/cp313-cp313/bin" >> "$GITHUB_PATH"
+
+      - name: Verify SDK version declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            python scripts/package-plugin.py check-version --tag "${GITHUB_REF_NAME}"
+          else
+            python scripts/package-plugin.py check-version
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Build and test native library
+        run: python scripts/build-native.py x86_64-unknown-linux-gnu --test
+
+      - name: Verify static library link and glibc 2.28 compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat <<'EOF' > "$RUNNER_TEMP/smoke.c"
+          #include "posthog_stateful.h"
+          int main(void) {
+            PostHogStatefulConfig *cfg = posthog_stateful_config_new("phc_release");
+            if (!cfg) { return 1; }
+            if (posthog_stateful_config_set_disabled(cfg, true) != POSTHOG_STATUS_OK) { return 2; }
+            PostHogStatefulClient *client = posthog_stateful_client_new(cfg);
+            posthog_stateful_config_free(cfg);
+            if (!client || !posthog_stateful_is_disabled(client)) { return 3; }
+            posthog_stateful_client_free(client);
+            return 0;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -ISource/ThirdParty/PostHogRust/include \
+            "$RUNNER_TEMP/smoke.c" \
+            Source/ThirdParty/PostHogRust/lib/x86_64-unknown-linux-gnu/libposthog_stateful_ffi.a \
+            -lgcc_s -lutil -lrt -lpthread -lm -ldl -o "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke"
+          archive_syms=$(readelf -sW Source/ThirdParty/PostHogRust/lib/x86_64-unknown-linux-gnu/libposthog_stateful_ffi.a)
+          dyn_syms=$(readelf --dyn-syms -W "$RUNNER_TEMP/smoke")
+          if grep -E '__isoc23_|GLIBC_([3-9]|2\.(29|[3-9][0-9]))' <<<"$archive_syms"$'\n'"$dyn_syms"; then
+            echo "Found symbols newer than glibc 2.28" >&2
+            exit 1
+          fi
+
+      - name: Install license notice generator
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-about@0.9.3
+          fallback: none
+
+      - name: Generate third-party notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/notices
+          cargo about generate \
+            --config rust/about.toml \
+            --manifest-path rust/Cargo.toml \
+            --locked --fail \
+            --target x86_64-unknown-linux-gnu \
+            scripts/third-party-notices.hbs \
+            --output-file artifacts/notices/THIRD_PARTY_NOTICES.txt
+
+      - name: Stage native library and notices
+        run: >-
+          python scripts/package-plugin.py stage x86_64-unknown-linux-gnu
+          --notices artifacts/notices/THIRD_PARTY_NOTICES.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-x86_64-unknown-linux-gnu
+          path: artifacts/native/x86_64-unknown-linux-gnu
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  build-native:
+    name: Build & stage (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify SDK version declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            python scripts/package-plugin.py check-version --tag "${GITHUB_REF_NAME}"
+          else
+            python scripts/package-plugin.py check-version
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Build and test native library
+        run: python scripts/build-native.py ${{ matrix.target }} --test
+
+      - name: Install license notice generator
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-about@0.9.3
+          fallback: none
+
+      - name: Generate third-party notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/notices
+          cargo about generate \
+            --config rust/about.toml \
+            --manifest-path rust/Cargo.toml \
+            --locked --fail \
+            --target "${{ matrix.target }}" \
+            scripts/third-party-notices.hbs \
+            --output-file artifacts/notices/THIRD_PARTY_NOTICES.txt
+
+      - name: Stage native library and notices
+        run: >-
+          python scripts/package-plugin.py stage ${{ matrix.target }}
+          --notices artifacts/notices/THIRD_PARTY_NOTICES.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-${{ matrix.target }}
+          path: artifacts/native/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  package:
+    name: Assemble drop-in plugin ZIP
+    needs: [build-linux, build-native]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pack.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: native-*
+          path: artifacts/native
+
+      - name: Normalize downloaded target directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for dir in artifacts/native/native-*; do
+            target="${dir#artifacts/native/native-}"
+            mv "$dir" "artifacts/native/$target"
+          done
+
+      - name: Run packaging unit tests
+        run: python -m unittest discover -s Tests -p 'test_package_plugin.py'
+
+      - name: Package drop-in plugin ZIP
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python scripts/package-plugin.py check-version)
+          python scripts/package-plugin.py package --native artifacts/native --output artifacts/releases
+          (cd artifacts/releases && sha256sum --check SHA256SUMS)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "## PostHog Unreal SDK $version"
+            echo '```'
+            cat artifacts/releases/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: posthog-unreal-plugin
+          path: |
+            artifacts/releases/posthog-unreal-*.zip
+            artifacts/releases/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    if: github.repository == 'PostHog/posthog-unreal' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: posthog-unreal-plugin
+          path: artifacts/releases
+
+      - name: Verify tag, main ancestry, and checksums and create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.package.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/package-plugin.py check-version --tag "${GITHUB_REF_NAME}"
+          test "$VERSION" = "${GITHUB_REF_NAME}"
+          compare_status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq '.status')
+          if [[ "$compare_status" != "identical" && "$compare_status" != "behind" ]]; then
+            echo "Refusing to publish tag ${GITHUB_REF_NAME} (${GITHUB_SHA}): not on main (status=${compare_status})" >&2
+            exit 1
+          fi
+          cd artifacts/releases
+          sha256sum --check SHA256SUMS
+          flags=(--verify-tag --generate-notes)
+          if [[ "$VERSION" == 0.* || "$VERSION" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$VERSION" "posthog-unreal-${VERSION}.zip" SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PostHog Unreal $VERSION" \
+            --notes "Drop-in Unreal Engine 5.8 plugin for C++ projects. Download \`posthog-unreal-${VERSION}.zip\` below (not the GitHub source archive) and copy its \`PostHog/\` folder into your project's \`Plugins/\` directory. Prebuilt static libraries for macOS arm64, Linux x64, and Windows x64 are bundled — no Rust toolchain is required." \
+            "${flags[@]}"
