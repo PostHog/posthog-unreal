@@ -1,16 +1,10 @@
 #pragma once
-
 #include "CoreMinimal.h"
 #include "PostHogProperties.h"
+#include "PostHogTypes.h"
 #include "PostHogFeatureFlags.generated.h"
 
-UENUM(BlueprintType)
-enum class EPostHogFlagReloadStatus : uint8
-{
-    Failed, Success, Partial, QuotaLimited, Disabled, Closed, Stale
-};
-
-/** Missing flags differ from known false flags; JSON null payloads remain present. */
+/** Single feature-flag lookup result. Missing differs from known false; null payloads stay present. */
 USTRUCT(BlueprintType)
 struct POSTHOG_API FPostHogFeatureFlagResult
 {
@@ -18,32 +12,60 @@ struct POSTHOG_API FPostHogFeatureFlagResult
 
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     bool bFound = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bEnabled = false;
+
+    /** Boolean or variant string. */
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     FPostHogValue Value;
+
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     bool bHasPayload = false;
+
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
     FPostHogValue Payload;
-    /** Evaluation metadata from the response that supplied this flag. */
+
+    /** Complete SDK evaluation record (including context and metadata). */
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    FPostHogProperties Metadata;
+    FPostHogProperties Record;
 };
 
 USTRUCT(BlueprintType)
-struct POSTHOG_API FPostHogFlagReloadResult
+struct POSTHOG_API FPostHogFeatureFlags
 {
     GENERATED_BODY()
 
     UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    EPostHogFlagReloadStatus Status = EPostHogFlagReloadStatus::Failed;
-    /** Cache is usable in memory even when its optional disk snapshot cannot fit. */
-    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    bool bPersisted = false;
-    /** Completion-time values, including known false. Failures retain only
-     * values for the same context; disabled/closed/stale results are empty. */
-    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
-    FPostHogProperties Flags;
+    bool bAvailable = false;
 
-    /** Native context stamp used to reject stale deferred notifications. */
-    uint64 ContextGeneration = 0;
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    TMap<FString, FPostHogFeatureFlagResult> Flags;
+};
+
+/** Snapshot delivered when feature flags are restored, bootstrapped, or loaded remotely. */
+USTRUCT(BlueprintType)
+struct POSTHOG_API FPostHogFeatureFlagsUpdate
+{
+    GENERATED_BODY()
+
+    /** Enabled cached flags only; call GetFeatureFlag or GetFeatureFlags to inspect known-disabled flags. */
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    FPostHogFeatureFlags Snapshot;
+
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    FPostHogProperties Context;
+
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bErrorsLoading = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bPartial = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    bool bInvalidPayloads = false;
+
+    /** JSON null or `{kind, status?}` load error. */
+    UPROPERTY(BlueprintReadOnly, Category = "PostHog")
+    FPostHogValue Error;
 };

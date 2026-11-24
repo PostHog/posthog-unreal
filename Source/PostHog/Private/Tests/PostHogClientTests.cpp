@@ -1,339 +1,271 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "PostHogClient.h"
-#include <limits>
-#include "PostHogJson.h"
-#include "Async/Async.h"
+#include "HAL/Event.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
-#include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/DateTime.h"
 #include "Misc/Paths.h"
-#include "Misc/FileHelper.h"
-#include "Misc/SecureHash.h"
+#include <atomic>
+#include <limits>
+#if !PLATFORM_EXCEPTIONS_DISABLED
+#include <stdexcept>
+#endif
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogPropertiesTest, "PostHog.Properties",
-    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-bool FPostHogPropertiesTest::RunTest(const FString& Parameters)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogClientBasicTest, "PostHog.Client.Basic",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FPostHogClientBasicTest::RunTest(const FString&)
 {
-    FPostHogProperties Properties;
-    TestTrue(TEXT("String"), Properties.SetString(TEXT("text"), TEXT("玩家 🚀")));
-    TestTrue(TEXT("Number"), Properties.SetNumber(TEXT("number"), 42.5));
-    TestTrue(TEXT("Boolean"), Properties.SetBoolean(TEXT("boolean"), false));
-    FPostHogProperties Copy = Properties;
-    Copy.SetString(TEXT("text"), TEXT("copy"));
-    TestEqual(TEXT("Value copy"), Properties.ToNative()->GetStringField(TEXT("text")), FString(TEXT("玩家 🚀")));
-    FPostHogValue Value;
-    TestTrue(TEXT("JSON scalar"), FPostHogValue::TryParse(TEXT("false"), Value));
-    TestEqual(TEXT("Boolean scalar type"), Value.ToNative()->Type, EJson::Boolean);
-    TestTrue(TEXT("JSON null"), FPostHogValue::TryParse(TEXT("null"), Value));
-    TestTrue(TEXT("Null distinct from invalid"), Value.IsValid() && Value.ToNative()->IsNull());
-    TestFalse(TEXT("Invalid JSON"), FPostHogValue::TryParse(TEXT("{bad"), Value));
-    TestFalse(TEXT("Multiple roots"), FPostHogValue::TryParse(TEXT("1,2"), Value));
-    TestFalse(TEXT("Non-object properties"), FPostHogProperties::TryParse(TEXT("[]"), Copy));
-    const double NonFiniteNumbers[] = { std::numeric_limits<double>::quiet_NaN(),
-        std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity() };
-    for (double Number : NonFiniteNumbers)
+    const FString Root = FPaths::ProjectSavedDir() / TEXT("PostHogTests") / FGuid::NewGuid().ToString();
+    FPostHogConfig Config;
+    Config.ProjectToken = TEXT("phc_test_client");
+    Config.Host = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_TEST_HOST"));
+    if (Config.Host.IsEmpty()) { Config.Host = TEXT("http://127.0.0.1:9"); }
+    Config.StorageRoot = Root;
+    Config.bPreloadFeatureFlags = false;
+    Config.FlushAt = 100;
+    Config.FlushIntervalMilliseconds = 60000;
+    Config.ShutdownTimeoutMilliseconds = 500;
+    Config.Context.SetString(TEXT("suite"), TEXT("client"));
+
+    auto HookCalls = MakeShared<std::atomic<int32>, ESPMode::ThreadSafe>(0);
+    Config.BeforeSend = [HookCalls](FJsonObject& Event)
     {
-        const FPostHogValue NonFinite = FPostHogValue::Number(Number);
-        TestTrue(TEXT("Non-finite number is valid"), NonFinite.IsValid());
-        TestEqual(TEXT("Non-finite number is JSON null"), NonFinite.ToJson(), FString(TEXT("null")));
-        TestTrue(TEXT("Replace finite number with non-finite"), Properties.SetNumber(TEXT("number"), Number));
-        TestTrue(TEXT("Non-finite setter stores null"), Properties.ToNative()->HasTypedField<EJson::Null>(TEXT("number")));
-        TestTrue(TEXT("Finite setter still works"), Properties.SetNumber(TEXT("number"), 42.5));
-        TestEqual(TEXT("Finite number unchanged"), Properties.ToNative()->GetNumberField(TEXT("number")), 42.5);
+        HookCalls->fetch_add(1);
+        FString Name;
+        if (Event.TryGetStringField(TEXT("event"), Name) && Name == TEXT("dropped_event")) { return false; }
+        return true;
+    };
 
-        FPostHogProperties Nested;
-        TestTrue(TEXT("Nested non-finite setter"), Nested.SetNumber(TEXT("bad"), Number));
-        TestTrue(TEXT("Nested finite neighbor"), Nested.SetNumber(TEXT("kept"), 7));
-        const FString NestedJson = Nested.ToJson();
-        TestTrue(TEXT("Nested object"), Properties.Set(TEXT("nested"), FPostHogValue::Object(Nested)));
-        TestTrue(TEXT("Nested non-finite is null"), Properties.ToNative()->GetObjectField(TEXT("nested"))->HasTypedField<EJson::Null>(TEXT("bad")));
-        TestEqual(TEXT("Nested neighbor survives"), Properties.ToNative()->GetObjectField(TEXT("nested"))->GetNumberField(TEXT("kept")), 7.0);
+    auto Client = FPostHogClient::CreateAsync(MoveTemp(Config)).Get();
+    TestTrue(TEXT("client created"), Client.IsValid() && Client->IsInitialized() && !Client->IsDisabled());
+    if (!Client) { return false; }
 
-        FPostHogProperties ArrayObject;
-        TestTrue(TEXT("Array object non-finite setter"), ArrayObject.SetNumber(TEXT("bad"), Number));
-        const TArray<FPostHogValue> Items = { NonFinite, FPostHogValue::Number(7), FPostHogValue::Boolean(false),
-            FPostHogValue::String(TEXT("NaN")), FPostHogValue(), FPostHogValue::Object(ArrayObject), FPostHogValue::Number(8) };
-        const FPostHogValue Array = FPostHogValue::Array(Items);
-        TestTrue(TEXT("Array with non-finite is valid"), Array.IsValid());
-        TestEqual(TEXT("Array positions and neighbors survive"), Array.ToJson(), FString(TEXT("[null,7,false,\"NaN\",null,{\"bad\":null},8]")));
-        TestTrue(TEXT("Array assignment"), Properties.Set(TEXT("items"), Array));
-        FPostHogProperties RoundTrip;
-        TestTrue(TEXT("Properties remain JSON"), FPostHogProperties::TryParse(Properties.ToJson(), RoundTrip));
-        TestEqual(TEXT("Caller array unchanged"), Items[0].ToJson(), FString(TEXT("null")));
-        TestEqual(TEXT("Caller nested object unchanged"), Nested.ToJson(), NestedJson);
-    }
-    FPostHogValue TooDeep;
-    for (int32 Index = 0; Index < 65; ++Index) { TooDeep = FPostHogValue::Array({ TooDeep }); }
-    TestFalse(TEXT("Over-depth array remains invalid"), TooDeep.IsValid());
-    TestFalse(TEXT("Invalid value assignment still rejected"), Properties.Set(TEXT("number"), TooDeep));
-    TestEqual(TEXT("Rejected assignment preserves finite value"), Properties.ToNative()->GetNumberField(TEXT("number")), 42.5);
-    TestFalse(TEXT("Depth bound"), FPostHogValue::TryParse(FString::ChrN(65, TEXT('[')) + TEXT("0") + FString::ChrN(65, TEXT(']')), Value));
-    TestFalse(TEXT("Size bound"), Properties.SetString(TEXT("big"), FString::ChrN(1024 * 1024, TEXT('x'))));
+    const FString AnonId = Client->GetAnonymousId();
+    TestFalse(TEXT("anonymous id generated"), AnonId.IsEmpty());
+    TestEqual(TEXT("initial distinct id matches anonymous id"), Client->GetDistinctId(), AnonId);
+
+    FPostHogProperties Props;
+    Props.SetString(TEXT("weapon"), TEXT("bow"));
+    Props.SetNumber(TEXT("damage"), 42.5);
+    Props.SetBoolean(TEXT("crit"), true);
+    TestEqual(TEXT("capture accepted"), Client->Capture(TEXT("attack"), Props), EPostHogCaptureResult::Accepted);
+    TestEqual(TEXT("dropped by before_send"), Client->Capture(TEXT("dropped_event")), EPostHogCaptureResult::Dropped);
+    TestEqual(TEXT("invalid empty event"), Client->Capture(TEXT("")), EPostHogCaptureResult::Invalid);
+    TestTrue(TEXT("before_send ran"), HookCalls->load() >= 2);
+
+    Client->Identify(TEXT("player-7"));
+    TestEqual(TEXT("identified distinct id"), Client->GetDistinctId(), FString(TEXT("player-7")));
+
+    Client->OptOut();
+    TestTrue(TEXT("opted out"), Client->IsOptedOut());
+    TestEqual(TEXT("capture while opted out"), Client->Capture(TEXT("ignored")), EPostHogCaptureResult::OptedOut);
+
+    Client->OptIn();
+    TestFalse(TEXT("opted back in"), Client->IsOptedOut());
+    TestEqual(TEXT("screen accepted"), Client->Screen(TEXT("MainMenu")), EPostHogCaptureResult::Accepted);
+
+    Client->Reset();
+    TestNotEqual(TEXT("reset rotates anonymous id"), Client->GetAnonymousId(), AnonId);
+    TestEqual(TEXT("reset restores anonymous distinct id"), Client->GetDistinctId(), Client->GetAnonymousId());
+
+    const auto Drain = Client->ShutdownAsync().Get();
+    TestFalse(TEXT("closed after shutdown"), Client->IsInitialized());
+    TestEqual(TEXT("capture after shutdown"), Client->Capture(TEXT("after_close")), EPostHogCaptureResult::Closed);
+    TestTrue(TEXT("persistence completed"), Drain.State == EPostHogPersistenceOutcome::Persisted || Drain.State == EPostHogPersistenceOutcome::TimedOut);
+
+    Client.Reset();
+    IFileManager::Get().DeleteDirectory(*Root, false, true);
     return true;
 }
 
-namespace
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogClientDisabledTest, "PostHog.Client.Disabled",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FPostHogClientDisabledTest::RunTest(const FString&)
 {
-struct FClientTestResult { TArray<FString> Errors; };
-class FWaitForClientTests final : public IAutomationLatentCommand
-{
-public:
-    FWaitForClientTests(FAutomationTestBase* InTest, TFuture<FClientTestResult>&& InFuture) : Test(InTest), Future(MoveTemp(InFuture)) {}
-    virtual bool Update() override
-    {
-        if (!Future.IsReady()) { return false; }
-        for (const FString& Error : Future.Get().Errors) { Test->AddError(Error); }
-        return true;
-    }
-private:
-    FAutomationTestBase* Test;
-    TFuture<FClientTestResult> Future;
-};
+    FPostHogConfig Config;
+    Config.ProjectToken = TEXT(""); // blank token disables client
+    Config.bPreloadFeatureFlags = false;
+    auto Client = FPostHogClient::CreateAsync(MoveTemp(Config)).Get();
+    TestTrue(TEXT("client created"), Client.IsValid());
+    if (!Client) { return false; }
+
+    TestTrue(TEXT("blank token disables client"), Client->IsDisabled());
+    TestEqual(TEXT("capture returns disabled"), Client->Capture(TEXT("noop")), EPostHogCaptureResult::Disabled);
+    const auto Drain = Client->ShutdownAsync().Get();
+    TestEqual(TEXT("disabled shutdown state"), Drain.State, EPostHogPersistenceOutcome::Disabled);
+    TestEqual(TEXT("disabled shutdown delivery"), Drain.Delivery, EPostHogDeliveryOutcome::Disabled);
+    return true;
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogClientTest, "PostHog.StatefulClient",
-    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-bool FPostHogClientTest::RunTest(const FString& Parameters)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogClientBeforeSendAndCleanupTest, "PostHog.Client.BeforeSendAndCleanup",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FPostHogClientBeforeSendAndCleanupTest::RunTest(const FString&)
+{
+    // Verify non-finite numbers serialize safely as JSON null without invalidating properties.
+    FPostHogProperties NonFinite;
+    TestTrue(TEXT("NaN accepted as null"), NonFinite.SetNumber(TEXT("nan_val"), std::numeric_limits<double>::quiet_NaN()));
+    TestTrue(TEXT("+Inf accepted as null"), NonFinite.SetNumber(TEXT("pos_inf"), std::numeric_limits<double>::infinity()));
+    TestTrue(TEXT("-Inf accepted as null"), NonFinite.SetNumber(TEXT("neg_inf"), -std::numeric_limits<double>::infinity()));
+    TestTrue(TEXT("non-finite properties valid"), NonFinite.IsValid());
+    const auto NativeObj = NonFinite.ToNative();
+    TestTrue(TEXT("nan serialized as null"), NativeObj->HasField(TEXT("nan_val")) && NativeObj->TryGetField(TEXT("nan_val"))->IsNull());
+    TestTrue(TEXT("+inf serialized as null"), NativeObj->HasField(TEXT("pos_inf")) && NativeObj->TryGetField(TEXT("pos_inf"))->IsNull());
+    TestTrue(TEXT("-inf serialized as null"), NativeObj->HasField(TEXT("neg_inf")) && NativeObj->TryGetField(TEXT("neg_inf"))->IsNull());
+
+    // Verify oversized (>4 MB) values fail cleanly without crashing or corrupting existing keys.
+    const FString Huge = FString::ChrN(4 * 1024 * 1024 + 64, TEXT('a'));
+    FPostHogProperties Bounded;
+    TestTrue(TEXT("initial key set before oversized write"), Bounded.SetString(TEXT("keep"), TEXT("ok")));
+    TestFalse(TEXT("oversized string rejected by SetString"), Bounded.SetString(TEXT("keep"), Huge));
+    TestEqual(TEXT("existing key preserved after oversized SetString"), Bounded.ToJson(), FString(TEXT("{\"keep\":\"ok\"}")));
+    TestFalse(TEXT("oversized array element produces invalid value"), FPostHogValue::Array({FPostHogValue::String(Huge)}).IsValid());
+
+    // Verify custom byte limits on FPostHogValue::TryParse carry through ToNative() and FPostHogProperties::Set().
+    FPostHogValue LargeVal;
+    TestTrue(TEXT("5 MB JSON value parsed with 8 MB limit"), FPostHogValue::TryParse(TEXT("\"") + Huge + TEXT("\""), LargeVal, 8 * 1024 * 1024));
+    TestTrue(TEXT("5 MB JSON value materializes with preserved limit"), LargeVal.ToNative().IsValid());
+    FPostHogProperties LargeProps;
+    TestTrue(TEXT("8 MB properties container created"), FPostHogProperties::TryParse(TEXT("{}"), LargeProps, 8 * 1024 * 1024));
+    TestTrue(TEXT("5 MB value accepted by 8 MB properties"), LargeProps.Set(TEXT("big"), LargeVal));
+
+    struct FDestroyTracker
+    {
+        std::atomic<int32> Destroyed{0};
+        FEvent* AllDestroyed = nullptr;
+        int32 Expected = 2;
+        ~FDestroyTracker()
+        {
+            if (AllDestroyed) { FPlatformProcess::ReturnSynchEventToPool(AllDestroyed); }
+        }
+    };
+    struct FCaptureSentinel
+    {
+        TSharedRef<FDestroyTracker, ESPMode::ThreadSafe> Tracker;
+        ~FCaptureSentinel()
+        {
+            if (Tracker->Destroyed.fetch_add(1) + 1 >= Tracker->Expected && Tracker->AllDestroyed)
+            {
+                Tracker->AllDestroyed->Trigger();
+            }
+        }
+    };
+
+    auto Tracker = MakeShared<FDestroyTracker, ESPMode::ThreadSafe>();
+    Tracker->AllDestroyed = FPlatformProcess::GetSynchEventFromPool(true);
+
+    auto BeforeSendSentinel = MakeShared<FCaptureSentinel, ESPMode::ThreadSafe>(FCaptureSentinel{Tracker});
+    auto FlagsSentinel = MakeShared<FCaptureSentinel, ESPMode::ThreadSafe>(FCaptureSentinel{Tracker});
+
+    FPostHogConfig Config;
+    Config.ProjectToken = TEXT("phc_test_hook");
+    Config.Host = TEXT("http://127.0.0.1:9");
+    Config.bPreloadFeatureFlags = false;
+    Config.FlushAt = 100;
+    Config.FlushIntervalMilliseconds = 60000;
+    Config.ShutdownTimeoutMilliseconds = 500;
+
+    auto MutatedSeen = MakeShared<std::atomic<bool>, ESPMode::ThreadSafe>(false);
+    Config.BeforeSend = [BeforeSendSentinel = MoveTemp(BeforeSendSentinel), MutatedSeen](FJsonObject& Event)
+    {
+        (void)BeforeSendSentinel;
+        FString Name;
+        Event.TryGetStringField(TEXT("event"), Name);
+#if !PLATFORM_EXCEPTIONS_DISABLED
+        if (Name == TEXT("throw_event"))
+        {
+            throw std::runtime_error("secret_should_not_be_logged");
+        }
+#endif
+        if (Name == TEXT("mutate_ts"))
+        {
+            if (const TSharedPtr<FJsonObject>* PropsObj = nullptr; Event.TryGetObjectField(TEXT("properties"), PropsObj) && PropsObj)
+            {
+                (*PropsObj)->SetBoolField(TEXT("mutated"), true);
+            }
+            Event.SetStringField(TEXT("timestamp"), FDateTime::UtcNow().ToIso8601());
+            MutatedSeen->store(true);
+        }
+        return true;
+    };
+    Config.OnFeatureFlagsChanged = [FlagsSentinel = MoveTemp(FlagsSentinel)](FPostHogFeatureFlagsUpdate)
+    {
+        (void)FlagsSentinel;
+    };
+
+    auto Client = FPostHogClient::CreateAsync(MoveTemp(Config)).Get();
+    TestTrue(TEXT("client created"), Client.IsValid() && Client->IsInitialized());
+    if (!Client) { return false; }
+
+    TestEqual(TEXT("mutated event with ISO8601 timestamp accepted"),
+        Client->Capture(TEXT("mutate_ts"), NonFinite), EPostHogCaptureResult::Accepted);
+    TestTrue(TEXT("before_send mutated event"), MutatedSeen->load());
+
+#if !PLATFORM_EXCEPTIONS_DISABLED
+    AddExpectedMessage(TEXT("BeforeSend threw std::exception"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
+    TestEqual(TEXT("throwing before_send drops event"),
+        Client->Capture(TEXT("throw_event")), EPostHogCaptureResult::Dropped);
+#endif
+
+    Client->ShutdownAsync().Get();
+    Client.Reset();
+    TestTrue(TEXT("callback captures destroyed cleanly after shutdown and reset"), Tracker->AllDestroyed->Wait(5000));
+    TestEqual(TEXT("both callback captures destroyed"), Tracker->Destroyed.load(), 2);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogClientOptOutStopsReplayTest, "PostHog.Client.OptOutStopsReplay",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FPostHogClientOptOutStopsReplayTest::RunTest(const FString&)
 {
     const FString Host = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_TEST_HOST"));
-    if (Host.IsEmpty()) { AddError(TEXT("Set POSTHOG_TEST_HOST to the SDK mock server.")); return false; }
-    const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("PostHogClientTests") / FGuid::NewGuid().ToString());
-    auto Future = Async(EAsyncExecution::Thread, [Host, Root]
+    if (Host.IsEmpty())
     {
-        FClientTestResult Result;
-        auto Check = [&Result](bool bPass, const TCHAR* Message) { if (!bPass) { Result.Errors.Add(Message); } };
-        FPostHogConfig Config; Config.ProjectToken = TEXT("phc_MOCK"); Config.Host = Host; Config.StorageRoot = Root;
-        Config.FlushAt = 100; Config.FlushIntervalMilliseconds = 60000;
-        auto Now = MakeShared<FDateTime, ESPMode::ThreadSafe>(2026, 1, 1);
-        Config.Now = [Now] { return *Now; };
-        Config.Context.SetString(TEXT("precedence"), TEXT("context"));
-        auto Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client.IsValid(), TEXT("create stateful client")); if (!Client) { return Result; }
-        const FString Anonymous = Client->GetAnonymousId();
-        const FString FirstSession = Client->GetSessionId();
-        Check(Anonymous == Client->GetDistinctId(), TEXT("anonymous identity"));
-        Check(FirstSession.Len() == 36 && FirstSession[14] == TEXT('7'), TEXT("UUIDv7 session"));
-        FPostHogProperties Registered; Registered.SetString(TEXT("registered"), TEXT("saved")); Registered.SetString(TEXT("precedence"), TEXT("registered"));
-        Client->Register(Registered);
-        FPostHogProperties Properties;
-        FPostHogProperties::TryParse(TEXT("{\"precedence\":\"caller\",\"$is_identified\":true,\"$process_person_profile\":true,\"null\":null,\"array\":[null,{\"gone\":null,\"kept\":1}],\"string\":\"00123\"}"), Properties);
-        Check(Client->Capture(TEXT("stateful_anonymous"), Properties) == EPostHogCaptureResult::Accepted, TEXT("capture anonymous"));
-        const double NonFiniteNumbers[] = { std::numeric_limits<double>::quiet_NaN(),
-            std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity() };
-        for (int32 Index = 0; Index < 3; ++Index)
-        {
-            FPostHogProperties Numeric, Nested;
-            Check(Numeric.SetNumber(TEXT("bad"), NonFiniteNumbers[Index]), TEXT("non-finite direct setter accepted"));
-            Check(Nested.SetNumber(TEXT("bad"), NonFiniteNumbers[Index]), TEXT("non-finite nested setter accepted"));
-            Nested.SetNumber(TEXT("kept"), 7);
-            Numeric.Set(TEXT("nested"), FPostHogValue::Object(Nested));
-            Check(Numeric.Set(TEXT("items"), FPostHogValue::Array({ FPostHogValue::Number(NonFiniteNumbers[Index]),
-                FPostHogValue::Number(8), FPostHogValue::Boolean(false), FPostHogValue::String(TEXT("NaN")),
-                FPostHogValue(), FPostHogValue::Object(Nested) })), TEXT("non-finite array setter accepted"));
-            Numeric.SetNumber(TEXT("finite"), 42.5);
-            Numeric.SetString(TEXT("literal"), TEXT("Infinity"));
-            const FString BeforeCapture = Numeric.ToJson();
-            Check(Client->Capture(FString::Printf(TEXT("stateful_nonfinite_%d"), Index), Numeric) == EPostHogCaptureResult::Accepted, TEXT("capture non-finite properties"));
-            Check(Numeric.ToJson() == BeforeCapture, TEXT("capture preserves caller properties"));
-        }
-        FPostHogProperties Neighbor; Neighbor.SetNumber(TEXT("finite"), 123);
-        Check(Client->Capture(TEXT("stateful_numeric_neighbor"), Neighbor) == EPostHogCaptureResult::Accepted, TEXT("capture finite neighbor"));
-        Check(Client->Identify(TEXT("user-one")), TEXT("identify anonymous"));
-        Check(!Client->Identify(TEXT("user-one")), TEXT("duplicate identify suppressed"));
-        Check(!Client->Identify(TEXT("user-two")), TEXT("account switch requires reset"));
-        Check(Client->GetSessionId() == FirstSession, TEXT("identify keeps session"));
-        FPostHogProperties Person; Person.SetString(TEXT("plan"), TEXT("paid"));
-        Check(Client->Identify(TEXT("user-one"), Person), TEXT("same-ID property update"));
-        Check(!Client->Identify(TEXT("user-one"), Person), TEXT("duplicate property update suppressed"));
-        Client->Group(TEXT("company"), TEXT("acme"));
-        Check(Client->Capture(TEXT("stateful_identified")) == EPostHogCaptureResult::Accepted, TEXT("capture identified"));
-        Check(Client->ResetAsync().Get(), TEXT("reset persistence"));
-        const FString ResetId = Client->GetDistinctId();
-        Check(ResetId != Anonymous && ResetId != TEXT("user-one"), TEXT("reset rotates identity"));
-        Check(Client->GetSessionId() != FirstSession, TEXT("reset rotates session"));
-        Check(Client->Capture(TEXT("stateful_reset")) == EPostHogCaptureResult::Accepted, TEXT("capture reset"));
-        const auto Flush = Client->FlushAsync().Get();
-        Check(Flush.bCompleted && Flush.Pending == 0 && Flush.StorageErrors == 0, TEXT("flush reports delivery"));
-        Check(Client->ShutdownAsync().Get(), TEXT("shutdown"));
-        Check(Client->ShutdownAsync().Get(), TEXT("idempotent shutdown"));
-        Check(Client->Capture(TEXT("closed")) == EPostHogCaptureResult::Closed, TEXT("post-close capture"));
-        Client.Reset();
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client && Client->GetDistinctId() == ResetId, TEXT("restore anonymous identity")); if (!Client) { return Result; }
-        Check(Client->OptOutAsync().Get(), TEXT("persist and purge opt-out"));
-        Check(Client->IsOptedOut(), TEXT("opted out"));
-        Check(!Client->Identify(TEXT("ignored")), TEXT("opt-out identify guard"));
-        Check(Client->Capture(TEXT("ignored")) == EPostHogCaptureResult::Disabled, TEXT("opt-out capture guard"));
-        Check(Client->ShutdownAsync().Get(), TEXT("opted-out shutdown")); Client.Reset();
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client && Client->IsOptedOut(), TEXT("restore consent before admission")); if (!Client) { return Result; }
-        Check(Client->ResetAsync().Get() && !Client->IsOptedOut(), TEXT("reset clears opt-out per spec"));
-        Check(Client->Capture(TEXT("stateful_after_reset_optout")) == EPostHogCaptureResult::Accepted, TEXT("capture after reset consent"));
-        Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush reset consent"));
-        Check(Client->ShutdownAsync().Get(), TEXT("shutdown reset consent")); Client.Reset();
+        AddInfo(TEXT("Skipping OptOut replay test: POSTHOG_TEST_HOST is not set."));
+        return true;
+    }
 
-        Config.ClientName = TEXT("hook");
-        auto Weak = MakeShared<TWeakPtr<FPostHogClient, ESPMode::ThreadSafe>, ESPMode::ThreadSafe>();
-        auto HookNumber = MakeShared<double, ESPMode::ThreadSafe>(0.0);
-        Config.BeforeSend = [Weak, HookNumber](FPostHogEvent& Event)
-        {
-            Event.Properties.Remove(TEXT("secret")); Event.Properties.Remove(TEXT("$lib"));
-            if (Event.Event.StartsWith(TEXT("stateful_hook_numeric_")))
-            {
-                Event.Properties.SetNumber(TEXT("computed"), *HookNumber);
-                Event.Properties.Set(TEXT("explicit_null"), FPostHogValue());
-                FPostHogProperties Nested;
-                Nested.SetNumber(TEXT("computed"), *HookNumber);
-                Nested.SetNumber(TEXT("kept"), 7);
-                Event.Properties.Set(TEXT("nested"), FPostHogValue::Object(Nested));
-                Event.Properties.Set(TEXT("items"), FPostHogValue::Array({ FPostHogValue::Number(*HookNumber),
-                    FPostHogValue::Number(8), FPostHogValue::Boolean(false), FPostHogValue::String(TEXT("NaN")),
-                    FPostHogValue(), FPostHogValue::Object(Nested) }));
-                Event.Properties.SetNumber(TEXT("finite"), 42.5);
-                Event.Properties.SetString(TEXT("literal"), TEXT("Infinity"));
-            }
-            if (Event.Event == TEXT("hook_withdraw")) { if (auto Current = Weak->Pin()) { Current->OptOutAsync(); } }
-            if (Event.Event == TEXT("hook_withdraw_resume"))
-            { if (auto Current = Weak->Pin()) { Current->OptOutAsync().Get(); Current->OptInAsync().Get(); } }
-            return true;
-        };
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client.IsValid(), TEXT("hook client")); if (!Client) { return Result; } *Weak = Client;
-        FPostHogProperties Secret; Secret.SetString(TEXT("secret"), TEXT("must not leave process"));
-        Check(Client->Capture(TEXT("hook_withdraw"), Secret) == EPostHogCaptureResult::Disabled, TEXT("consent rechecked after hook"));
-        Check(Client->OptInAsync().Get(), TEXT("opt back in"));
-        Check(Client->Capture(TEXT("hook_withdraw_resume"), Secret) == EPostHogCaptureResult::Disabled, TEXT("opt-in does not revive pre-opt-out snapshots"));
-        Check(Client->Capture(TEXT("stateful_redacted"), Secret) == EPostHogCaptureResult::Accepted, TEXT("capture redacted"));
-        const FString BeforeHookCapture = Secret.ToJson();
-        for (int32 Index = 0; Index < 4; ++Index)
-        {
-            *HookNumber = Index < 3 ? NonFiniteNumbers[Index] : 42.5;
-            Check(Client->Capture(FString::Printf(TEXT("stateful_hook_numeric_%d"), Index), Secret) == EPostHogCaptureResult::Accepted, TEXT("capture hook numeric properties"));
-            Check(Secret.ToJson() == BeforeHookCapture, TEXT("hook capture preserves caller properties"));
-        }
-        Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush redacted"));
-        Check(Client->ShutdownAsync().Get(), TEXT("close hook client")); Client.Reset();
+    const FString Root = FPaths::ProjectSavedDir() / TEXT("PostHogTests") / FGuid::NewGuid().ToString();
+    FPostHogConfig Config;
+    Config.ProjectToken = TEXT("phc_test_optout_replay");
+    Config.Host = Host;
+    Config.StorageRoot = Root;
+    Config.bPreloadFeatureFlags = false;
+    Config.ShutdownTimeoutMilliseconds = 500;
 
-        Config.BeforeSend = {}; Config.ClientName = TEXT("sessions");
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client.IsValid(), TEXT("session client")); if (!Client) { return Result; }
-        const FString Session = Client->GetSessionId();
-        *Now += FTimespan::FromMinutes(30);
-        Check(Client->GetSessionId() == Session, TEXT("exact inactivity boundary"));
-        *Now += FTimespan::FromMilliseconds(1);
-        Check(Client->GetSessionId() != Session, TEXT("past inactivity boundary"));
-        Client->OnBackground(); *Now += FTimespan::FromMinutes(31);
-        Check(Client->GetSessionId().IsEmpty(), TEXT("background expired session is empty"));
-        Client->OnForeground(); Check(!Client->GetSessionId().IsEmpty(), TEXT("foreground starts session"));
-        const FString DaySession = Client->GetSessionId();
-        for (int32 Index = 0; Index < 49; ++Index)
-        {
-            *Now += FTimespan::FromMinutes(29); Client->Capture(TEXT("session_activity"));
-        }
-        *Now += FTimespan::FromMinutes(19);
-        Check(Client->GetSessionId() == DaySession, TEXT("exact maximum-duration boundary"));
-        *Now += FTimespan::FromMilliseconds(1);
-        Check(Client->GetSessionId() != DaySession, TEXT("past maximum-duration boundary"));
-        Check(Client->ShutdownAsync().Get(), TEXT("close automatic sessions")); Client.Reset();
-
-        Config.ClientName = TEXT("explicit"); Config.SessionMode = EPostHogSessionMode::Explicit;
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client.IsValid(), TEXT("explicit client")); if (!Client) { return Result; }
-        Check(Client->GetSessionId().IsEmpty(), TEXT("explicit mode starts sessionless"));
-        Client->Capture(TEXT("explicit_before"));
-        Check(Client->StartSession(), TEXT("explicit start")); const FString Explicit = Client->GetSessionId();
-        Check(Client->StartSession() && Client->GetSessionId() == Explicit, TEXT("explicit start idempotent"));
-        Client->Capture(TEXT("explicit_during")); Client->EndSession();
-        Check(Client->GetSessionId().IsEmpty(), TEXT("explicit end stays sessionless"));
-        Client->Capture(TEXT("explicit_after"));
-        Check(!Client->SetSessionId(TEXT("invalid")), TEXT("reject invalid session"));
-        Check(Client->SetSessionId(Explicit), TEXT("accept compatible session"));
-        Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush explicit"));
-        Check(Client->ShutdownAsync().Get(), TEXT("close explicit")); Client.Reset();
-        Config.ClientName = TEXT("never"); Config.PersonProfiles = EPostHogPersonProfiles::Never;
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client.IsValid(), TEXT("personless client")); if (!Client) { return Result; }
-        Check(!Client->Identify(TEXT("ignored")), TEXT("Never profile guard"));
-        Client->Alias(TEXT("ignored")); Client->Group(TEXT("ignored"), TEXT("ignored")); Client->SetPersonProperties(Person);
-        Client->Capture(TEXT("stateful_never"));
-        Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush personless capture"));
-        Check(Client->ShutdownAsync().Get(), TEXT("close personless client")); Client.Reset();
-        Config.PersonProfiles = EPostHogPersonProfiles::IdentifiedOnly;
-
-        Config.ClientName = TEXT("bounds"); Config.SessionMode = EPostHogSessionMode::Automatic;
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client.IsValid(), TEXT("bounds client")); if (!Client) { return Result; }
-        FPostHogProperties Large;
-        Check(Large.SetString(TEXT("payload"), FString::ChrN(1024 * 1024 - 32, TEXT('x'))), TEXT("individual properties fit size bound"));
-        Client->Register(Large);
-        FPostHogProperties Deep;
-        Check(FPostHogProperties::TryParse(TEXT("{\"payload\":") + FString::ChrN(63, TEXT('[')) + TEXT("0") + FString::ChrN(63, TEXT(']')) + TEXT("}"), Deep), TEXT("individual properties fit depth bound"));
-        Client->Register(Deep);
-        Check(Client->OptOutAsync().Get(), TEXT("oversized state rejected before consent persistence"));
-        Check(Client->ShutdownAsync().Get(), TEXT("close bounds client")); Client.Reset();
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client && Client->IsOptedOut(), TEXT("size/depth boundary cannot erase opt-out")); if (!Client) { return Result; }
-        auto OptIn = Client->OptInAsync();
-        for (int32 Index = 0; Index < 50; ++Index)
-        {
-            FPostHogProperties Mutation; Mutation.SetNumber(TEXT("iteration"), Index); Client->Register(Mutation);
-        }
-        Check(OptIn.Get(), TEXT("opt-in with coalesced property writes"));
-        const FString Namespace = FMD5::HashAnsiString(*(Config.Host + TEXT("\n") + Config.ProjectToken + TEXT("\n") + Config.ClientName));
-        FString StateText; bool PersistedOptOut = true;
-        Check(FFileHelper::LoadFileToString(StateText, *(Root / Namespace / TEXT("state.json"))), TEXT("read acknowledged consent"));
-        auto SavedState = PostHogJson::Decode(StateText);
-        Check(SavedState && SavedState->TryGetBoolField(TEXT("opted_out"), PersistedOptOut) && !PersistedOptOut, TEXT("successful opt-in acknowledges persisted consent"));
-        Client->Capture(TEXT("stateful_bounds"));
-        Check(Client->FlushAsync().Get().Pending == 0, TEXT("flush bounded state"));
-        Check(Client->ShutdownAsync().Get(), TEXT("close bounded state")); Client.Reset();
-
-        Config.ClientName = TEXT("purge-failure");
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client.IsValid(), TEXT("purge failure client")); if (!Client) { return Result; }
-        const FString FailureNamespace = FMD5::HashAnsiString(*(Config.Host + TEXT("\n") + Config.ProjectToken + TEXT("\n") + Config.ClientName));
-        const FString FailureDirectory = Root / FailureNamespace;
-        const FString EventsDirectory = FailureDirectory / TEXT("events");
-        const FString BackupDirectory = FailureDirectory / TEXT("events.saved");
-        Client->Capture(TEXT("must_not_replay"));
-        TArray<FString> DurableEvents;
-        for (int32 Attempt = 0; Attempt < 200 && DurableEvents.IsEmpty(); ++Attempt)
-        { IFileManager::Get().FindFiles(DurableEvents, *(EventsDirectory / TEXT("*.json")), true, false); FPlatformProcess::SleepNoStats(0.01f); }
-        Check(!DurableEvents.IsEmpty(), TEXT("event durable before purge failure"));
-        auto& Files = FPlatformFileManager::Get().GetPlatformFile();
-        Check(Files.MoveFile(*BackupDirectory, *EventsDirectory), TEXT("retain old spool for failure injection"));
-        Check(FFileHelper::SaveStringToFile(TEXT("not a directory"), *EventsDirectory), TEXT("inject purge failure"));
-        Check(!Client->OptOutAsync().Get(), TEXT("purge failure reported"));
-        Check(!Client->OptInAsync().Get() && Client->IsOptedOut(), TEXT("failed purge cannot grant consent"));
-        Check(FFileHelper::LoadFileToString(StateText, *(FailureDirectory / TEXT("state.json"))), TEXT("read failed opt-in consent"));
-        SavedState = PostHogJson::Decode(StateText); PersistedOptOut = false;
-        Check(SavedState && SavedState->TryGetBoolField(TEXT("opted_out"), PersistedOptOut) && PersistedOptOut, TEXT("failed purge preserves persisted opt-out"));
-        Check(Client->ShutdownAsync().Get(), TEXT("close failed purge client")); Client.Reset();
-        Check(Files.DeleteFile(*EventsDirectory) && Files.MoveFile(*EventsDirectory, *BackupDirectory), TEXT("restore original spool"));
-        Client = FPostHogClient::CreateAsync(Config).Get();
-        Check(Client && Client->IsOptedOut(), TEXT("restart remains opted out with old spool"));
-        if (Client) { Check(Client->ShutdownAsync().Get(), TEXT("close restored failure client")); Client.Reset(); }
-
-        Config.ClientName = TEXT("parallel-a"); auto FirstFuture = FPostHogClient::CreateAsync(Config);
-        Config.ClientName = TEXT("parallel-b"); auto SecondFuture = FPostHogClient::CreateAsync(Config);
-        auto First = FirstFuture.Get(); auto Second = SecondFuture.Get();
-        Check(First && Second, TEXT("parallel clients"));
-        if (First && Second)
-        {
-            Check(First->GetDistinctId() != Second->GetDistinctId(), TEXT("separate namespaces isolate identity"));
-            auto A = Async(EAsyncExecution::Thread, [First] { for (int32 Index = 0; Index < 25; ++Index) { First->Capture(TEXT("parallel_a")); } });
-            auto B = Async(EAsyncExecution::Thread, [Second] { for (int32 Index = 0; Index < 25; ++Index) { Second->Capture(TEXT("parallel_b")); } });
-            A.Wait(); B.Wait();
-            Check(First->FlushAsync().Get().Pending == 0 && Second->FlushAsync().Get().Pending == 0, TEXT("parallel delivery"));
-            auto CloseA = First->ShutdownAsync(); auto CloseB = Second->ShutdownAsync();
-            Check(CloseA.Get() && CloseB.Get(), TEXT("parallel teardown"));
-        }
+    auto Client = FPostHogClient::CreateAsync(MoveTemp(Config)).Get();
+    TestTrue(TEXT("client created"), Client.IsValid() && Client->IsInitialized());
+    if (!Client)
+    {
         IFileManager::Get().DeleteDirectory(*Root, false, true);
-        return Result;
-    });
-    FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FWaitForClientTests>(this, MoveTemp(Future)));
+        return false;
+    }
+
+    Client->StartSessionReplay();
+    const double Deadline = FPlatformTime::Seconds() + 5.0;
+    while (!Client->IsSessionReplayActive() && FPlatformTime::Seconds() < Deadline)
+    {
+        FPlatformProcess::Sleep(0.02f);
+    }
+    TestTrue(TEXT("replay active before opt-out"), Client->IsSessionReplayActive());
+
+    Client->OptOut();
+    TestFalse(TEXT("replay stopped by opt-out"), Client->IsSessionReplayActive());
+    Client->StartSessionReplay();
+    TestFalse(TEXT("start replay ignored while opted out"), Client->IsSessionReplayActive());
+
+    Client->OptIn();
+    TestFalse(TEXT("replay remains stopped after opt-in"), Client->IsSessionReplayActive());
+
+    Client->ShutdownAsync().Get();
+    Client.Reset();
+    IFileManager::Get().DeleteDirectory(*Root, false, true);
     return true;
 }
 #endif

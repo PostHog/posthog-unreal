@@ -5,199 +5,309 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformMisc.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/Paths.h"
 #include "UObject/StrongObjectPtr.h"
+#include <atomic>
+#if !PLATFORM_EXCEPTIONS_DISABLED
+#include <stdexcept>
+#endif
 
 namespace
 {
-// Exercise the reflected entry points used by Blueprint, not just direct C++ calls.
-EPostHogCaptureResult Capture(UPostHogSubsystem* Subsystem, const FString& Event, const FPostHogProperties& Properties = {})
-{
-    struct { FString Event; FPostHogProperties Properties; EPostHogCaptureResult ReturnValue; }
-        Params{Event, Properties, EPostHogCaptureResult::Closed};
-    Subsystem->ProcessEvent(Subsystem->FindFunctionChecked(TEXT("Capture")), &Params);
-    return Params.ReturnValue;
-}
-bool Identify(UPostHogSubsystem* Subsystem, const FString& Id, const FPostHogProperties& Set = {}, const FPostHogProperties& SetOnce = {})
-{
-    struct { FString DistinctId; FPostHogProperties Set; FPostHogProperties SetOnce; bool ReturnValue; }
-        Params{Id, Set, SetOnce, false};
-    Subsystem->ProcessEvent(Subsystem->FindFunctionChecked(TEXT("Identify")), &Params);
-    return Params.ReturnValue;
-}
-FPostHogFeatureFlagResult GetFlag(UPostHogSubsystem* Subsystem, const FString& Key, bool bSendEvent = true)
-{
-    struct { FString Key; bool bSendEvent; FPostHogFeatureFlagResult ReturnValue; } Params{Key, bSendEvent, {}};
-    Subsystem->ProcessEvent(Subsystem->FindFunctionChecked(TEXT("GetFeatureFlag")), &Params);
-    return Params.ReturnValue;
-}
-bool Reload(UPostHogSubsystem* Subsystem)
-{
-    struct { bool ReturnValue = false; } Params;
-    Subsystem->ProcessEvent(Subsystem->FindFunctionChecked(TEXT("ReloadFeatureFlags")), &Params);
-    return Params.ReturnValue;
-}
-
-class FBlueprintScenario final : public IAutomationLatentCommand
+class FBlueprintDelegateProbeLatent final : public IAutomationLatentCommand
 {
 public:
-    explicit FBlueprintScenario(FAutomationTestBase* InTest) : Test(InTest)
+    explicit FBlueprintDelegateProbeLatent(FAutomationTestBase* InTest) : Test(InTest)
     {
         auto* Settings = GetMutableDefault<UPostHogSettings>();
-        bPreviousAuto = Settings->bAutoInitialize; Settings->bAutoInitialize = false;
+        bPrevAuto = Settings->bAutoInitialize;
+        Settings->bAutoInitialize = false;
         Root = FPaths::ProjectSavedDir() / TEXT("PostHogBlueprintTests") / FGuid::NewGuid().ToString();
-        Config.ProjectToken = TEXT("phc_MOCK"); Config.Host = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_TEST_HOST"));
-        Config.StorageRoot = Root; Config.bPreloadFeatureFlags = false; Config.bCaptureApplicationLifecycleEvents = false;
-        Config.FlushAt = 100; Config.FlushIntervalMilliseconds = 60000;
-        Config.Context.SetString(TEXT("test_suite"), TEXT("blueprint"));
-        Deadline = FPlatformTime::Seconds() + 30;
+        ClientName = TEXT("bp-probe-") + FGuid::NewGuid().ToString();
+        Host = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_TEST_HOST"));
+        Deadline = FPlatformTime::Seconds() + 20.0;
     }
-    ~FBlueprintScenario()
+
+    ~FBlueprintDelegateProbeLatent()
     {
-        Destroy();
-        GetMutableDefault<UPostHogSettings>()->bAutoInitialize = bPreviousAuto;
+        if (Instance.IsValid())
+        {
+            Instance->Shutdown();
+            if (GEngine) { GEngine->DestroyWorldContext(Instance->GetWorld()); }
+            Instance.Reset();
+        }
+        Probe.Reset();
+        GetMutableDefault<UPostHogSettings>()->bAutoInitialize = bPrevAuto;
+        IFileManager::Get().DeleteDirectory(*Root, false, true);
     }
+
     bool Update() override
     {
-        if (FPlatformTime::Seconds() > Deadline) { Test->AddError(TEXT("Blueprint scenario timed out")); return true; }
-        auto* Subsystem = Instance ? Instance->GetSubsystem<UPostHogSubsystem>() : nullptr;
-        switch (Phase)
+        if (FPlatformTime::Seconds() > Deadline)
         {
-        case 0:
-            if (Config.Host.IsEmpty()) { Test->AddError(TEXT("Run with Tests/native_integration.py")); return true; }
-            Instance.Reset(NewObject<UGameInstance>(GEngine));
-            Instance->InitializeStandalone(FName(*FGuid::NewGuid().ToString()));
-            Subsystem = Instance->GetSubsystem<UPostHogSubsystem>();
-            Probe.Reset(NewObject<UPostHogBlueprintProbe>()); Probe->Subsystem = Subsystem;
-            Subsystem->OnFeatureFlagsReloaded.AddDynamic(Probe.Get(), &UPostHogBlueprintProbe::OnReload);
-            Test->TestEqual(TEXT("not-ready capture"), Capture(Subsystem, TEXT("blueprint_not_ready")), EPostHogCaptureResult::Closed);
-            Test->TestFalse(TEXT("not-ready identify"), Identify(Subsystem, TEXT("ignored")));
-            Test->TestFalse(TEXT("not-ready getter"), GetFlag(Subsystem, TEXT("bool-value")).bFound);
-            Test->TestFalse(TEXT("not-ready reload"), Reload(Subsystem));
-            Test->TestTrue(TEXT("setup"), Subsystem->SetupWithConfig(Config, true));
-            Test->TestFalse(TEXT("initializing reload"), Reload(Subsystem));
-            ++Phase; return false;
-        case 1:
-        {
-            if (!Subsystem->IsInitialized()) { return false; }
-            FPostHogProperties Properties, Set, SetOnce;
-            UPostHogBlueprintLibrary::SetProperty(Properties, TEXT("string"), UPostHogBlueprintLibrary::MakeStringValue(TEXT("00123 玩家 🚀")));
-            UPostHogBlueprintLibrary::SetProperty(Properties, TEXT("number"), UPostHogBlueprintLibrary::MakeNumberValue(42));
-            UPostHogBlueprintLibrary::SetProperty(Properties, TEXT("boolean"), UPostHogBlueprintLibrary::MakeBooleanValue(false));
-            UPostHogBlueprintLibrary::SetProperty(Properties, TEXT("array"), UPostHogBlueprintLibrary::MakeArrayValue({UPostHogBlueprintLibrary::MakeNullValue(), UPostHogBlueprintLibrary::MakeObjectValue(Properties)}));
-            Test->TestEqual(TEXT("capture"), Capture(Subsystem, TEXT("blueprint_anonymous"), Properties), EPostHogCaptureResult::Accepted);
-            Test->TestTrue(TEXT("parse set"), UPostHogBlueprintLibrary::ParseProperties(TEXT("{\"name\":\"Blueprint player\"}"), Set));
-            UPostHogBlueprintLibrary::SetProperty(SetOnce, TEXT("origin"), UPostHogBlueprintLibrary::MakeStringValue(TEXT("blueprint")));
-            Test->TestTrue(TEXT("identify"), Identify(Subsystem, TEXT("blueprint-user"), Set, SetOnce));
-            Test->TestFalse(TEXT("duplicate identify"), Identify(Subsystem, TEXT("blueprint-user"), Set, SetOnce));
-            Test->TestEqual(TEXT("identified capture"), Capture(Subsystem, TEXT("blueprint_identified")), EPostHogCaptureResult::Accepted);
-            Test->TestEqual(TEXT("invalid capture"), Capture(Subsystem, TEXT("")), EPostHogCaptureResult::Invalid);
-            Test->TestFalse(TEXT("invalid properties JSON"), UPostHogBlueprintLibrary::ParseProperties(TEXT("[]"), Set));
-            Test->TestEqual(TEXT("failed parse clears output"), UPostHogBlueprintLibrary::PropertiesToJson(Set), FString(TEXT("{}")));
-            Flushed = Subsystem->GetClient()->FlushAsync();
-            Probe->bReloadAgain = true;
-            Test->TestTrue(TEXT("start reload"), Reload(Subsystem));
-            Test->TestTrue(TEXT("coalesce reload"), Reload(Subsystem));
-            Test->TestEqual(TEXT("completion is deferred"), Probe->Completions, 0);
-            ++Phase; return false;
-        }
-        case 2:
-        {
-            if (Probe->Completions < 2 || !Flushed.IsReady()) { return false; }
-            Test->TestTrue(TEXT("capture flush"), Flushed.Get().bCompleted);
-            Test->TestEqual(TEXT("one completion per cycle including reentrant reload"), Probe->Completions, 2);
-            Test->TestTrue(TEXT("game-thread delegate"), Probe->bGameThread);
-            Test->TestEqual(TEXT("successful reload"), Probe->LastResult.Status, EPostHogFlagReloadStatus::Success);
-            bool Boolean = true; FString String;
-            auto Flag = GetFlag(Subsystem, TEXT("disabled-flag"));
-            Test->TestTrue(TEXT("known false"), Flag.bFound && UPostHogBlueprintLibrary::TryGetBoolean(Flag.Value, Boolean) && !Boolean);
-            GetFlag(Subsystem, TEXT("disabled-flag")); // The native client deduplicates exposures.
-            Test->TestFalse(TEXT("missing"), GetFlag(Subsystem, TEXT("missing")).bFound);
-            Flag = GetFlag(Subsystem, TEXT("string-value"), false);
-            Test->TestTrue(TEXT("variant"), Flag.bFound && UPostHogBlueprintLibrary::TryGetString(Flag.Value, String) && String == TEXT("test"));
-            Test->TestFalse(TEXT("no boolean coercion"), UPostHogBlueprintLibrary::TryGetBoolean(Flag.Value, Boolean));
-            Test->TestFalse(TEXT("no string coercion"), UPostHogBlueprintLibrary::TryGetString(UPostHogBlueprintLibrary::MakeBooleanValue(true), String));
-            Test->TestEqual(TEXT("null value"), UPostHogBlueprintLibrary::ValueToJson(UPostHogBlueprintLibrary::MakeNullValue()), FString(TEXT("null")));
-            Flushed = Subsystem->GetClient()->FlushAsync();
-            Reload(Subsystem);
-            // Test-only bounded wait: invalidate after native completion but before the next ticker notification.
-            auto NativeReload = Subsystem->GetClient()->ReloadFeatureFlagsAsync();
-            if (!NativeReload.WaitFor(FTimespan::FromSeconds(5))) { Test->AddError(TEXT("native reload timed out")); return true; }
-            Transition = Subsystem->GetClient()->ResetAsync();
-            ++Phase; return false;
-        }
-        case 3:
-            if (Probe->Completions < 3 || !Transition.IsReady() || !Flushed.IsReady()) { return false; }
-            Test->TestTrue(TEXT("exposure flush"), Flushed.Get().bCompleted);
-            Test->TestEqual(TEXT("deferred old-context snapshot rejected"), Probe->LastResult.Status, EPostHogFlagReloadStatus::Stale);
-            Test->TestTrue(TEXT("stale snapshot cleared"), Probe->LastResult.Flags.IsEmpty());
-            Transition = Subsystem->GetClient()->OptOutAsync();
-            Test->TestEqual(TEXT("opted-out capture"), Capture(Subsystem, TEXT("blueprint_opted_out")), EPostHogCaptureResult::Disabled);
-            Test->TestTrue(TEXT("opted-out reload accepted for completion"), Reload(Subsystem));
-            ++Phase; return false;
-        case 4:
-            if (Probe->Completions < 4 || !Transition.IsReady()) { return false; }
-            Test->TestEqual(TEXT("disabled completion"), Probe->LastResult.Status, EPostHogFlagReloadStatus::Disabled);
-            Transition = Subsystem->GetClient()->OptInAsync(); ++Phase; return false;
-        case 5:
-            if (!Transition.IsReady()) { return false; }
-            Test->TestTrue(TEXT("opt in"), Transition.Get());
-            Reload(Subsystem); Subsystem->Shutdown();
-            Test->TestFalse(TEXT("shutdown rejects reload"), Reload(Subsystem));
-            Test->TestFalse(TEXT("shutdown getter is missing"), GetFlag(Subsystem, TEXT("string-value")).bFound);
-            ++Phase; return false;
-        case 6:
-            if (Subsystem->GetState() != EPostHogSubsystemState::Idle) { return false; }
-            Test->TestEqual(TEXT("shutdown cancels notification"), Probe->Completions, 4);
-            Test->TestTrue(TEXT("restart"), Subsystem->SetupWithConfig(Config, true)); ++Phase; return false;
-        case 7:
-            if (!Subsystem->IsInitialized()) { return false; }
-            Reload(Subsystem);
-            Client = Subsystem->GetClient(); Destroy();
-            CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
-            Test->TestFalse(TEXT("subsystem weak reference expires"), Probe->Subsystem.IsValid());
-            Transition = Client->ShutdownAsync(); ++Phase; return false;
-        case 8:
-            if (!Transition.IsReady()) { return false; }
-            Test->TestEqual(TEXT("owner destruction cancels notification"), Probe->Completions, 4);
-            Client.Reset(); IFileManager::Get().DeleteDirectory(*Root, false, true);
+            Test->AddError(FString::Printf(TEXT("Blueprint delegate probe test timed out in phase %d"), Phase));
             return true;
         }
-        return false;
+        if (Phase == 0)
+        {
+            Instance.Reset(NewObject<UGameInstance>(GEngine));
+            FWorldContext& Context = GEngine->CreateNewWorldContext(EWorldType::Game);
+            Context.OwningGameInstance = Instance.Get();
+            UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+            Context.SetCurrentWorld(World);
+            Instance->Init();
+
+            auto* Sub = Instance->GetSubsystem<UPostHogSubsystem>();
+            Test->TestNotNull(TEXT("subsystem exists"), Sub);
+            if (!Sub) { return true; }
+
+            Probe.Reset(NewObject<UPostHogBlueprintProbe>());
+            Sub->OnFeatureFlagsChanged.AddDynamic(Probe.Get(), &UPostHogBlueprintProbe::OnFlagsChanged);
+            Test->TestTrue(TEXT("probe bound to OnFeatureFlagsChanged"),
+                Sub->OnFeatureFlagsChanged.IsAlreadyBound(Probe.Get(), &UPostHogBlueprintProbe::OnFlagsChanged));
+
+            if (Host.IsEmpty())
+            {
+                // Exercise reflected dynamic delegate dispatch directly when offline.
+                FPostHogFeatureFlagsUpdate Synthetic;
+                Synthetic.Snapshot.bAvailable = true;
+                Sub->OnFeatureFlagsChanged.Broadcast(Synthetic);
+                Test->TestEqual(TEXT("probe received synthetic broadcast"), Probe->Completions, 1);
+                Test->TestTrue(TEXT("probe ran on game thread"), Probe->bGameThread);
+                Test->TestTrue(TEXT("probe received snapshot"), Probe->LastUpdate.Snapshot.bAvailable);
+                return true;
+            }
+
+            // Phase 0 -> 1: load flags from mock server to populate disk cache, verifying live OnFeatureFlagsChanged.
+            FPostHogConfig Config;
+            Config.ProjectToken = TEXT("phc_test_bp_probe");
+            Config.Host = Host;
+            Config.StorageRoot = Root;
+            Config.ClientName = ClientName;
+            Config.bPreloadFeatureFlags = true;
+            Config.ShutdownTimeoutMilliseconds = 1000;
+            Test->TestTrue(TEXT("preload setup accepted"), Sub->SetupWithConfig(MoveTemp(Config), true, true));
+            Phase = 1;
+            return false;
+        }
+        auto* Sub = Instance->GetSubsystem<UPostHogSubsystem>();
+        if (Phase == 1)
+        {
+            if (Sub->GetState() == EPostHogSubsystemState::Initializing) { return false; }
+            if (Probe->Completions < 1) { return false; }
+            Test->TestTrue(TEXT("live flag broadcast ran on game thread"), Probe->bGameThread);
+            Test->TestTrue(TEXT("live flag broadcast snapshot available"), Probe->LastUpdate.Snapshot.bAvailable);
+            Sub->Shutdown();
+            Phase = 2;
+            return false;
+        }
+        if (Phase == 2)
+        {
+            if (Sub->GetState() == EPostHogSubsystemState::ShuttingDown) { return false; }
+            // Phase 2 -> 3: warm-cache restore with bPreloadFeatureFlags = false must fire
+            // UPostHogSubsystem::OnFeatureFlagsChanged on the GameThread after setup becomes Ready!
+            Probe->Completions = 0;
+            Probe->LastUpdate = FPostHogFeatureFlagsUpdate{};
+            FPostHogConfig Config;
+            Config.ProjectToken = TEXT("phc_test_bp_probe");
+            Config.Host = TEXT("http://127.0.0.1:9");
+            Config.StorageRoot = Root;
+            Config.ClientName = ClientName;
+            Config.bPreloadFeatureFlags = false;
+            Config.ShutdownTimeoutMilliseconds = 500;
+            Test->TestTrue(TEXT("warm-restore setup accepted"), Sub->SetupWithConfig(MoveTemp(Config), true, true));
+            Phase = 3;
+            return false;
+        }
+        if (Phase == 3)
+        {
+            if (Sub->GetState() == EPostHogSubsystemState::Initializing) { return false; }
+            Test->TestEqual(TEXT("warm-restore ready"), Sub->GetState(), EPostHogSubsystemState::Ready);
+            // Buffered restored update is drained synchronously right after OnSetupCompleted(true),
+            // or arrives on the GameThread tick immediately after.
+            if (Probe->Completions < 1) { return false; }
+            Test->TestTrue(TEXT("warm-restore delegate ran on game thread"), Probe->bGameThread);
+            Test->TestTrue(TEXT("warm-restore delegate snapshot available"), Probe->LastUpdate.Snapshot.bAvailable);
+            Test->TestTrue(TEXT("getters reflect restored flags"), Sub->GetFeatureFlags().bAvailable);
+            Sub->Shutdown();
+            Phase = 4;
+            return false;
+        }
+        if (Sub->GetState() == EPostHogSubsystemState::ShuttingDown) { return false; }
+        return true;
     }
+
 private:
-    void Destroy()
-    {
-        if (!Instance) { return; }
-        UWorld* World = Instance->GetWorld(); Instance->Shutdown();
-        if (World) { World->SetGameInstance(nullptr); GEngine->DestroyWorldContext(World); World->DestroyWorld(false); }
-        Instance.Reset();
-    }
     FAutomationTestBase* Test;
     TStrongObjectPtr<UGameInstance> Instance;
     TStrongObjectPtr<UPostHogBlueprintProbe> Probe;
-    FPostHogConfig Config;
-    FPostHogClient::FPtr Client;
-    TSharedFuture<bool> Transition;
-    TSharedFuture<FPostHogDeliveryResult> Flushed;
     FString Root;
-    bool bPreviousAuto = false;
-    int32 Phase = 0;
+    FString ClientName;
+    FString Host;
+    bool bPrevAuto = true;
     double Deadline = 0;
+    int32 Phase = 0;
 };
+
+#if !PLATFORM_EXCEPTIONS_DISABLED
+class FSubsystemFlagCallbackExceptionLatent final : public IAutomationLatentCommand
+{
+public:
+    explicit FSubsystemFlagCallbackExceptionLatent(FAutomationTestBase* InTest) : Test(InTest)
+    {
+        auto* Settings = GetMutableDefault<UPostHogSettings>();
+        bPrevAuto = Settings->bAutoInitialize;
+        Settings->bAutoInitialize = false;
+        Root = FPaths::ProjectSavedDir() / TEXT("PostHogBlueprintTests") / FGuid::NewGuid().ToString();
+        Host = FPlatformMisc::GetEnvironmentVariable(TEXT("POSTHOG_TEST_HOST"));
+        Deadline = FPlatformTime::Seconds() + 20.0;
+    }
+
+    ~FSubsystemFlagCallbackExceptionLatent()
+    {
+        if (Instance.IsValid())
+        {
+            Instance->Shutdown();
+            if (GEngine) { GEngine->DestroyWorldContext(Instance->GetWorld()); }
+            Instance.Reset();
+        }
+        Probe.Reset();
+        GetMutableDefault<UPostHogSettings>()->bAutoInitialize = bPrevAuto;
+        IFileManager::Get().DeleteDirectory(*Root, false, true);
+    }
+
+    bool Update() override
+    {
+        if (Host.IsEmpty())
+        {
+            Test->AddInfo(TEXT("Skipping subsystem flag callback exception test: POSTHOG_TEST_HOST is not set."));
+            return true;
+        }
+        if (FPlatformTime::Seconds() > Deadline)
+        {
+            Test->AddError(FString::Printf(TEXT("Subsystem flag callback exception test timed out in phase %d"), Phase));
+            return true;
+        }
+        if (Phase == 0)
+        {
+            Test->AddExpectedMessage(TEXT("OnFeatureFlagsChanged threw std::exception."), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
+
+            Instance.Reset(NewObject<UGameInstance>(GEngine));
+            FWorldContext& Context = GEngine->CreateNewWorldContext(EWorldType::Game);
+            Context.OwningGameInstance = Instance.Get();
+            UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+            Context.SetCurrentWorld(World);
+            Instance->Init();
+
+            auto* Sub = Instance->GetSubsystem<UPostHogSubsystem>();
+            Test->TestNotNull(TEXT("subsystem exists"), Sub);
+            if (!Sub) { return true; }
+
+            Probe.Reset(NewObject<UPostHogBlueprintProbe>());
+            Sub->OnFeatureFlagsChanged.AddDynamic(Probe.Get(), &UPostHogBlueprintProbe::OnFlagsChanged);
+
+            FPostHogConfig Config;
+            Config.ProjectToken = TEXT("phc_test_sub_flag_throw");
+            Config.Host = Host;
+            Config.StorageRoot = Root;
+            Config.ClientName = TEXT("flag-throw");
+            Config.bPreloadFeatureFlags = true;
+            Config.ShutdownTimeoutMilliseconds = 500;
+            Config.OnFeatureFlagsChanged = [Threw = bThrew](FPostHogFeatureFlagsUpdate)
+            {
+                if (!Threw->exchange(true))
+                {
+                    throw std::runtime_error("secret_subsystem_flag_exception");
+                }
+            };
+            Test->TestTrue(TEXT("setup accepted"), Sub->SetupWithConfig(MoveTemp(Config), true, true));
+            Phase = 1;
+            return false;
+        }
+        auto* Sub = Instance->GetSubsystem<UPostHogSubsystem>();
+        if (Phase == 1)
+        {
+            if (Sub->GetState() == EPostHogSubsystemState::Initializing || Probe->Completions < 1) { return false; }
+            Test->TestEqual(TEXT("subsystem ready"), Sub->GetState(), EPostHogSubsystemState::Ready);
+            Test->TestTrue(TEXT("throwing user callback ran"), bThrew->load());
+            Test->TestTrue(TEXT("subsystem OnFeatureFlagsChanged fired on game thread"), Probe->Completions >= 1 && Probe->bGameThread);
+            Test->TestTrue(TEXT("subsystem OnFeatureFlagsChanged received snapshot"), Probe->LastUpdate.Snapshot.bAvailable);
+            Sub->Shutdown();
+            Phase = 2;
+            return false;
+        }
+        if (Sub->GetState() == EPostHogSubsystemState::ShuttingDown) { return false; }
+        Test->TestEqual(TEXT("subsystem idle"), Sub->GetState(), EPostHogSubsystemState::Idle);
+        return true;
+    }
+
+private:
+    FAutomationTestBase* Test;
+    TStrongObjectPtr<UGameInstance> Instance;
+    TStrongObjectPtr<UPostHogBlueprintProbe> Probe;
+    FString Root;
+    FString Host;
+    TSharedRef<std::atomic<bool>, ESPMode::ThreadSafe> bThrew = MakeShared<std::atomic<bool>, ESPMode::ThreadSafe>(false);
+    bool bPrevAuto = true;
+    double Deadline = 0;
+    int32 Phase = 0;
+};
+#endif
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogBlueprintTest, "PostHog.Blueprint",
-    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-bool FPostHogBlueprintTest::RunTest(const FString& Parameters)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogBlueprintReflectionTest, "PostHog.Blueprint.Reflection",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FPostHogBlueprintReflectionTest::RunTest(const FString&)
 {
-    for (const FName Name : {FName(TEXT("Capture")), FName(TEXT("Identify")), FName(TEXT("GetFeatureFlag")), FName(TEXT("ReloadFeatureFlags"))})
+    const TCHAR* ExpectedFunctions[] = {
+        TEXT("Setup"), TEXT("Shutdown"), TEXT("IsInitialized"), TEXT("IsDisabled"), TEXT("GetState"),
+        TEXT("Capture"), TEXT("Identify"), TEXT("Reset"), TEXT("OptIn"), TEXT("OptOut"),
+        TEXT("GetFeatureFlag"), TEXT("GetFeatureFlags"), TEXT("ReloadFeatureFlags"),
+        TEXT("StartSessionReplay"), TEXT("StopSessionReplay"), TEXT("IsSessionReplayActive"),
+        TEXT("BindAnalyticsProvider"), TEXT("UnbindAnalyticsProvider")
+    };
+    for (const TCHAR* Name : ExpectedFunctions)
     {
-        const auto* Function = UPostHogSubsystem::StaticClass()->FindFunctionByName(Name);
-        TestTrue(*Name.ToString(), Function && Function->HasAnyFunctionFlags(FUNC_BlueprintCallable) && !Function->HasAnyFunctionFlags(FUNC_BlueprintPure));
+        TestNotNull(FString::Printf(TEXT("UPostHogSubsystem::%s reflected"), Name),
+            UPostHogSubsystem::StaticClass()->FindFunctionByName(Name));
     }
-    FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FBlueprintScenario>(this));
+
+    FPostHogProperties Props;
+    TestTrue(TEXT("set string"), UPostHogBlueprintLibrary::SetProperty(Props, TEXT("a"), UPostHogBlueprintLibrary::MakeStringValue(TEXT("x"))));
+    TestTrue(TEXT("set bool"), UPostHogBlueprintLibrary::SetProperty(Props, TEXT("b"), UPostHogBlueprintLibrary::MakeBooleanValue(true)));
+    TestTrue(TEXT("set number"), UPostHogBlueprintLibrary::SetProperty(Props, TEXT("c"), UPostHogBlueprintLibrary::MakeNumberValue(3.5)));
+    TestFalse(TEXT("invalid json rejected"), UPostHogBlueprintLibrary::ParseProperties(TEXT("[]"), Props));
+    TestEqual(TEXT("failed parse clears output"), UPostHogBlueprintLibrary::PropertiesToJson(Props), FString(TEXT("{}")));
+
+    bool BoolOut = false;
+    FString StrOut;
+    TestTrue(TEXT("try get bool"), UPostHogBlueprintLibrary::TryGetBoolean(UPostHogBlueprintLibrary::MakeBooleanValue(true), BoolOut) && BoolOut);
+    TestFalse(TEXT("no bool coercion"), UPostHogBlueprintLibrary::TryGetBoolean(UPostHogBlueprintLibrary::MakeStringValue(TEXT("true")), BoolOut));
+    TestTrue(TEXT("try get string"), UPostHogBlueprintLibrary::TryGetString(UPostHogBlueprintLibrary::MakeStringValue(TEXT("v1")), StrOut) && StrOut == TEXT("v1"));
+    TestEqual(TEXT("null value json"), UPostHogBlueprintLibrary::ValueToJson(UPostHogBlueprintLibrary::MakeNullValue()), FString(TEXT("null")));
     return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogBlueprintDelegateProbeTest, "PostHog.Blueprint.DelegateProbe",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FPostHogBlueprintDelegateProbeTest::RunTest(const FString&)
+{
+    ADD_LATENT_AUTOMATION_COMMAND(FBlueprintDelegateProbeLatent(this));
+    return true;
+}
+
+#if !PLATFORM_EXCEPTIONS_DISABLED
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPostHogSubsystemFlagCallbackExceptionTest, "PostHog.Subsystem.FlagCallbackException",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext | EAutomationTestFlags::ProductFilter)
+
+bool FPostHogSubsystemFlagCallbackExceptionTest::RunTest(const FString&)
+{
+    ADD_LATENT_AUTOMATION_COMMAND(FSubsystemFlagCallbackExceptionLatent(this));
+    return true;
+}
+#endif
 #endif

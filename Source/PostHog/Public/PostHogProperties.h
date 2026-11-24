@@ -15,11 +15,10 @@ struct POSTHOG_API FPostHogValue
 
     static FPostHogValue String(const FString& Value);
     static FPostHogValue Boolean(bool Value);
-    /** Non-finite numbers become JSON null. */
     static FPostHogValue Number(double Value);
     static FPostHogValue Object(const FPostHogProperties& Value);
     static FPostHogValue Array(const TArray<FPostHogValue>& Values);
-    static bool TryParse(const FString& Json, FPostHogValue& OutValue);
+    static bool TryParse(const FString& Json, FPostHogValue& OutValue, int32 MaxBytes = 1024 * 1024);
 
     bool IsValid() const { return !Json.IsEmpty(); }
     FString ToJson() const { return Json; }
@@ -28,6 +27,8 @@ struct POSTHOG_API FPostHogValue
 private:
     UPROPERTY()
     FString Json = TEXT("null");
+    UPROPERTY()
+    int32 ByteLimit = 4 * 1024 * 1024;
 };
 
 /** Typed event properties. Copies never share mutable JSON objects. */
@@ -36,8 +37,8 @@ struct POSTHOG_API FPostHogProperties
 {
     GENERATED_BODY()
 
-    static bool TryParse(const FString& Json, FPostHogProperties& OutProperties);
-    static FPostHogProperties FromNative(const TSharedRef<FJsonObject>& Object);
+    static bool TryParse(const FString& Json, FPostHogProperties& OutProperties, int32 MaxBytes = 1024 * 1024);
+    static FPostHogProperties FromNative(const TSharedRef<FJsonObject>& Object, int32 MaxBytes = 1024 * 1024);
 
     bool Set(const FString& Key, const FPostHogValue& Value);
     bool SetString(const FString& Key, const FString& Value);
@@ -50,6 +51,9 @@ struct POSTHOG_API FPostHogProperties
     TSharedRef<FJsonObject> ToNative() const;
 
 private:
+    friend struct FPostHogValue;
     UPROPERTY()
     FString Json = TEXT("{}");
+    UPROPERTY()
+    int32 ByteLimit = 1024 * 1024;
 };

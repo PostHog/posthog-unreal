@@ -1,7 +1,8 @@
 #include "PostHogSubsystem.h"
 #include "PostHogAnalyticsProvider.h"
 #include "PostHogJson.h"
-#include "PostHogTasks.h"
+#include "PostHogReplayRecorder.h"
+#include "Async/Async.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
@@ -13,44 +14,59 @@
 #include "Misc/EngineVersion.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
-#include "Misc/SecureHash.h"
+#include "UObject/StrongObjectPtr.h"
+#include <atomic>
+#if !PLATFORM_EXCEPTIONS_DISABLED
+#include <exception>
+#endif
 
-/** No UObject references cross into initialization/close workers. */
-struct FPostHogInitialization
+DEFINE_LOG_CATEGORY_STATIC(LogPostHogSubsystem, Log, All);
+
+struct FPostHogNamespaceLease
 {
+    FString Key;
+    TSharedPtr<TPromise<void>, ESPMode::ThreadSafe> DonePromise;
+    TSharedFuture<void> DoneFuture;
     FCriticalSection Mutex;
     bool bCancelled = false;
-    FPostHogClient::FPtr Client;
-    TSharedFuture<bool> Ready;
-    TSharedFuture<bool> Closing;
+    bool bInitFinished = false;
+    FPostHogClient::FPtr PendingCreated;
+    std::atomic<bool> bCompleted{false};
+    bool bReleasing = false;        // Game-thread only
+    uint64 ShutdownGeneration = 0;  // Protected by Mutex
 
-    void Cancel()
+    void Complete()
     {
-        FScopeLock Lock(&Mutex); bCancelled = true;
-        if (Client) { Closing = Client->ShutdownAsync(); Client.Reset(); }
+        if (!bCompleted.exchange(true) && DonePromise)
+        {
+            DonePromise->SetValue();
+        }
     }
-};
-
-/** Platform callbacks only post plain data; UObject work is consumed by Tick. */
-struct FPostHogLifecycleSignals
-{
-    FCriticalSection Mutex;
-    TArray<bool> Pending;
-    void Push(bool bForeground)
-    {
-        FScopeLock Lock(&Mutex);
-        if (!Pending.IsEmpty() && Pending.Last() == bForeground) { return; }
-        if (Pending.Num() < 32) { Pending.Add(bForeground); }
-        else { Pending.Last() = bForeground; }
-    }
-    TArray<bool> Take()
-    { FScopeLock Lock(&Mutex); TArray<bool> Result = MoveTemp(Pending); Pending.Empty(); return Result; }
 };
 
 namespace
 {
-// Game-thread-only weak leases serialize reuse of an initializing/closing namespace.
-TMap<FString, TWeakPtr<FPostHogInitialization, ESPMode::ThreadSafe>> Owners;
+// Game-thread map of active or releasing namespace leases keyed by storage namespace,
+// preventing concurrent owners and serializing replacement initialization until the
+// previous client finishes both initialization and shutdown.
+TMap<FString, TSharedRef<FPostHogNamespaceLease, ESPMode::ThreadSafe>> NamespaceLeases;
+
+void ReleaseLeaseFromMap(const TSharedPtr<FPostHogNamespaceLease, ESPMode::ThreadSafe>& Lease)
+{
+    check(IsInGameThread());
+    if (!Lease) { return; }
+    if (auto* Current = NamespaceLeases.Find(Lease->Key); Current && &Current->Get() == Lease.Get())
+    {
+        NamespaceLeases.Remove(Lease->Key);
+    }
+}
+
+FString MakeNamespaceKey(const FPostHogConfig& Config)
+{
+    return FPaths::ConvertRelativePathToFull(Config.StorageRoot) + TEXT("|")
+        + Config.ProjectToken.TrimStartAndEnd() + TEXT("|") + Config.ClientName;
+}
+
 FPostHogProperties SampleContext()
 {
     FPostHogProperties Context;
@@ -64,7 +80,9 @@ FPostHogProperties SampleContext()
     Context.SetString(TEXT("$device_type"), TEXT("Desktop"));
     FString Version;
     if (GConfig && GConfig->GetString(TEXT("/Script/EngineSettings.GeneralProjectSettings"), TEXT("ProjectVersion"), Version, GGameIni) && !Version.IsEmpty())
-    { Context.SetString(TEXT("$app_version"), Version); }
+    {
+        Context.SetString(TEXT("$app_version"), Version);
+    }
     return Context;
 }
 }
@@ -73,62 +91,272 @@ void UPostHogSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
     const auto* Settings = GetDefault<UPostHogSettings>();
-    if (Settings->bAutoInitialize && !Settings->Options.ProjectToken.IsEmpty()) { Setup(Settings->Options); }
+    if (Settings->bAutoInitialize && !Settings->Options.ProjectToken.IsEmpty())
+    {
+        Setup(Settings->Options);
+    }
 }
 
 bool UPostHogSubsystem::Setup(const FPostHogOptions& Options)
-{ return SetupWithConfig(Options.ToNative(), Options.bEnableInEditor, Options.bEnableOnDedicatedServer); }
+{
+    return SetupWithConfig(Options.ToNative(), Options.bEnableInEditor, Options.bEnableOnDedicatedServer);
+}
 
 bool UPostHogSubsystem::SetupWithConfig(FPostHogConfig Config, bool bEnableInEditor, bool bEnableOnDedicatedServer)
 {
-    if (!IsInGameThread() || (State != EPostHogSubsystemState::Idle && State != EPostHogSubsystemState::Failed)) { return false; }
+    if (!IsInGameThread() || (State != EPostHogSubsystemState::Idle && State != EPostHogSubsystemState::Failed))
+    {
+        return false;
+    }
     auto* Instance = GetGameInstance();
     const auto* WorldContext = Instance ? Instance->GetWorldContext() : nullptr;
     if (!WorldContext || (WorldContext->WorldType != EWorldType::Game && WorldContext->WorldType != EWorldType::PIE) ||
-        IsRunningCommandlet() || (GIsEditor && !bEnableInEditor) || (Instance->IsDedicatedServerInstance() && !bEnableOnDedicatedServer)) { return false; }
-    if (Config.ProjectToken.TrimStartAndEnd().IsEmpty() || Config.Host.TrimStartAndEnd().IsEmpty() || Config.ClientName.TrimStartAndEnd().IsEmpty()) { return false; }
+        IsRunningCommandlet() || (GIsEditor && !bEnableInEditor) || (Instance->IsDedicatedServerInstance() && !bEnableOnDedicatedServer))
+    {
+        return false;
+    }
+
     const FString Scope = WorldContext->WorldType == EWorldType::PIE
         ? FString::Printf(TEXT("editor/pie-%d"), WorldContext->PIEInstance)
         : (GIsEditor ? FString(TEXT("editor/standalone")) : FString(TEXT("runtime")));
     Config.ClientName = Scope + TEXT("/") + Config.ClientName;
-    if (Config.StorageRoot.IsEmpty()) { Config.StorageRoot = FPaths::ProjectSavedDir() / TEXT("PostHog"); }
-    auto Context = SampleContext().ToNative(); PostHogJson::Merge(*Context, *Config.Context.ToNative());
+    if (Config.StorageRoot.IsEmpty())
+    {
+        Config.StorageRoot = FPaths::ProjectSavedDir() / TEXT("PostHogStateful");
+    }
+
+    auto Context = SampleContext().ToNative();
+    PostHogJson::Merge(*Context, *Config.Context.ToNative());
     Config.Context = FPostHogProperties::FromNative(Context);
     if (!Config.Context.IsValid()) { return false; }
-    FString Host = Config.Host.TrimStartAndEnd();
-    while (Host.EndsWith(TEXT("/"))) { Host.LeftChopInline(1); }
-    const FString Key = FPaths::ConvertRelativePathToFull(Config.StorageRoot) / FMD5::HashAnsiString(*(Host + TEXT("\n") + Config.ProjectToken.TrimStartAndEnd() + TEXT("\n") + Config.ClientName));
-    for (auto It = Owners.CreateIterator(); It; ++It) { if (!It.Value().IsValid()) { It.RemoveCurrent(); } }
-    auto Previous = Owners.FindRef(Key).Pin();
-    if (Previous) { FScopeLock Lock(&Previous->Mutex); if (!Previous->bCancelled) { return false; } }
-    State = EPostHogSubsystemState::Initializing;
-    StartObserving(); EnsureTicker();
-    auto Request = MakeShared<FPostHogInitialization, ESPMode::ThreadSafe>();
-    Initialization = Request; Owners.Add(Key, Request);
-    Request->Ready = PostHogTasks::Run([Request, Previous, Config = MoveTemp(Config)]() mutable
+
+    const FString Key = MakeNamespaceKey(Config);
+    TSharedFuture<void> Predecessor;
+    if (auto* Existing = NamespaceLeases.Find(Key))
     {
-        if (Previous)
+        if (!(*Existing)->bReleasing && !(*Existing)->DoneFuture.IsReady())
         {
-            Previous->Ready.Wait();
-            TSharedFuture<bool> Closed;
-            { FScopeLock Lock(&Previous->Mutex); Closed = Previous->Closing; }
-            if (Closed.IsValid()) { Closed.Wait(); }
+            UE_LOG(LogPostHogSubsystem, Warning,
+                TEXT("Rejecting PostHog setup: another active client already owns namespace '%s'."), *Key);
+            return false;
         }
-        { FScopeLock Lock(&Request->Mutex); if (Request->bCancelled) { return false; } }
-        auto Created = FPostHogClient::CreateAsync(MoveTemp(Config)).Get();
-        FScopeLock Lock(&Request->Mutex);
-        if (Request->bCancelled)
-        { if (Created) { Request->Closing = Created->ShutdownAsync(); } return false; }
-        Request->Client = MoveTemp(Created);
-        return Request->Client.IsValid();
-    });
+        if (!(*Existing)->DoneFuture.IsReady())
+        {
+            Predecessor = (*Existing)->DoneFuture;
+        }
+    }
+
+    auto Lease = MakeShared<FPostHogNamespaceLease, ESPMode::ThreadSafe>();
+    Lease->Key = Key;
+    Lease->DonePromise = MakeShared<TPromise<void>, ESPMode::ThreadSafe>();
+    Lease->DoneFuture = Lease->DonePromise->GetFuture().Share();
+    NamespaceLeases.Add(Key, Lease);
+
+    NamespaceKey = Key;
+    ActiveLease = Lease;
+    PendingFlagUpdates.Empty();
+    ReplaySettings = Config.Replay;
+    bCaptureApplicationLifecycleEvents = Config.bCaptureApplicationLifecycleEvents;
+    State = EPostHogSubsystemState::Initializing;
+    const uint64 Generation = ++SetupGeneration;
+    StartObserving();
+
+    TWeakObjectPtr<UPostHogSubsystem> WeakThis(this);
+    auto UserFlagCallback = MoveTemp(Config.OnFeatureFlagsChanged);
+    Config.OnFeatureFlagsChanged = [WeakThis, Generation, UserFlagCallback = MoveTemp(UserFlagCallback)](FPostHogFeatureFlagsUpdate Update)
+    {
+        if (UserFlagCallback)
+        {
+#if PLATFORM_EXCEPTIONS_DISABLED
+            UserFlagCallback(Update);
+#else
+            try
+            {
+                UserFlagCallback(Update);
+            }
+            catch (const std::exception&)
+            {
+                UE_LOG(LogPostHogSubsystem, Warning, TEXT("OnFeatureFlagsChanged threw std::exception."));
+            }
+            catch (...)
+            {
+                UE_LOG(LogPostHogSubsystem, Warning, TEXT("OnFeatureFlagsChanged threw an unknown exception."));
+            }
+#endif
+        }
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, Generation, Update = MoveTemp(Update)]() mutable
+        {
+            auto* Self = WeakThis.Get();
+            if (!Self || Self->SetupGeneration != Generation) { return; }
+            if (Self->State == EPostHogSubsystemState::Initializing)
+            {
+                Self->PendingFlagUpdates.Add(MoveTemp(Update));
+                return;
+            }
+            if (Self->State == EPostHogSubsystemState::Ready)
+            {
+                TStrongObjectPtr<UPostHogSubsystem> KeepAlive(Self);
+                Self->OnFeatureFlagsChanged.Broadcast(Update);
+            }
+        });
+    };
+
+    auto InitTask = [WeakThis, Generation, Lease, Predecessor, Config = MoveTemp(Config)]() mutable
+    {
+        if (Predecessor.IsValid()) { Predecessor.Wait(); }
+        {
+            FScopeLock Lock(&Lease->Mutex);
+            if (Lease->bCancelled)
+            {
+                const uint64 ShutdownGen = Lease->ShutdownGeneration;
+                Lease->Complete();
+                AsyncTask(ENamedThreads::GameThread, [WeakThis, Lease, ShutdownGen]()
+                {
+                    ReleaseLeaseFromMap(Lease);
+                    if (auto* Self = WeakThis.Get()) { Self->FinishShutdown(Lease, ShutdownGen, FPostHogDrainResult{}); }
+                });
+                return;
+            }
+        }
+
+        auto Created = FPostHogClient::CreateSync(MoveTemp(Config));
+        bool bCancelledDuringInit = false;
+        uint64 ShutdownGen = 0;
+        {
+            FScopeLock Lock(&Lease->Mutex);
+            if (Lease->bCancelled)
+            {
+                bCancelledDuringInit = true;
+                ShutdownGen = Lease->ShutdownGeneration;
+            }
+            else
+            {
+                Lease->PendingCreated = MoveTemp(Created);
+                Lease->bInitFinished = true;
+            }
+        }
+        if (bCancelledDuringInit)
+        {
+            FPostHogDrainResult Result;
+            if (Created)
+            {
+                Result = Created->ShutdownSync();
+                Created.Reset();
+            }
+            Lease->Complete();
+            AsyncTask(ENamedThreads::GameThread, [WeakThis, Lease, ShutdownGen, Result]()
+            {
+                ReleaseLeaseFromMap(Lease);
+                if (auto* Self = WeakThis.Get()) { Self->FinishShutdown(Lease, ShutdownGen, Result); }
+            });
+            return;
+        }
+
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, Generation, Lease]() mutable
+        {
+            FPostHogClient::FPtr Created;
+            bool bCancelled = false;
+            {
+                FScopeLock Lock(&Lease->Mutex);
+                bCancelled = Lease->bCancelled;
+                Created = MoveTemp(Lease->PendingCreated);
+            }
+            if (bCancelled)
+            {
+                // ShutdownInternal already took ownership of PendingCreated or completed the lease.
+                return;
+            }
+            auto* Self = WeakThis.Get();
+            if (!Self || Self->SetupGeneration != Generation || Self->State != EPostHogSubsystemState::Initializing)
+            {
+                if (Created)
+                {
+                    if (!FPostHogClient::LaunchTrackedTask([Lease, Created]() mutable
+                    {
+                        Created->ShutdownSync();
+                        Created.Reset();
+                        Lease->Complete();
+                        AsyncTask(ENamedThreads::GameThread, [Lease]() { ReleaseLeaseFromMap(Lease); });
+                    }))
+                    {
+                        Created->ShutdownSync();
+                        Created.Reset();
+                        Lease->Complete();
+                        ReleaseLeaseFromMap(Lease);
+                    }
+                }
+                else
+                {
+                    Lease->Complete();
+                    ReleaseLeaseFromMap(Lease);
+                }
+                return;
+            }
+            TStrongObjectPtr<UPostHogSubsystem> KeepAlive(Self);
+            if (!Created)
+            {
+                Lease->bReleasing = true;
+                Lease->Complete();
+                ReleaseLeaseFromMap(Lease);
+                if (Self->ActiveLease == Lease) { Self->ActiveLease.Reset(); }
+                Self->PendingFlagUpdates.Empty();
+                Self->State = EPostHogSubsystemState::Failed;
+                Self->StopObserving();
+                Self->OnSetupCompleted.Broadcast(false);
+                return;
+            }
+            Self->Client = MoveTemp(Created);
+            Self->State = EPostHogSubsystemState::Ready;
+            Self->Client->SetAppInBackground(!Self->bForeground);
+            if (!Self->Client->IsDisabled() && Self->bCaptureApplicationLifecycleEvents && Self->bForeground)
+            {
+                FPostHogProperties Props;
+                Props.SetBoolean(TEXT("from_background"), false);
+                Self->Client->Capture(TEXT("Application Opened"), Props);
+            }
+            if (Self->SetupGeneration == Generation && Self->State == EPostHogSubsystemState::Ready)
+            {
+                Self->OnSetupCompleted.Broadcast(true);
+            }
+            auto BufferedUpdates = MoveTemp(Self->PendingFlagUpdates);
+            Self->PendingFlagUpdates.Empty();
+            for (const FPostHogFeatureFlagsUpdate& Update : BufferedUpdates)
+            {
+                if (Self->SetupGeneration != Generation || Self->State != EPostHogSubsystemState::Ready)
+                {
+                    break;
+                }
+                Self->OnFeatureFlagsChanged.Broadcast(Update);
+            }
+        });
+    };
+
+    if (!FPostHogClient::LaunchTrackedTask(MoveTemp(InitTask)))
+    {
+        Lease->bReleasing = true;
+        Lease->Complete();
+        ReleaseLeaseFromMap(Lease);
+        ActiveLease.Reset();
+        PendingFlagUpdates.Empty();
+        State = EPostHogSubsystemState::Failed;
+        StopObserving();
+        return false;
+    }
     return true;
 }
 
 bool UPostHogSubsystem::IsInitialized() const
-{ return IsInGameThread() && State == EPostHogSubsystemState::Ready && Client && Client->IsInitialized(); }
-FPostHogClient::FPtr UPostHogSubsystem::GetClient() const
-{ return IsInitialized() ? Client : nullptr; }
+{
+    return IsInGameThread() && State == EPostHogSubsystemState::Ready && Client && Client->IsInitialized();
+}
+
+bool UPostHogSubsystem::IsDisabled() const
+{
+    auto Current = GetClient();
+    return !Current || Current->IsDisabled();
+}
+
+FPostHogClient::FPtr UPostHogSubsystem::GetClient() const { return IsInitialized() ? Client : nullptr; }
 
 EPostHogCaptureResult UPostHogSubsystem::Capture(const FString& Event, const FPostHogProperties& Properties)
 {
@@ -136,24 +364,65 @@ EPostHogCaptureResult UPostHogSubsystem::Capture(const FString& Event, const FPo
     return Current ? Current->Capture(Event, Properties) : EPostHogCaptureResult::Closed;
 }
 
-bool UPostHogSubsystem::Identify(const FString& DistinctId, const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
+void UPostHogSubsystem::Identify(const FString& DistinctId, const FPostHogProperties& Set, const FPostHogProperties& SetOnce)
 {
-    auto Current = GetClient();
-    return Current && Current->Identify(DistinctId, Set, SetOnce);
+    if (auto Current = GetClient()) { Current->Identify(DistinctId, Set, SetOnce); }
 }
 
-FPostHogFeatureFlagResult UPostHogSubsystem::GetFeatureFlag(const FString& Key, bool bSendEvent)
+void UPostHogSubsystem::Reset() { if (auto Current = GetClient()) { Current->Reset(); } }
+void UPostHogSubsystem::OptIn() { if (auto Current = GetClient()) { Current->OptIn(); } }
+
+void UPostHogSubsystem::OptOut()
 {
     auto Current = GetClient();
-    return Current ? Current->GetFeatureFlagResult(Key, bSendEvent) : FPostHogFeatureFlagResult();
+    if (!Current) { return; }
+    Current->OptOut();
+    StopSessionReplay();
 }
 
-bool UPostHogSubsystem::ReloadFeatureFlags()
+FPostHogFeatureFlagResult UPostHogSubsystem::GetFeatureFlag(const FString& Key, EPostHogFlagReporting Reporting)
 {
     auto Current = GetClient();
-    if (!Current) { return false; }
-    if (!FlagReload.IsValid()) { FlagReload = Current->ReloadFeatureFlagsAsync(); }
-    return true;
+    return Current ? Current->GetFeatureFlagResult(Key, Reporting) : FPostHogFeatureFlagResult{};
+}
+
+FPostHogFeatureFlags UPostHogSubsystem::GetFeatureFlags() const
+{
+    auto Current = GetClient();
+    return Current ? Current->GetFeatureFlags() : FPostHogFeatureFlags{};
+}
+
+void UPostHogSubsystem::ReloadFeatureFlags() { if (auto Current = GetClient()) { Current->ReloadFeatureFlags(); } }
+
+void UPostHogSubsystem::StartSessionReplay()
+{
+    auto Current = GetClient();
+    if (!Current || Current->IsDisabled() || Current->IsOptedOut()) { return; }
+    if (!Recorder)
+    {
+        Recorder = FPostHogReplayRecorder::Attach(GetGameInstance(), Current, ReplaySettings);
+        if (!Recorder) { return; }
+        Recorder->SetAvailable(bForeground);
+    }
+    Current->StartSessionReplay();
+}
+
+void UPostHogSubsystem::StopSessionReplay()
+{
+    auto Current = GetClient();
+    if (!Current) { return; }
+    Current->StopSessionReplay();
+    if (Recorder)
+    {
+        Recorder->Stop();
+        Recorder.Reset();
+    }
+}
+
+bool UPostHogSubsystem::IsSessionReplayActive() const
+{
+    auto Current = GetClient();
+    return Current && Recorder && Current->IsSessionReplayActive();
 }
 
 TSharedPtr<IAnalyticsProvider> UPostHogSubsystem::GetAnalyticsProvider()
@@ -166,8 +435,7 @@ TSharedPtr<IAnalyticsProvider> UPostHogSubsystem::GetAnalyticsProvider()
 
 bool UPostHogSubsystem::BindAnalyticsProvider()
 {
-    if (!GetAnalyticsProvider()) { return false; }
-    return FPostHogAnalyticsProvider::Bind(AnalyticsProvider);
+    return GetAnalyticsProvider() && FPostHogAnalyticsProvider::Bind(AnalyticsProvider);
 }
 
 void UPostHogSubsystem::UnbindAnalyticsProvider()
@@ -177,92 +445,182 @@ void UPostHogSubsystem::UnbindAnalyticsProvider()
 
 void UPostHogSubsystem::Shutdown()
 {
-    if (!IsInGameThread() || State == EPostHogSubsystemState::ShuttingDown || State == EPostHogSubsystemState::Deinitialized) { return; }
-    UnbindAnalyticsProvider(); AnalyticsProvider.Reset();
+    ShutdownInternal(false);
+}
+
+void UPostHogSubsystem::ShutdownInternal(bool bDeinitializing)
+{
+    if (!IsInGameThread() || State == EPostHogSubsystemState::ShuttingDown || State == EPostHogSubsystemState::Deinitialized)
+    {
+        return;
+    }
+    const EPostHogSubsystemState PreviousState = State;
+    ++SetupGeneration;
+    PendingFlagUpdates.Empty();
+    UnbindAnalyticsProvider();
+    AnalyticsProvider.Reset();
     StopObserving();
-    FlagReload = {};
-    if (Initialization)
+    if (Recorder)
     {
-        auto Request = Initialization; Request->Cancel(); Initialization.Reset(); Client.Reset();
-        Closing = PostHogTasks::Run([Request]
-        {
-            Request->Ready.Wait();
-            TSharedFuture<bool> Closed;
-            { FScopeLock Lock(&Request->Mutex); Closed = Request->Closing; }
-            return !Closed.IsValid() || Closed.Get();
-        });
+        Recorder->Stop();
+        Recorder.Reset();
     }
-    else if (Client) { Closing = Client->ShutdownAsync(); Client.Reset(); }
-    else { State = EPostHogSubsystemState::Idle; return; }
-    State = EPostHogSubsystemState::ShuttingDown;
-    EnsureTicker();
-}
+    auto ActiveClient = MoveTemp(Client);
+    Client.Reset();
+    auto Lease = ActiveLease;
 
-void UPostHogSubsystem::EnsureTicker()
-{
-    if (!TickerHandle.IsValid())
+    if (PreviousState == EPostHogSubsystemState::Initializing && Lease.IsValid())
     {
-        TickerHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateWeakLambda(this, [this](float DeltaTime) { return Tick(DeltaTime); }));
+        Lease->bReleasing = true;
+        FPostHogClient::FPtr Pending;
+        bool bAlreadyFinishedInit = false;
+        {
+            FScopeLock Lock(&Lease->Mutex);
+            Lease->bCancelled = true;
+            Lease->ShutdownGeneration = SetupGeneration;
+            bAlreadyFinishedInit = Lease->bInitFinished;
+            Pending = MoveTemp(Lease->PendingCreated);
+        }
+        if (!bAlreadyFinishedInit)
+        {
+            State = EPostHogSubsystemState::ShuttingDown;
+            return;
+        }
+        if (!Pending)
+        {
+            Lease->Complete();
+            ReleaseLeaseFromMap(Lease);
+            ActiveLease.Reset();
+            State = EPostHogSubsystemState::Idle;
+            if (!bDeinitializing)
+            {
+                TStrongObjectPtr<UPostHogSubsystem> KeepAlive(this);
+                OnShutdownCompleted.Broadcast(FPostHogDrainResult{});
+            }
+            return;
+        }
+        ActiveClient = MoveTemp(Pending);
     }
-}
 
-bool UPostHogSubsystem::Tick(float DeltaTime)
-{
-    if (!IsInGameThread()) { return true; }
-    if (Signals)
+    if (!ActiveClient)
     {
-        for (bool bNextForeground : Signals->Take())
+        if (Lease)
         {
-            if (bForeground == bNextForeground) { continue; }
-            bForeground = bNextForeground;
-            if (auto Current = Client)
-            { if (bForeground) { Current->OnForeground(); } else { Current->OnBackground(); } }
+            Lease->bReleasing = true;
+            Lease->Complete();
+            ReleaseLeaseFromMap(Lease);
+            ActiveLease.Reset();
         }
-    }
-    if (State == EPostHogSubsystemState::Initializing && Initialization && Initialization->Ready.IsReady())
-    {
-        const bool bSuccess = Initialization->Ready.Get();
-        { FScopeLock Lock(&Initialization->Mutex); Client = Initialization->Client; }
-        State = bSuccess && Client ? EPostHogSubsystemState::Ready : EPostHogSubsystemState::Failed;
-        if (State == EPostHogSubsystemState::Ready)
-        {
-            auto Current = Client; Current->StartApplicationLifecycle(bForeground);
-            if (State == EPostHogSubsystemState::Ready && Client == Current) { OnSetupCompleted.Broadcast(true); }
-        }
-        else { Initialization->Cancel(); Initialization.Reset(); StopObserving(); OnSetupCompleted.Broadcast(false); }
-    }
-    if (State == EPostHogSubsystemState::Ready && FlagReload.IsValid() && FlagReload.IsReady())
-    {
-        auto Result = FlagReload.Get(); FlagReload = {};
-        Result = Client->ValidateFlagReloadResult(MoveTemp(Result));
-        OnFeatureFlagsReloaded.Broadcast(Result);
-    }
-    if (State == EPostHogSubsystemState::ShuttingDown && Closing.IsReady())
-    {
-        const bool bSuccess = Closing.Get(); Closing = {};
         State = EPostHogSubsystemState::Idle;
-        OnShutdownCompleted.Broadcast(bSuccess);
+        return;
     }
-    if (State == EPostHogSubsystemState::Idle || State == EPostHogSubsystemState::Failed || State == EPostHogSubsystemState::Deinitialized)
-    { TickerHandle.Reset(); return false; }
-    return true;
+
+    if (Lease) { Lease->bReleasing = true; }
+    State = EPostHogSubsystemState::ShuttingDown;
+
+    TWeakObjectPtr<UPostHogSubsystem> WeakThis(this);
+    const uint64 Generation = SetupGeneration;
+    if (!FPostHogClient::LaunchTrackedTask([WeakThis, Generation, Lease, ActiveClient]() mutable
+    {
+        const FPostHogDrainResult Result = ActiveClient->ShutdownSync();
+        ActiveClient.Reset();
+        if (Lease) { Lease->Complete(); }
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, Generation, Lease, Result]()
+        {
+            ReleaseLeaseFromMap(Lease);
+            if (auto* Self = WeakThis.Get()) { Self->FinishShutdown(Lease, Generation, Result); }
+        });
+    }))
+    {
+        // Module stopping: run synchronously so the namespace lease resolves cleanly.
+        const FPostHogDrainResult Result = ActiveClient->ShutdownSync();
+        ActiveClient.Reset();
+        if (Lease)
+        {
+            Lease->Complete();
+            ReleaseLeaseFromMap(Lease);
+        }
+        ActiveLease.Reset();
+        State = EPostHogSubsystemState::Idle;
+        if (!bDeinitializing)
+        {
+            TStrongObjectPtr<UPostHogSubsystem> KeepAlive(this);
+            OnShutdownCompleted.Broadcast(Result);
+        }
+    }
+}
+
+void UPostHogSubsystem::FinishShutdown(TSharedPtr<FPostHogNamespaceLease, ESPMode::ThreadSafe> Lease, uint64 Generation, const FPostHogDrainResult& Result)
+{
+    check(IsInGameThread());
+    if (SetupGeneration != Generation || State != EPostHogSubsystemState::ShuttingDown)
+    {
+        return;
+    }
+    TStrongObjectPtr<UPostHogSubsystem> KeepAlive(this);
+    if (ActiveLease == Lease) { ActiveLease.Reset(); }
+    State = EPostHogSubsystemState::Idle;
+    OnShutdownCompleted.Broadcast(Result);
+}
+
+void UPostHogSubsystem::HandleLifecycleChange(bool bNextForeground)
+{
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UPostHogSubsystem> WeakThis(this);
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, bNextForeground]()
+        {
+            if (auto* Self = WeakThis.Get()) { Self->HandleLifecycleChange(bNextForeground); }
+        });
+        return;
+    }
+    if (bForeground == bNextForeground) { return; }
+    bForeground = bNextForeground;
+    auto Current = GetClient();
+    if (!Current) { return; }
+    TStrongObjectPtr<UPostHogSubsystem> KeepAlive(this);
+    if (Recorder) { Recorder->SetAvailable(bForeground); }
+    if (bForeground) { Current->SetAppInBackground(false); }
+    if (GetClient() != Current) { return; }
+    if (!Current->IsDisabled() && bCaptureApplicationLifecycleEvents)
+    {
+        FPostHogProperties Properties;
+        if (bForeground) { Properties.SetBoolean(TEXT("from_background"), true); }
+        Current->Capture(bForeground ? TEXT("Application Opened") : TEXT("Application Backgrounded"), Properties);
+        if (GetClient() != Current) { return; }
+    }
+    if (!bForeground) { Current->SetAppInBackground(true); }
 }
 
 void UPostHogSubsystem::StartObserving()
 {
-    Signals = MakeShared<FPostHogLifecycleSignals, ESPMode::ThreadSafe>();
-    auto Inbox = Signals;
-    BackgroundHandle = FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddLambda([Inbox] { Inbox->Push(false); });
-    ForegroundHandle = FCoreDelegates::ApplicationHasEnteredForegroundDelegate.AddLambda([Inbox] { Inbox->Push(true); });
-    DeactivateHandle = FCoreDelegates::ApplicationWillDeactivateDelegate.AddLambda([Inbox] { Inbox->Push(false); });
-    ReactivateHandle = FCoreDelegates::ApplicationHasReactivatedDelegate.AddLambda([Inbox] { Inbox->Push(true); });
+    TWeakObjectPtr<UPostHogSubsystem> WeakThis(this);
+    auto Forward = [WeakThis](bool bNext)
+    {
+        if (!IsInGameThread())
+        {
+            AsyncTask(ENamedThreads::GameThread, [WeakThis, bNext]()
+            {
+                if (auto* Self = WeakThis.Get()) { Self->HandleLifecycleChange(bNext); }
+            });
+            return;
+        }
+        if (auto* Self = WeakThis.Get()) { Self->HandleLifecycleChange(bNext); }
+    };
+    BackgroundHandle = FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddLambda([Forward] { Forward(false); });
+    ForegroundHandle = FCoreDelegates::ApplicationHasEnteredForegroundDelegate.AddLambda([Forward] { Forward(true); });
+    DeactivateHandle = FCoreDelegates::ApplicationWillDeactivateDelegate.AddLambda([Forward] { Forward(false); });
+    ReactivateHandle = FCoreDelegates::ApplicationHasReactivatedDelegate.AddLambda([Forward] { Forward(true); });
     if (FSlateApplication::IsInitialized())
     {
         bForeground = FSlateApplication::Get().IsActive();
-        SlateHandle = FSlateApplication::Get().OnApplicationActivationStateChanged().AddLambda([Inbox](bool bActive) { Inbox->Push(bActive); });
+        SlateHandle = FSlateApplication::Get().OnApplicationActivationStateChanged().AddLambda([Forward](bool bActive) { Forward(bActive); });
     }
-    else { bForeground = true; }
-    ExitHandle = FCoreDelegates::OnEnginePreExit.AddUObject(this, &UPostHogSubsystem::HandleEngineExit);
+    else
+    {
+        bForeground = true;
+    }
+    ExitHandle = FCoreDelegates::OnEnginePreExit.AddUObject(this, &UPostHogSubsystem::Stop);
 }
 
 void UPostHogSubsystem::StopObserving()
@@ -272,19 +630,27 @@ void UPostHogSubsystem::StopObserving()
     FCoreDelegates::ApplicationWillDeactivateDelegate.Remove(DeactivateHandle);
     FCoreDelegates::ApplicationHasReactivatedDelegate.Remove(ReactivateHandle);
     if (SlateHandle.IsValid() && FSlateApplication::IsInitialized())
-    { FSlateApplication::Get().OnApplicationActivationStateChanged().Remove(SlateHandle); }
+    {
+        FSlateApplication::Get().OnApplicationActivationStateChanged().Remove(SlateHandle);
+    }
     FCoreDelegates::OnEnginePreExit.Remove(ExitHandle);
-    BackgroundHandle.Reset(); ForegroundHandle.Reset(); DeactivateHandle.Reset(); ReactivateHandle.Reset(); SlateHandle.Reset(); ExitHandle.Reset();
-    Signals.Reset();
+    BackgroundHandle.Reset();
+    ForegroundHandle.Reset();
+    DeactivateHandle.Reset();
+    ReactivateHandle.Reset();
+    SlateHandle.Reset();
+    ExitHandle.Reset();
 }
 
 void UPostHogSubsystem::Stop()
 {
     if (State == EPostHogSubsystemState::Deinitialized) { return; }
-    Shutdown();
-    StopObserving();
-    FTSTicker::RemoveTicker(TickerHandle); TickerHandle.Reset();
+    ShutdownInternal(true);
     State = EPostHogSubsystemState::Deinitialized;
 }
-void UPostHogSubsystem::HandleEngineExit() { Stop(); }
-void UPostHogSubsystem::Deinitialize() { Stop(); Super::Deinitialize(); }
+
+void UPostHogSubsystem::Deinitialize()
+{
+    Stop();
+    Super::Deinitialize();
+}

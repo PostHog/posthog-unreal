@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-ffi:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml --check
+      - name: Run Clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Run FFI tests
+        run: cargo test --manifest-path rust/Cargo.toml --locked
+      - name: Build release static and dynamic libraries
+        run: cargo build --manifest-path rust/Cargo.toml --release --locked
+      - name: Verify C header and native library link (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo rustc --manifest-path rust/posthog-stateful-ffi/Cargo.toml --release --locked --lib -- --print native-static-libs
+          cc -std=c11 -Wall -Wextra -Werror -x c -fsyntax-only Source/ThirdParty/PostHogRust/include/posthog_stateful.h
+          c++ -std=c++20 -Wall -Wextra -Werror -x c++ -fsyntax-only Source/ThirdParty/PostHogRust/include/posthog_stateful.h
+          cat <<'EOF' > "$RUNNER_TEMP/smoke.c"
+          #include "posthog_stateful.h"
+          #include <stdio.h>
+          int main(void) {
+            PostHogStatefulConfig *cfg = posthog_stateful_config_new("phc_ci");
+            if (!cfg) { return 1; }
+            if (posthog_stateful_config_set_disabled(cfg, true) != POSTHOG_STATUS_OK) { return 2; }
+            PostHogStatefulClient *client = posthog_stateful_client_new(cfg);
+            posthog_stateful_config_free(cfg);
+            if (!client || !posthog_stateful_is_disabled(client)) { return 3; }
+            posthog_stateful_client_free(client);
+            return 0;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -ISource/ThirdParty/PostHogRust/include \
+            "$RUNNER_TEMP/smoke.c" rust/target/release/libposthog_stateful_ffi.a \
+            -lgcc_s -lutil -lrt -lpthread -lm -ldl -o "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke"
+      - name: Verify C header, native library link, and dylib alignment (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo rustc --manifest-path rust/posthog-stateful-ffi/Cargo.toml --release --locked --lib -- --print native-static-libs
+          clang -std=c11 -Wall -Wextra -Werror -x c -fsyntax-only Source/ThirdParty/PostHogRust/include/posthog_stateful.h
+          clang++ -std=c++20 -Wall -Wextra -Werror -x c++ -fsyntax-only Source/ThirdParty/PostHogRust/include/posthog_stateful.h
+          cat <<'EOF' > "$RUNNER_TEMP/smoke.c"
+          #include "posthog_stateful.h"
+          #include <stdio.h>
+          int main(void) {
+            PostHogStatefulConfig *cfg = posthog_stateful_config_new("phc_ci");
+            if (!cfg) { return 1; }
+            if (posthog_stateful_config_set_disabled(cfg, true) != POSTHOG_STATUS_OK) { return 2; }
+            PostHogStatefulClient *client = posthog_stateful_client_new(cfg);
+            posthog_stateful_config_free(cfg);
+            if (!client || !posthog_stateful_is_disabled(client)) { return 3; }
+            posthog_stateful_client_free(client);
+            return 0;
+          }
+          EOF
+          clang -std=c11 -Wall -Wextra -Werror -ISource/ThirdParty/PostHogRust/include \
+            "$RUNNER_TEMP/smoke.c" rust/target/release/libposthog_stateful_ffi.a \
+            -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation \
+            -lresolv -liconv -lobjc -o "$RUNNER_TEMP/smoke_static"
+          "$RUNNER_TEMP/smoke_static"
+          clang -std=c11 -Wall -Wextra -Werror -ISource/ThirdParty/PostHogRust/include \
+            "$RUNNER_TEMP/smoke.c" rust/target/release/libposthog_stateful_ffi.dylib \
+            -Wl,-rpath,"$PWD/rust/target/release" -o "$RUNNER_TEMP/smoke_dyn"
+          "$RUNNER_TEMP/smoke_dyn"
+          stroff=$(otool -l rust/target/release/libposthog_stateful_ffi.dylib | awk '/cmd LC_SYMTAB/{f=1} f && /stroff/{print $2; exit}')
+          echo "LC_SYMTAB stroff=$stroff"
+          test -n "$stroff" && test $((stroff % 8)) -eq 0
+      - name: Verify C header and native library link (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo rustc --manifest-path rust/posthog-stateful-ffi/Cargo.toml --release --locked --lib -- --print native-static-libs
+          $smokeC = Join-Path $env:RUNNER_TEMP 'smoke.c'
+          @'
+          #include "posthog_stateful.h"
+          int main(void) {
+            PostHogStatefulConfig *cfg = posthog_stateful_config_new("phc_ci");
+            if (!cfg) { return 1; }
+            if (posthog_stateful_config_set_disabled(cfg, true) != POSTHOG_STATUS_OK) { return 2; }
+            PostHogStatefulClient *client = posthog_stateful_client_new(cfg);
+            posthog_stateful_config_free(cfg);
+            if (!client || !posthog_stateful_is_disabled(client)) { return 3; }
+            posthog_stateful_client_free(client);
+            return 0;
+          }
+          '@ | Set-Content -Path $smokeC -Encoding ascii
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsPath)) { throw 'Visual Studio Build Tools not found' }
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+          $smokeObj = Join-Path $env:RUNNER_TEMP 'smoke.obj'
+          $smokeExe = Join-Path $env:RUNNER_TEMP 'smoke.exe'
+          cmd /c "call `"$vcvars`" && cl /nologo /std:c++20 /EHsc /W4 /WX /Zs /Tp Source\ThirdParty\PostHogRust\include\posthog_stateful.h && cl /nologo /MD /std:c11 /W4 /WX /ISource\ThirdParty\PostHogRust\include `"$smokeC`" rust\target\release\posthog_stateful_ffi.lib advapi32.lib bcrypt.lib crypt32.lib ncrypt.lib ntdll.lib ole32.lib shell32.lib userenv.lib ws2_32.lib /Fo:`"$smokeObj`" /Fe:`"$smokeExe`" && `"$smokeExe`""
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

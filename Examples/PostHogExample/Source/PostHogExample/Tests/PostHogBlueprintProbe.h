@@ -11,21 +11,14 @@ class UPostHogBlueprintProbe : public UObject
     GENERATED_BODY()
 public:
     UFUNCTION()
-    void OnReload(const FPostHogFlagReloadResult& Result)
+    void OnFlagsChanged(const FPostHogFeatureFlagsUpdate& Update)
     {
         ++Completions;
         bGameThread = bGameThread && IsInGameThread();
-        LastResult = Result;
-        if (bReloadAgain && Subsystem.IsValid())
-        {
-            bReloadAgain = false;
-            Subsystem->ReloadFeatureFlags();
-        }
+        LastUpdate = Update;
     }
 
-    TWeakObjectPtr<UPostHogSubsystem> Subsystem;
     int32 Completions = 0;
     bool bGameThread = true;
-    bool bReloadAgain = false;
-    FPostHogFlagReloadResult LastResult;
+    FPostHogFeatureFlagsUpdate LastUpdate;
 };

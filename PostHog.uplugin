@@ -3,16 +3,38 @@
   "Version": 1,
   "VersionName": "0.0.1",
   "FriendlyName": "PostHog",
-  "Description": "PostHog analytics and feature flags for Unreal Engine (in development).",
+  "Description": "PostHog analytics, feature flags, and session replay for Unreal Engine (in development).",
   "Category": "Analytics",
   "CreatedBy": "PostHog",
   "CreatedByURL": "https://posthog.com",
   "CanContainContent": false,
   "IsBetaVersion": true,
   "Installed": false,
-  "SupportedTargetPlatforms": ["Mac"],
+  "SupportedTargetPlatforms": [
+    "Mac",
+    "Win64",
+    "Linux"
+  ],
   "Modules": [
-    {"Name": "PostHog", "Type": "Runtime", "LoadingPhase": "Default", "PlatformAllowList": ["Mac"]},
-    {"Name": "PostHogAnalytics", "Type": "Runtime", "LoadingPhase": "None", "PlatformAllowList": ["Mac"]}
+    {
+      "Name": "PostHog",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": [
+        "Mac",
+        "Win64",
+        "Linux"
+      ]
+    },
+    {
+      "Name": "PostHogAnalytics",
+      "Type": "Runtime",
+      "LoadingPhase": "None",
+      "PlatformAllowList": [
+        "Mac",
+        "Win64",
+        "Linux"
+      ]
+    }
   ]
 }
