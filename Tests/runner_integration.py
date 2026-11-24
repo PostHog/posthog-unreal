@@ -1,13 +1,17 @@
-"""Build the example first, then exercise its public launch script and the SDK mock backend."""
+"""Build the example first, then run its gameplay smoke scenarios against the local mock server."""
 import argparse
+from datetime import datetime
 import json
 import os
+import shutil
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
+
+REQUEST_TIMEOUT_SECONDS = 10
 
 
 def request(host, path, value=None):
@@ -19,6 +23,7 @@ def request(host, path, value=None):
 
 def run_scenario(args, name, hard, delay, enabled):
     root = Path(__file__).resolve().parents[1]
+    shutil.rmtree(root / "Examples/PostHogExample/Saved/PostHogStateful", ignore_errors=True)
     output = (root / "artifacts/runner" / name).resolve()
     output.mkdir(parents=True, exist_ok=True)
     with socket.socket() as sock:
@@ -26,7 +31,12 @@ def run_scenario(args, name, hard, delay, enabled):
         port = sock.getsockname()[1]
     host = f"http://127.0.0.1:{port}"
     with (output / "mock.log").open("w") as log:
-        server = subprocess.Popen([sys.executable, args.mock_server], env={**os.environ, "PORT": str(port)}, stdout=log, stderr=log)
+        server = subprocess.Popen(
+            [sys.executable, str(args.mock_server)],
+            env={**os.environ, "PORT": str(port)},
+            stdout=log,
+            stderr=log,
+        )
         try:
             for _ in range(100):
                 try:
@@ -40,19 +50,36 @@ def run_scenario(args, name, hard, delay, enabled):
                 raise RuntimeError("Mock startup timed out")
             request(host, "/__control/state", {"flags": {"runner-hard-mode": hard}, "delays": {"flags": delay}})
             env = {k: v for k, v in os.environ.items() if k not in ("POSTHOG_TOKEN", "POSTHOG_HOST")}
-            env.update(UE_ROOT=args.ue_root, RUNNER_TEST_OUTPUT=str(output),
-                       RUNNER_EXPECT_HARD=str(int(hard and delay == 0)),
-                       RUNNER_EXPECT_SECOND_HARD=str(int(hard and delay < 3)),
-                       RUNNER_SHORT_COUNTDOWN=str(int(name == "delayed")))
+            env.update(
+                UE_ROOT=args.ue_root,
+                RUNNER_TEST_OUTPUT=str(output),
+                RUNNER_EXPECT_HARD=str(int(hard and delay == 0)),
+                RUNNER_EXPECT_SECOND_HARD=str(int(hard and delay < REQUEST_TIMEOUT_SECONDS)),
+                RUNNER_SHORT_COUNTDOWN=str(int(name == "delayed")),
+            )
             if enabled:
                 env.update(POSTHOG_TOKEN="phc_MOCK", POSTHOG_HOST=host)
             result_path = output / "smoke-result.json"
             result_path.unlink(missing_ok=True)
             with (output / "stdout.log").open("w") as editor_log:
-                subprocess.run([str(root / "scripts/run-example.sh"), "-unattended", "-nullrhi", "-nosplash", "-nop4",
-                                "-EnablePlugins=PythonScriptPlugin", f"-ExecutePythonScript={root / 'Tests/runner_smoke.py'}",
-                                "-ExecCmds=t.MaxFPS 60", f"-abslog={output / 'editor.log'}"],
-                               env=env, stdout=editor_log, stderr=subprocess.STDOUT, timeout=150, check=True)
+                subprocess.run(
+                    [
+                        str(root / "scripts/run-example.sh"),
+                        "-unattended",
+                        "-nullrhi",
+                        "-nosplash",
+                        "-nop4",
+                        "-EnablePlugins=PythonScriptPlugin",
+                        f"-ExecutePythonScript={root / 'Tests/runner_smoke.py'}",
+                        "-ExecCmds=t.MaxFPS 60",
+                        f"-abslog={output / 'editor.log'}",
+                    ],
+                    env=env,
+                    stdout=editor_log,
+                    stderr=subprocess.STDOUT,
+                    timeout=150,
+                    check=True,
+                )
             result = json.loads(result_path.read_text())
             assert result["success"], result
             events = request(host, "/__captured/events")
@@ -67,9 +94,13 @@ def run_scenario(args, name, hard, delay, enabled):
                 assert len(ids) == 2 and ids == {e["properties"]["run_id"] for e in ends}
                 assert all(e["properties"]["run_id"] in ids for e in coins)
                 assert len({e["distinct_id"] for e in starts + ends + coins}) == 1, "Identity changed on restart"
-                assert len({e["properties"]["$session_id"] for e in starts + ends}) == 1, "Session changed on restart"
+                sessions = {e.get("session_id") or e.get("properties", {}).get("$session_id") for e in starts + ends}
+                assert len(sessions) == 1 and next(iter(sessions)), f"Expected one non-empty session across restart: {sessions}"
                 assert starts[0]["properties"]["difficulty"] == ("hard" if hard and delay == 0 else "normal")
-                assert starts[1]["properties"]["difficulty"] == ("hard" if hard and delay < 3 else "normal")
+                assert starts[1]["properties"]["difficulty"] == ("hard" if hard and delay < REQUEST_TIMEOUT_SECONDS else "normal")
+                if hard and delay >= REQUEST_TIMEOUT_SECONDS:
+                    answered = datetime.fromisoformat(request(host, "/__captured/all")["flags_calls"][0]["ts"])
+                    assert datetime.fromisoformat(starts[1]["timestamp"]) > answered, (answered, starts[1]["timestamp"])
                 assert all(e["properties"]["duration_seconds"] > 0 and e["properties"]["reason"] == "collision" for e in ends)
                 assert any(e["properties"]["distance_meters"] > 700 for e in ends)
             else:
@@ -82,13 +113,19 @@ def run_scenario(args, name, hard, delay, enabled):
 
 
 def main():
+    root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ue-root", default=os.environ.get("UE_ROOT"), required=not os.environ.get("UE_ROOT"))
-    parser.add_argument("--mock-server", required=True)
+    parser.add_argument("--mock-server", default=str(root / "Tests/mock_server.py"))
     parser.add_argument("--scenario", choices=["offline", "normal", "hard", "delayed", "timeout"])
     args = parser.parse_args()
-    for name, hard, delay, enabled in [("offline", False, 0, False), ("normal", False, 0, True),
-                                        ("hard", True, 0, True), ("delayed", True, 2, True), ("timeout", True, 5, True)]:
+    for name, hard, delay, enabled in [
+        ("offline", False, 0, False),
+        ("normal", False, 0, True),
+        ("hard", True, 0, True),
+        ("delayed", True, 2, True),
+        ("timeout", True, REQUEST_TIMEOUT_SECONDS + 1, True),
+    ]:
         if args.scenario is None or args.scenario == name:
             run_scenario(args, name, hard, delay, enabled)
 

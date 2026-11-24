@@ -9,7 +9,6 @@ DEFINE_LOG_CATEGORY_STATIC(LogPostHogAnalytics, Log, All);
 
 namespace
 {
-// Game-thread-only, non-owning designation. Each subsystem owns its own adapter.
 TWeakPtr<FPostHogAnalyticsProvider> BoundProvider;
 }
 
@@ -57,9 +56,14 @@ FPostHogProperties FPostHogAnalyticsProvider::ConvertAttributes(const TArray<FAn
                 continue;
             }
         }
-        else { Value = FPostHogValue::String(Attribute.GetValue()); }
+        else
+        {
+            Value = FPostHogValue::String(Attribute.GetValue());
+        }
         if (!Properties.Set(Attribute.GetName(), Value))
-        { UE_LOG(LogPostHogAnalytics, Warning, TEXT("Ignoring an Analytics attribute that exceeds property bounds.")); }
+        {
+            UE_LOG(LogPostHogAnalytics, Warning, TEXT("Ignoring an Analytics attribute that exceeds property bounds."));
+        }
     }
     return Properties;
 }
@@ -67,40 +71,87 @@ FPostHogProperties FPostHogAnalyticsProvider::ConvertAttributes(const TArray<FAn
 FPostHogProperties FPostHogAnalyticsProvider::GetDefaults() const
 {
     FScopeLock Lock(&DefaultsMutex);
-    return DefaultProperties;
+    return CachedDefaults;
 }
 
 bool FPostHogAnalyticsProvider::StartSession(const TArray<FAnalyticsEventAttribute>& Attributes)
-{ return Client->StartAnalyticsSession(ConvertAttributes(Attributes), GetDefaults()); }
-void FPostHogAnalyticsProvider::EndSession() { Client->EndAnalyticsSession(GetDefaults()); }
+{
+    auto Current = Client;
+    if (!Current->IsInitialized() || Current->IsOptedOut()) { return false; }
+    Current->StartSession();
+    const FString Session = Current->GetSessionId();
+    if (Session.IsEmpty()) { return false; }
+    {
+        FScopeLock Lock(&SessionMutex);
+        if (StartedSessionId == Session) { return true; }
+        StartedSessionId = Session;
+    }
+    const auto Result = Current->CaptureWithFallback(TEXT("SessionStart"), ConvertAttributes(Attributes), GetDefaults());
+    const bool bAccepted = Result == EPostHogCaptureResult::Accepted && Current->IsInitialized() && Current->PeekSessionId() == Session;
+    if (!bAccepted)
+    {
+        FScopeLock Lock(&SessionMutex);
+        if (StartedSessionId == Session) { StartedSessionId.Empty(); }
+    }
+    return bAccepted;
+}
+
+void FPostHogAnalyticsProvider::EndSession()
+{
+    auto Current = Client;
+    {
+        FScopeLock Lock(&SessionMutex);
+        StartedSessionId.Empty();
+    }
+    const FString EndingId = Current->PeekSessionId();
+    const FString CurrentId = EndingId.IsEmpty() ? FString() : Current->GetSessionId();
+    if (!EndingId.IsEmpty())
+    {
+        FPostHogProperties Properties;
+        Properties.SetString(TEXT("$session_id"), EndingId);
+        Current->CaptureWithFallback(TEXT("SessionEnd"), Properties, GetDefaults());
+    }
+    if (Current->IsInitialized() && Current->PeekSessionId() == CurrentId) { Current->EndSession(); }
+    if (Current->IsInitialized()) { Current->FlushAsync(); }
+}
+
 FString FPostHogAnalyticsProvider::GetSessionID() const { return Client->GetSessionId(); }
-bool FPostHogAnalyticsProvider::SetSessionID(const FString& InSessionID) { return Client->SetSessionId(InSessionID); }
+bool FPostHogAnalyticsProvider::SetSessionID(const FString&) { return false; }
 void FPostHogAnalyticsProvider::FlushEvents() { Client->FlushAsync(); }
 void FPostHogAnalyticsProvider::SetUserID(const FString& InUserID) { Client->Identify(InUserID); }
 FString FPostHogAnalyticsProvider::GetUserID() const { return Client->IsInitialized() ? Client->GetDistinctId() : FString(); }
 
 void FPostHogAnalyticsProvider::RecordEvent(const FString& EventName, const TArray<FAnalyticsEventAttribute>& Attributes)
 {
-    const auto Defaults = GetDefaults();
-    Client->CaptureWithDefaults(EventName, ConvertAttributes(Attributes), &Defaults);
+    Client->CaptureWithFallback(EventName, ConvertAttributes(Attributes), GetDefaults());
 }
+
 void FPostHogAnalyticsProvider::RecordEvent(const FString& EventName, const TArray<FAnalyticsEventAttribute>& Attributes, EAnalyticsRecordEventMode Mode)
 {
-    RecordEvent(EventName, Attributes);
-    if (Mode == EAnalyticsRecordEventMode::Immediate) { FlushEvents(); }
+    Client->CaptureWithFallback(EventName, ConvertAttributes(Attributes), GetDefaults());
+    if (Mode == EAnalyticsRecordEventMode::Immediate && Client->IsInitialized()) { Client->FlushAsync(); }
 }
 
 void FPostHogAnalyticsProvider::SetDefaultEventAttributes(TArray<FAnalyticsEventAttribute>&& Attributes)
 {
-    auto Properties = ConvertAttributes(Attributes);
+    FPostHogProperties Converted = ConvertAttributes(Attributes);
     FScopeLock Lock(&DefaultsMutex);
     DefaultAttributes = MoveTemp(Attributes);
-    DefaultProperties = MoveTemp(Properties);
+    CachedDefaults = MoveTemp(Converted);
 }
+
 TArray<FAnalyticsEventAttribute> FPostHogAnalyticsProvider::GetDefaultEventAttributesSafe() const
-{ FScopeLock Lock(&DefaultsMutex); return DefaultAttributes; }
+{
+    FScopeLock Lock(&DefaultsMutex);
+    return DefaultAttributes;
+}
+
 int32 FPostHogAnalyticsProvider::GetDefaultEventAttributeCount() const
-{ FScopeLock Lock(&DefaultsMutex); return DefaultAttributes.Num(); }
+{
+    FScopeLock Lock(&DefaultsMutex);
+    return DefaultAttributes.Num();
+}
+
 FAnalyticsEventAttribute FPostHogAnalyticsProvider::GetDefaultEventAttribute(int AttributeIndex) const
 {
     FScopeLock Lock(&DefaultsMutex);

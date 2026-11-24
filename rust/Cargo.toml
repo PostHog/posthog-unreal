@@ -1,7 +1,8 @@
 [workspace]
-members = ["posthog-unreal-ffi"]
+members = ["posthog-stateful-ffi"]
 resolver = "2"
 
 [profile.release]
 panic = "unwind"
-strip = "debuginfo"
+# Keep symbols unstripped so Apple ld emits 8-byte aligned LINKEDIT offsets on cdylib (matches posthog-rs).
+strip = false

@@ -4,15 +4,13 @@ A playable three-lane infinite runner demonstrating the PostHog Unreal SDK. The 
 
 ## Build and play
 
-Current validated target: **Unreal Engine 5.8 on macOS arm64**. Follow the repository's [native build prerequisites](../../README.md#building-the-development-checkout), including the development Rust embedding checkout.
+Current validated target: **Unreal Engine 5.8 on macOS arm64**. Follow the repository's [build prerequisites](../../README.md#building).
 
 From the repository root:
 
 ```sh
 export UE_ROOT="/path/to/UE_5.8"
-export POSTHOG_RS_PATH="/path/to/posthog-rs-embedding-checkout"
-export PYTHON=python3 # Python 3.11+ for the native build
-./scripts/build-native.sh aarch64-apple-darwin
+python3 scripts/build-native.py --test
 ./scripts/build-example.sh
 ./scripts/run-example.sh
 ```
@@ -35,7 +33,7 @@ After building, you can open `PostHogExample.uproject` directly or use the launc
 
 **The game works without credentials.** To enable capture, launch the script from a terminal with `POSTHOG_TOKEN` set. `POSTHOG_HOST` optionally overrides the default ingestion host. Do not put real credentials in tracked files or command-line arguments. An SDK instance already configured through Project Settings retains that configuration; enable editor capture there when using PIE.
 
-For a local test, start the maintained SDK mock server, then use its dummy token:
+For a local test, start the bundled mock server (`PORT=9999 python3 Tests/mock_server.py`), then use its dummy token:
 
 ```sh
 export POSTHOG_TOKEN=phc_MOCK
@@ -79,12 +77,10 @@ After building, run the three rule tests in Unreal's console:
 Automation RunTests PostHogExample.Runner
 ```
 
-For Play-in-Editor gameplay and event-ingestion checks, use the maintained mock server implementation:
+For Play-in-Editor gameplay and event-ingestion checks, run the integration driver (which uses the bundled `Tests/mock_server.py` by default; pass `--mock-server` to override):
 
 ```sh
-python3 Tests/runner_integration.py \
-  --ue-root "$UE_ROOT" \
-  --mock-server /path/to/sdk-mock-server/server.py
+python3 Tests/runner_integration.py --ue-root "$UE_ROOT"
 ```
 
 The driver launches the same public run script, enables Python only for the test process, and checks the unconfigured game, normal/hard flags, a late flag response, a flag-request timeout, real obstacle traversal, track cleanup, game over, and restart. The late-response scenario shortens the first countdown to ensure the run starts before the response arrives. It inspects ingested events, including run correlation and identity/session continuity. Logs, results, and captured mock events are written to ignored `artifacts/runner/`.
