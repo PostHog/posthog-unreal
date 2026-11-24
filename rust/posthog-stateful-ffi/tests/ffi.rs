@@ -477,7 +477,7 @@ fn session_replay_encodes_and_delivers_jpeg_snapshot() {
 
         // 16x16 BGRA8888 red image
         let mut pixels = vec![0u8; 16 * 16 * 4];
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             px[0] = 0; // B
             px[1] = 0; // G
             px[2] = 255; // R
