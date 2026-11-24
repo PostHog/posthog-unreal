@@ -1,13 +1,17 @@
 # PostHog Unreal SDK
 
-PostHog SDK for Unreal Engine, currently at pre-release `0.0.1` (**not ready for production use**; the C++, Blueprint, and C FFI API surface is subject to breaking changes before `1.0`).
+PostHog SDK for Unreal Engine, currently in pre-release (`0.x`, **not ready for production use**; the C++, Blueprint, and C FFI API surface is subject to breaking changes before `1.0`).
 
 Unreal acts as a thin host adapter over the stateful Rust SDK (`posthog::stateful::Client`), bridged through a C FFI crate (`rust/posthog-stateful-ffi`) modeled on `posthog-rs-ffi` so it can be migrated into `posthog-rs`. Persisted client state is stored under `Saved/PostHogStateful` by default (namespaced per runtime/editor/PIE instance).
 
 - **Rust owns**: identity, consent, registered/person/group properties, sessions, feature flags, remote config, disk persistence, event assembly, retry/delivery, and session replay policy/JPEG encoding/delivery.
 - **Unreal owns**: `UPostHogSubsystem` game-instance lifecycle, Blueprint nodes, `PostHogAnalytics` (`IAnalyticsProvider`), engine platform context, lifecycle delegates (`Application Opened` / `Application Backgrounded`), and owning-viewport GPU readback.
 
-## Building
+## Installing (Drop-in Release ZIP)
+
+Download `posthog-unreal-<version>.zip` from [GitHub Releases](https://github.com/PostHog/posthog-unreal/releases) (not the automatic source archive), extract the `PostHog/` folder into `<YourProject>/Plugins/PostHog/`, and rebuild your C++ project. Prebuilt Mac arm64, Linux x64, and Windows x64 static libraries are bundled — no Rust toolchain is required.
+
+## Building from source
 
 Requires Rust, Python 3.11+, and Unreal Engine 5.8 for editor/example builds.
 

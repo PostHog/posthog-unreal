@@ -1,0 +1,20 @@
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "IJG",
+    "CDLA-Permissive-2.0",
+    "0BSD",
+    # Corresponding dependency sources are bundled in the plugin ZIP.
+    "MPL-2.0",
+]
+
+[private]
+ignore = true

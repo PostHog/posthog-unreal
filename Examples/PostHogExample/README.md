@@ -4,7 +4,7 @@ A playable three-lane infinite runner demonstrating the PostHog Unreal SDK. The 
 
 ## Build and play
 
-Current validated target: **Unreal Engine 5.8 on macOS arm64**. Follow the repository's [build prerequisites](../../README.md#building).
+Current validated target: **Unreal Engine 5.8 on macOS arm64**. Follow the repository's [build prerequisites](../../README.md#building-from-source).
 
 From the repository root:
 
