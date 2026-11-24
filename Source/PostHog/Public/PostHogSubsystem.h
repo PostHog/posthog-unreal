@@ -111,13 +111,13 @@ private:
     void StartObserving();
     void StopObserving();
     void ShutdownInternal(bool bDeinitializing);
-    void FinishShutdown(TSharedPtr<struct FPostHogNamespaceLease> Lease, uint64 Generation, const FPostHogDrainResult& Result);
+    void FinishShutdown(TSharedPtr<struct FPostHogNamespaceLease, ESPMode::ThreadSafe> Lease, uint64 Generation, const FPostHogDrainResult& Result);
     void Stop();
 
     EPostHogSubsystemState State = EPostHogSubsystemState::Idle;
     uint64 SetupGeneration = 0;
     FString NamespaceKey;
-    TSharedPtr<struct FPostHogNamespaceLease> ActiveLease;
+    TSharedPtr<struct FPostHogNamespaceLease, ESPMode::ThreadSafe> ActiveLease;
     TArray<FPostHogFeatureFlagsUpdate> PendingFlagUpdates;
     bool bForeground = true;
     bool bCaptureApplicationLifecycleEvents = true;

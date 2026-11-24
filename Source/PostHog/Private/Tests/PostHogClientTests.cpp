@@ -126,6 +126,14 @@ bool FPostHogClientBeforeSendAndCleanupTest::RunTest(const FString&)
     TestEqual(TEXT("existing key preserved after oversized SetString"), Bounded.ToJson(), FString(TEXT("{\"keep\":\"ok\"}")));
     TestFalse(TEXT("oversized array element produces invalid value"), FPostHogValue::Array({FPostHogValue::String(Huge)}).IsValid());
 
+    // Verify custom byte limits on FPostHogValue::TryParse carry through ToNative() and FPostHogProperties::Set().
+    FPostHogValue LargeVal;
+    TestTrue(TEXT("5 MB JSON value parsed with 8 MB limit"), FPostHogValue::TryParse(TEXT("\"") + Huge + TEXT("\""), LargeVal, 8 * 1024 * 1024));
+    TestTrue(TEXT("5 MB JSON value materializes with preserved limit"), LargeVal.ToNative().IsValid());
+    FPostHogProperties LargeProps;
+    TestTrue(TEXT("8 MB properties container created"), FPostHogProperties::TryParse(TEXT("{}"), LargeProps, 8 * 1024 * 1024));
+    TestTrue(TEXT("5 MB value accepted by 8 MB properties"), LargeProps.Set(TEXT("big"), LargeVal));
+
     struct FDestroyTracker
     {
         std::atomic<int32> Destroyed{0};

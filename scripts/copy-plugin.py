@@ -10,7 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: copy-plugin.py <destination-plugin-dir>")
-    dest = Path(sys.argv[1]).resolve()
+    raw_dest = Path(sys.argv[1])
+    if raw_dest.is_symlink():
+        raw_dest.unlink()
+    dest = raw_dest.resolve()
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / "PostHog.uplugin", dest / "PostHog.uplugin")
     dest_source = dest / "Source"

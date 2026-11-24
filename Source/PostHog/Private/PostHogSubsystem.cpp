@@ -49,9 +49,9 @@ namespace
 // Game-thread map of active or releasing namespace leases keyed by storage namespace,
 // preventing concurrent owners and serializing replacement initialization until the
 // previous client finishes both initialization and shutdown.
-TMap<FString, TSharedRef<FPostHogNamespaceLease>> NamespaceLeases;
+TMap<FString, TSharedRef<FPostHogNamespaceLease, ESPMode::ThreadSafe>> NamespaceLeases;
 
-void ReleaseLeaseFromMap(const TSharedPtr<FPostHogNamespaceLease>& Lease)
+void ReleaseLeaseFromMap(const TSharedPtr<FPostHogNamespaceLease, ESPMode::ThreadSafe>& Lease)
 {
     check(IsInGameThread());
     if (!Lease) { return; }
@@ -146,7 +146,7 @@ bool UPostHogSubsystem::SetupWithConfig(FPostHogConfig Config, bool bEnableInEdi
         }
     }
 
-    auto Lease = MakeShared<FPostHogNamespaceLease>();
+    auto Lease = MakeShared<FPostHogNamespaceLease, ESPMode::ThreadSafe>();
     Lease->Key = Key;
     Lease->DonePromise = MakeShared<TPromise<void>, ESPMode::ThreadSafe>();
     Lease->DoneFuture = Lease->DonePromise->GetFuture().Share();
@@ -271,14 +271,13 @@ bool UPostHogSubsystem::SetupWithConfig(FPostHogConfig Config, bool bEnableInEdi
             {
                 if (Created)
                 {
-                    auto Cleanup = [Lease, Created = MoveTemp(Created)]() mutable
+                    if (!FPostHogClient::LaunchTrackedTask([Lease, Created]() mutable
                     {
                         Created->ShutdownSync();
                         Created.Reset();
                         Lease->Complete();
                         AsyncTask(ENamedThreads::GameThread, [Lease]() { ReleaseLeaseFromMap(Lease); });
-                    };
-                    if (!FPostHogClient::LaunchTrackedTask(MoveTemp(Cleanup)))
+                    }))
                     {
                         Created->ShutdownSync();
                         Created.Reset();
@@ -521,7 +520,7 @@ void UPostHogSubsystem::ShutdownInternal(bool bDeinitializing)
 
     TWeakObjectPtr<UPostHogSubsystem> WeakThis(this);
     const uint64 Generation = SetupGeneration;
-    auto ShutdownTask = [WeakThis, Generation, Lease, ActiveClient = MoveTemp(ActiveClient)]() mutable
+    if (!FPostHogClient::LaunchTrackedTask([WeakThis, Generation, Lease, ActiveClient]() mutable
     {
         const FPostHogDrainResult Result = ActiveClient->ShutdownSync();
         ActiveClient.Reset();
@@ -531,9 +530,7 @@ void UPostHogSubsystem::ShutdownInternal(bool bDeinitializing)
             ReleaseLeaseFromMap(Lease);
             if (auto* Self = WeakThis.Get()) { Self->FinishShutdown(Lease, Generation, Result); }
         });
-    };
-
-    if (!FPostHogClient::LaunchTrackedTask(MoveTemp(ShutdownTask)))
+    }))
     {
         // Module stopping: run synchronously so the namespace lease resolves cleanly.
         const FPostHogDrainResult Result = ActiveClient->ShutdownSync();
@@ -553,7 +550,7 @@ void UPostHogSubsystem::ShutdownInternal(bool bDeinitializing)
     }
 }
 
-void UPostHogSubsystem::FinishShutdown(TSharedPtr<FPostHogNamespaceLease> Lease, uint64 Generation, const FPostHogDrainResult& Result)
+void UPostHogSubsystem::FinishShutdown(TSharedPtr<FPostHogNamespaceLease, ESPMode::ThreadSafe> Lease, uint64 Generation, const FPostHogDrainResult& Result)
 {
     check(IsInGameThread());
     if (SetupGeneration != Generation || State != EPostHogSubsystemState::ShuttingDown)

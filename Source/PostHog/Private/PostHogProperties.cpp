@@ -93,6 +93,7 @@ FPostHogValue FPostHogValue::Object(const FPostHogProperties& Value)
 {
     FPostHogValue Result;
     Result.Json = Value.ToJson();
+    Result.ByteLimit = FMath::Max(Result.ByteLimit, Value.ByteLimit);
     return Result;
 }
 
@@ -115,13 +116,16 @@ bool FPostHogValue::TryParse(const FString& Json, FPostHogValue& OutValue, int32
 {
     const auto Parsed = PostHogJson::DecodeValue(Json, MaxBytes);
     if (!Parsed.IsValid()) { return false; }
-    OutValue.Json = PostHogJson::EncodeValue(Parsed);
+    const FString Candidate = PostHogJson::EncodeValue(Parsed);
+    if (!PostHogJson::IsBounded(Candidate, MaxBytes)) { return false; }
+    OutValue.Json = Candidate;
+    OutValue.ByteLimit = MaxBytes;
     return true;
 }
 
 TSharedPtr<FJsonValue> FPostHogValue::ToNative() const
 {
-    return PostHogJson::DecodeValue(Json, 4 * 1024 * 1024);
+    return PostHogJson::DecodeValue(Json, ByteLimit);
 }
 
 bool FPostHogProperties::TryParse(const FString& Json, FPostHogProperties& OutProperties, int32 MaxBytes)

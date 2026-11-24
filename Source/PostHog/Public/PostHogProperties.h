@@ -27,6 +27,8 @@ struct POSTHOG_API FPostHogValue
 private:
     UPROPERTY()
     FString Json = TEXT("null");
+    UPROPERTY()
+    int32 ByteLimit = 4 * 1024 * 1024;
 };
 
 /** Typed event properties. Copies never share mutable JSON objects. */
@@ -49,6 +51,7 @@ struct POSTHOG_API FPostHogProperties
     TSharedRef<FJsonObject> ToNative() const;
 
 private:
+    friend struct FPostHogValue;
     UPROPERTY()
     FString Json = TEXT("{}");
     UPROPERTY()
